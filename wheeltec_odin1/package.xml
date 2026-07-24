@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>wheeltec_odin1</name>
+  <version>1.0.0</version>
+  <description>
+    Odin1(留形科技空间记忆模组) 建图/重定位导航集成包, 与 wheeltec_fastlio(MID360s)、
+    wheeltec_n10plus 是三选一的独立模式, 只复用底盘串口(电机驱动)和 Nav2 的
+    controller/planner/behavior/bt_navigator, 不用 AMCL/map_server(Odin1自带定位)。
+    硬件到货前准备: odin_ros_driver 已编译通过, 未接实际传感器测试。
+  </description>
+  <maintainer email="at15535377922@gmail.com">cat</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>odin_ros_driver</exec_depend>
+  <exec_depend>turn_on_wheeltec_robot</exec_depend>
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>nav2_waypoint_cycle</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

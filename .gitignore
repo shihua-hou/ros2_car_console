@@ -1,0 +1,25 @@
+# ROS2 / colcon 编译产物
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 建图输出 / 大文件 (不入库)
+FAST_LIO/PCD/*.pcd
+*.pcd
+*.bag
+*.pgm.bak
+
+# 运行日志
+*.log
+.ros/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+*.swp

@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>wheeltec_fastlio</name>
+  <version>1.0.0</version>
+  <description>
+    WHEELTEC + Livox MID360 + FAST-LIO2 3D建图与导航集成包。
+    建图: livox_ros_driver2 + fast_lio 生成3D点云地图(PCD)，pcd2pgm 转换为2D栅格地图。
+    导航: MID360点云 转 laserscan，复用 wheeltec_nav2 (AMCL+Nav2) 导航框架。
+  </description>
+  <maintainer email="wheeltec@wheeltec.net">wheeltec</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>nav_msgs</depend>
+  <depend>pcl_conversions</depend>
+
+  <exec_depend>livox_ros_driver2</exec_depend>
+  <exec_depend>fast_lio</exec_depend>
+  <exec_depend>pointcloud_to_laserscan</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

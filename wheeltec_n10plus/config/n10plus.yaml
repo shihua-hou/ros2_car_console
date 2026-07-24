@@ -1,0 +1,53 @@
+# N10Plus (镭神智能 LSLIDAR N10Plus) 2D激光雷达配置
+# 驱动包: lslidar_driver (随 wheeltec_lidar_ros2/lslidar_ros2 一起拷贝, 官方型号列表
+# 明确包含 N10Plus)。硬件已到货, 2026-07-22 确认: 插入串口版USB线后系统自动生成
+# /dev/wheeltec_lidar(通过原厂已装好的 udev 规则, serial=0001, 不需要额外写udev规则,
+# udev/n10plus.rules 这份文件已不再需要, 保留仅作参考)。
+x10:
+  lslidar_driver_node:
+    ros__parameters:
+      lidar_type: "X10"
+      lidar_model: "N10Plus"        # 型号需精确匹配, 可选: M10 M10GPS M10P N10 N10Plus N301
+
+      # 串口版, 复用原厂udev规则生成的固定名(与底盘/wheeltec_lidar同名但不同serial,
+      # 不会跟 /dev/wheeltec_controller 冲突)
+      serial_port: "/dev/wheeltec_lidar"
+      device_ip: ""
+      msop_port: 2368
+      difop_port: 2369
+      packet_rate: 188.0
+
+      frame_id: "n10plus_laser"     # 与 launch 里 static_transform_publisher 的 child-frame 一致
+      pointcloud_topic: "lslidar_point_cloud"
+      laserscan_topic: "/scan"      # 直接发布标准 /scan, 导航侧不需要 pointcloud_to_laserscan
+      use_time_service: false
+      use_first_point_time: false
+      publish_scan: true
+      use_high_precision: true      # N10系列官方建议开启
+      publish_multiecholaserscan: false
+      enable_noise_filter: false    # 官方说明: N10Plus 不生效
+      N10Plus_hz: 10                # 扫描频率, 允许范围 [6,12]
+
+      # TODO(硬件到货后核对官方规格书): 以下测距范围是保守占位值,
+      # 需要用实测数据(或数据手册)确认后再收紧, 太大会让墙外噪点进入建图
+      min_range: 0.15
+      max_range: 10.0
+
+      # 屏蔽正后方90°(135°~225°), 建图时人跟在车正后方推/走, 不想把自己扫进地图。
+      # 角度约定(读lslidar_x10_driver.cpp源码确认): 0°=正前方, 90°=左, 180°=正后方,
+      # 逆时针为正(与点云x=distance*cos(azimuth), y=distance*sin(azimuth)一致,
+      # 标准ROS右手坐标系), 单位0.01°, 前提是雷达装车时朝向和launch里
+      # lidar_yaw=0(朝正前方)一致——如果实际雷达有额外朝向偏转, 这个屏蔽区间
+      # 需要跟着旋转同样角度。
+      # 不想屏蔽时改回 angle_disable_min: [0], angle_disable_max: [0]
+      angle_disable_min: [13500]     # 135.00°
+      angle_disable_max: [22500]     # 225.00°
+
+      is_pretreatment: false
+      x_offset: 0.0
+      y_offset: 0.0
+      z_offset: 0.0
+      roll: 0.0
+      pitch: 0.0
+      yaw: 0.0
+      is_MatrixTransformation: false

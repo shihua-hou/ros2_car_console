@@ -1,0 +1,1769 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>WHEELTEC 小车控制台</title>
+<style>
+/* ============================================================
+   iOS 风格设计系统 — 浅色/深色自适应
+   颜色取自 iOS 系统语义色板; 圆角/阴影/字重按 Apple HIG 对齐。
+   ============================================================ */
+:root{
+  --bg:#f2f2f7;              /* systemGroupedBackground */
+  --panel:#ffffff;           /* secondarySystemGroupedBackground */
+  --panel2:rgba(118,118,128,.12);   /* systemFill 填充色 */
+  --panel3:rgba(118,118,128,.06);
+  --line:rgba(60,60,67,.13);        /* separator */
+  --fg:#000000;                     /* label */
+  --dim:rgba(60,60,67,.6);          /* secondaryLabel */
+  --dim2:rgba(60,60,67,.3);         /* tertiaryLabel */
+  --acc:#007aff;  --acc-soft:rgba(0,122,255,.12);   /* systemBlue */
+  --acc2:#0040dd;
+  --ok:#34c759;   --ok-soft:rgba(52,199,89,.14);    /* systemGreen */
+  --warn:#ff9500; --warn-soft:rgba(255,149,0,.14);  /* systemOrange */
+  --bad:#ff3b30;  --bad-soft:rgba(255,59,48,.12);   /* systemRed */
+  --purple:#af52de;
+  --glass:rgba(255,255,255,.72);
+  --glass-strong:rgba(255,255,255,.86);
+  --canvas-bg:#f7f8fa;
+  --knob-hi:#5ac8fa;
+  --shadow:0 1px 2px rgba(0,0,0,.03),0 4px 14px rgba(0,0,0,.05);
+  --shadow-lg:0 10px 36px rgba(0,0,0,.14);
+  --thumb:0 3px 8px rgba(0,0,0,.14),0 1px 2px rgba(0,0,0,.16);
+  --r-card:18px; --r-btn:12px; --r-pill:100px;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#000000;
+    --panel:#1c1c1e;
+    --panel2:rgba(118,118,128,.24);
+    --panel3:rgba(118,118,128,.14);
+    --line:rgba(84,84,88,.5);
+    --fg:#ffffff;
+    --dim:rgba(235,235,245,.6);
+    --dim2:rgba(235,235,245,.3);
+    --acc:#0a84ff;  --acc-soft:rgba(10,132,255,.22);
+    --acc2:#409cff;
+    --ok:#30d158;   --ok-soft:rgba(48,209,88,.2);
+    --warn:#ff9f0a; --warn-soft:rgba(255,159,10,.2);
+    --bad:#ff453a;  --bad-soft:rgba(255,69,58,.2);
+    --purple:#bf5af2;
+    --glass:rgba(28,28,30,.72);
+    --glass-strong:rgba(28,28,30,.9);
+    --canvas-bg:#0c0c0f;
+    --knob-hi:#64d2ff;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 4px 14px rgba(0,0,0,.45);
+    --shadow-lg:0 10px 36px rgba(0,0,0,.6);
+    --thumb:0 3px 8px rgba(0,0,0,.5),0 1px 2px rgba(0,0,0,.4);
+  }
+}
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+/* ---------- 图标 ----------
+   全部走 currentColor, 所以按钮变主色/选中变白字时图标自动跟着变;
+   尺寸用 em, 跟随所在元素字号。填充型部件(实心圆点)用 .f 标记。 */
+.ic{width:1.15em;height:1.15em;flex:none;vertical-align:-.18em;
+  fill:none;stroke:currentColor;stroke-width:1.8;
+  stroke-linecap:round;stroke-linejoin:round}
+.ic .f{fill:currentColor;stroke:none}
+.cbtn .ic{width:1.25em;height:1.25em;vertical-align:0}
+html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--fg);
+  font:15px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro SC","SF Pro Text",
+       "PingFang SC","Noto Sans CJK SC",system-ui,sans-serif;
+  font-synthesis:none;-webkit-font-smoothing:antialiased;
+  touch-action:none;overscroll-behavior:none}
+#app{display:flex;flex-direction:column;height:100%}
+
+/* ---------- 顶栏 / 任务条 (毛玻璃) ---------- */
+#topbar,#taskBar{background:var(--glass);
+  backdrop-filter:blur(24px) saturate(180%);
+  -webkit-backdrop-filter:blur(24px) saturate(180%);
+  border-bottom:.5px solid var(--line)}
+#topbar{display:flex;align-items:center;gap:10px;padding:8px 16px;
+  flex-wrap:wrap;min-height:50px;z-index:8}
+#topbar .title{font-weight:600;font-size:16px;letter-spacing:-.4px;color:var(--fg)}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--bad);display:inline-block;
+  box-shadow:0 0 0 3px var(--bad-soft);transition:background .3s,box-shadow .3s}
+.dot.on{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
+.badge{padding:3px 11px;border-radius:var(--r-pill);background:var(--panel2);color:var(--dim);
+  font-size:12px;font-weight:590;letter-spacing:-.1px;
+  display:inline-flex;align-items:center;gap:6px}
+/* 运行/外部实例时: 徽章前一个呼吸的圆点, 一眼看出"有东西在跑" */
+.badge.run::before,.badge.ext::before{content:'';width:6px;height:6px;border-radius:50%;
+  background:currentColor;animation:breathe 1.6s ease-in-out infinite}
+.badge.run{background:var(--ok-soft);color:var(--ok)}
+.badge.ext{background:var(--warn-soft);color:var(--warn)}
+@keyframes breathe{0%,100%{opacity:1;box-shadow:0 0 0 0 currentColor}
+  50%{opacity:.55;box-shadow:0 0 0 3px transparent}}
+/* 操作栏右侧信息胶囊: 与传感器选择器同为 29px 高, 三个胶囊对齐成一排 */
+#poseChip{font-size:12px;color:var(--dim);background:var(--panel2);border-radius:var(--r-pill);
+  height:29px;padding:0 12px;font-variant-numeric:tabular-nums;
+  display:inline-flex;align-items:center;gap:4px}
+#poseChip b{color:var(--fg);font-weight:590}
+#poseChip .ic{opacity:.6}
+/* 导航中实际加载的地图, 常驻操作栏——不展开侧栏也能一眼看到跑的是哪张图 */
+#mapChip{font-size:12px;height:29px;padding:0 12px;border-radius:var(--r-pill);
+  background:var(--acc-soft);color:var(--acc);font-weight:590;
+  display:inline-flex;align-items:center;gap:5px;max-width:220px}
+#mapChip b{font-weight:590;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 系统时间: 右侧信息组的第一项, margin-left:auto 把 时间/统计/喇叭 整组推到右边 */
+#clock{margin-left:auto;display:inline-flex;align-items:center;gap:5px;font-size:12.5px;
+  color:var(--dim);font-variant-numeric:tabular-nums}
+#clock .ic{opacity:.55}
+#clock b{color:var(--fg);font-weight:590;letter-spacing:.2px}
+#stats{display:flex;gap:13px;font-size:12px;color:var(--dim);flex-wrap:wrap;
+  font-variant-numeric:tabular-nums}
+#stats span{display:inline-flex;align-items:baseline;gap:3px}
+#stats .ic{opacity:.55;align-self:center}
+#stats b{color:var(--fg);font-weight:590}
+#stats .u{color:var(--dim2);font-size:11px;font-weight:510}
+#stats .warn b{color:var(--warn)} #stats .bad b{color:var(--bad)}
+#stats .warn{color:var(--warn)} #stats .bad{color:var(--bad)}
+/* 状态栏图标按钮 (语音播报喇叭): off=灰, on=主色 */
+.iconbtn{width:30px;height:30px;flex:none;border-radius:9px;
+  background:var(--panel2);color:var(--dim);display:inline-flex;align-items:center;
+  justify-content:center;cursor:pointer;user-select:none;font-size:15px;
+  transition:background .18s,color .18s,transform .1s}
+.iconbtn:active{transform:scale(.9)}
+.iconbtn.on{background:var(--acc-soft);color:var(--acc)}
+@media (hover:hover){.iconbtn:hover{color:var(--fg)}.iconbtn.on:hover{color:var(--acc)}}
+
+#taskBar{display:flex;align-items:center;gap:8px;padding:9px 16px;flex-wrap:wrap;z-index:7}
+/* 操作按钮: 内容自适应宽度, 不拉伸、不形变 */
+#taskBar .b{flex:none;padding-left:16px;padding-right:16px}
+/* 左侧按钮 与 右侧信息 之间的竖向圆角分隔条 (吸收中间空白, 把信息组推到右侧) */
+.v-sep{width:3px;height:24px;border-radius:2px;background:var(--line);
+  flex:none;align-self:center;margin-left:auto}
+/* 操作栏右侧的信息组: 地图名/坐标/传感器, 靠右成组 */
+#taskInfo{display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:none}
+/* 地图调节按钮: 悬浮在画布右上角的毛玻璃小工具条 (与图例同风格) */
+#viewToolbar{position:absolute;top:12px;right:12px;z-index:6;
+  display:flex;align-items:center;gap:5px;padding:5px;flex-wrap:wrap;
+  justify-content:flex-end;max-width:calc(100% - 24px);
+  background:var(--glass);backdrop-filter:blur(16px) saturate(180%);
+  -webkit-backdrop-filter:blur(16px) saturate(180%);
+  border:.5px solid var(--line);border-radius:13px;box-shadow:var(--shadow)}
+.cbtn{width:38px;height:38px;border-radius:var(--r-btn);background:var(--panel2);
+  color:var(--fg);font-size:17px;display:flex;align-items:center;justify-content:center;
+  cursor:pointer;user-select:none;transition:background .18s,color .18s,transform .1s}
+#viewToolbar .cbtn{width:30px;height:30px;font-size:14px}
+.cbtn:active{transform:scale(.92)}
+.cbtn.active{background:var(--acc);color:#fff;box-shadow:0 2px 10px var(--acc-soft)}
+#compassNeedle{display:inline-block;transition:transform .15s}
+
+/* ---------- 主区 / 画布 ---------- */
+#main{flex:1;display:flex;min-height:0;position:relative}
+#canvasWrap{flex:1;position:relative;min-width:0}
+canvas#view{position:absolute;inset:0;width:100%;height:100%;display:block}
+#hint{position:absolute;top:14px;left:14px;right:14px;pointer-events:none;
+  color:var(--warn);font-size:13px;font-weight:590;
+  text-shadow:0 1px 3px var(--glass-strong),0 0 10px var(--glass-strong)}
+
+/* ---------- 摇杆 ---------- */
+#joyWrap{display:flex;justify-content:center;padding:8px 0 4px}
+#joy{width:154px;height:154px;border-radius:50%;position:relative;touch-action:none;
+  background:radial-gradient(circle at 50% 45%,var(--panel3),var(--panel2));
+  box-shadow:inset 0 1px 3px rgba(0,0,0,.06),inset 0 0 0 .5px var(--line)}
+#knob{width:64px;height:64px;border-radius:50%;position:absolute;left:45px;top:45px;
+  background:radial-gradient(circle at 34% 28%,var(--knob-hi),var(--acc));
+  box-shadow:0 4px 14px rgba(0,122,255,.42),inset 0 -2px 6px rgba(0,0,0,.12)}
+
+/* ---------- 侧栏 ---------- */
+.side-panel{width:306px;flex:none;background:transparent;overflow:hidden;
+  transition:width .26s cubic-bezier(.32,.72,0,1)}
+.side-panel.panel-hidden{width:0}
+.panel-inner{width:306px;height:100%;overflow-y:auto;padding:14px 13px 22px;
+  display:flex;flex-direction:column;gap:12px;touch-action:pan-y;
+  -webkit-overflow-scrolling:touch}
+.panel-handle{position:absolute;top:50%;transform:translateY(-50%);width:22px;height:58px;
+  background:var(--glass);backdrop-filter:blur(16px) saturate(180%);
+  -webkit-backdrop-filter:blur(16px) saturate(180%);color:var(--dim);
+  display:flex;align-items:center;justify-content:center;cursor:pointer;
+  box-shadow:var(--shadow);z-index:6;font-size:15px;user-select:none;
+  border:.5px solid var(--line);border-left:none}
+.panel-handle{left:0;border-radius:0 14px 14px 0}
+.panel-handle.right{left:auto;right:0;border-radius:14px 0 0 14px;
+  border:.5px solid var(--line);border-right:none}
+
+/* ---------- 卡片 (iOS 内嵌分组列表风格) ---------- */
+.card{background:var(--panel);border-radius:var(--r-card);padding:14px;
+  box-shadow:var(--shadow)}
+.card h3{font-size:12px;color:var(--dim);font-weight:600;margin-bottom:10px;
+  letter-spacing:.3px;text-transform:uppercase}
+.card h3.fold{display:flex;align-items:center;justify-content:space-between;
+  cursor:pointer;user-select:none;margin-bottom:0;text-transform:uppercase}
+.card h3.fold .chev{font-size:11px;color:var(--dim2);transition:transform .22s;
+  padding-left:10px;flex:none;text-transform:none}
+.card.collapsed h3.fold{margin-bottom:0}
+.card.collapsed .chev{transform:rotate(-90deg)}
+.card.collapsed .card-body{display:none}
+.card .card-body{margin-top:11px}
+.tip{font-size:11.5px;color:var(--dim);line-height:1.5;margin-top:10px;
+  padding-top:10px;border-top:.5px solid var(--line)}
+.tip code{font-size:10.5px;background:var(--panel2);padding:1.5px 5px;border-radius:5px;
+  font-family:ui-monospace,"SF Mono",Menlo,monospace}
+
+/* ---------- 按钮 ---------- */
+.btnrow{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+button.b{padding:11px 10px;border-radius:var(--r-btn);border:none;
+  background:var(--panel2);color:var(--fg);font-size:14.5px;font-weight:510;
+  letter-spacing:-.2px;cursor:pointer;font-family:inherit;
+  display:inline-flex;align-items:center;justify-content:center;gap:7px;
+  transition:background .16s,transform .1s,opacity .16s}
+/* 图标按钮里的图标略降透明度, 让文字是主角; 主色/选中态下恢复满不透明 */
+button.b .ic{opacity:.72}
+button.b.primary .ic,button.b.danger .ic,button.b.tool.active .ic{opacity:1}
+button.b:active{transform:scale(.96)}
+@media (hover:hover){button.b:hover{background:var(--panel3)}}
+button.b:disabled{opacity:.35;pointer-events:none}
+button.b.dim{opacity:.45}
+button.b.primary{background:var(--acc);color:#fff;font-weight:600;
+  box-shadow:0 2px 10px var(--acc-soft)}
+@media (hover:hover){button.b.primary:hover{background:var(--acc);filter:brightness(1.08)}}
+button.b.danger{background:var(--bad-soft);color:var(--bad);font-weight:600}
+@media (hover:hover){button.b.danger:hover{background:var(--bad-soft);filter:brightness(.96)}}
+/* 急停是全场唯一的实心红 —— 它跟"停止任务"不是一个量级的动作, 视觉上必须分开 */
+#bEstop{background:var(--bad);color:#fff;box-shadow:0 2px 10px var(--bad-soft)}
+@media (hover:hover){#bEstop:hover{background:var(--bad);filter:brightness(1.08)}}
+button.b.full{grid-column:1/3}
+button.b.tool.active{background:var(--acc);color:#fff;box-shadow:0 2px 10px var(--acc-soft)}
+
+/* ---------- 分段控件 (iOS Segmented Control) ---------- */
+.seg{display:flex;background:var(--panel2);border-radius:10px;padding:2px;gap:2px;
+  margin-bottom:9px}
+#topbar .seg{width:236px;flex:none;margin-bottom:0}
+/* 传感器下拉: 一个胶囊, 显示当前传感器名 + 在线小圆点, 点开原生下拉切换 */
+.sensor-pick{flex:none;display:inline-flex;align-items:center;gap:6px;
+  background:var(--panel2);border-radius:var(--r-pill);padding:0 9px 0 11px;
+  height:29px;cursor:pointer;position:relative}
+.sensor-pick .dot2{width:6px;height:6px;border-radius:50%;background:var(--dim2);flex:none}
+.sensor-pick.online .dot2{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
+.sensor-pick select{-webkit-appearance:none;appearance:none;border:none;outline:none;
+  background:transparent;color:var(--fg);font:590 12.5px/1 inherit;font-family:inherit;
+  cursor:pointer;padding:0;letter-spacing:-.1px}
+.sensor-pick .chev-i{width:.9em;height:.9em;opacity:.5;pointer-events:none;margin-left:-3px}
+.sensor-pick.busy{opacity:.5;pointer-events:none}
+.seg-btn{flex:1;padding:7px 4px;border:none;background:transparent;color:var(--fg);
+  font-size:12.5px;font-weight:510;cursor:pointer;border-radius:8px;font-family:inherit;
+  letter-spacing:-.1px;transition:background .2s,color .2s,box-shadow .2s}
+.seg-btn.active{background:var(--panel);color:var(--fg);font-weight:600;
+  box-shadow:0 1px 3px rgba(0,0,0,.12),0 0 0 .5px rgba(0,0,0,.04)}
+.seg-btn:disabled{opacity:.4;pointer-events:none}
+.seg-btn.detected{position:relative}
+.seg-btn.detected::after{content:'';display:inline-block;width:5px;height:5px;
+  border-radius:50%;background:var(--ok);vertical-align:middle;margin-left:4px}
+
+/* ---------- 滑块 (iOS Slider) ---------- */
+.slider{display:flex;align-items:center;gap:10px;font-size:12.5px;color:var(--dim);
+  margin-top:9px}
+.slider input[type=range]{flex:1;-webkit-appearance:none;appearance:none;height:4px;
+  border-radius:2px;outline:none;background:var(--panel2);
+  background-image:linear-gradient(var(--acc),var(--acc));
+  background-size:var(--fill,50%) 100%;background-repeat:no-repeat}
+.slider input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;
+  width:22px;height:22px;border-radius:50%;background:#fff;cursor:pointer;
+  box-shadow:var(--thumb);transition:transform .1s}
+.slider input[type=range]::-webkit-slider-thumb:active{transform:scale(1.12)}
+.slider input[type=range]::-moz-range-thumb{width:22px;height:22px;border:none;
+  border-radius:50%;background:#fff;cursor:pointer;box-shadow:var(--thumb)}
+.slider span{width:58px;text-align:right;color:var(--fg);font-weight:510;
+  font-variant-numeric:tabular-nums}
+
+/* ---------- 开关 (iOS Switch) ---------- */
+.chkrow{display:flex;align-items:center;gap:10px;font-size:13.5px;color:var(--fg);
+  margin:11px 0 9px}
+.chkrow label{flex:1;cursor:pointer;color:var(--dim)}
+.chkrow input[type=checkbox]{-webkit-appearance:none;appearance:none;flex:none;
+  width:50px;height:30px;border-radius:var(--r-pill);background:var(--panel2);
+  position:relative;cursor:pointer;transition:background .26s cubic-bezier(.32,.72,0,1)}
+.chkrow input[type=checkbox]::after{content:'';position:absolute;top:2px;left:2px;
+  width:26px;height:26px;border-radius:50%;background:#fff;box-shadow:var(--thumb);
+  transition:transform .26s cubic-bezier(.32,.72,0,1)}
+.chkrow input[type=checkbox]:checked{background:var(--ok)}
+.chkrow input[type=checkbox]:checked::after{transform:translateX(20px)}
+
+/* ---------- 导航状态卡 ---------- */
+#navCard .row{display:flex;justify-content:space-between;align-items:center;
+  font-size:13.5px;padding:7px 0;color:var(--dim);border-bottom:.5px solid var(--line)}
+#navCard .row:last-child{border-bottom:none;padding-bottom:0}
+#navCard .row b{color:var(--fg);font-weight:590;font-variant-numeric:tabular-nums}
+#navState{padding:3px 11px;border-radius:var(--r-pill);font-size:11.5px;font-weight:600;
+  background:var(--panel2);color:var(--dim);text-transform:none;letter-spacing:0}
+#navState.active{background:var(--acc-soft);color:var(--acc)}
+#navState.succeeded{background:var(--ok-soft);color:var(--ok)}
+#navState.aborted,#navState.rejected{background:var(--bad-soft);color:var(--bad)}
+#navState.canceled{background:var(--warn-soft);color:var(--warn)}
+
+/* ---------- 航点列表 ---------- */
+#wpsList{max-height:158px;overflow-y:auto;font-size:12.5px;touch-action:pan-y}
+#wpsList .wp{display:flex;align-items:center;gap:9px;padding:7px 2px;
+  border-bottom:.5px solid var(--line);font-variant-numeric:tabular-nums}
+#wpsList .wp:last-child{border-bottom:none}
+#wpsList .n{width:22px;height:22px;border-radius:50%;background:var(--warn);color:#fff;
+  font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;flex:none}
+#wpsList .wp.cur .n{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
+#wpsList .del{margin-left:auto;color:var(--dim2);cursor:pointer;padding:4px;
+  display:inline-flex;align-items:center;border-radius:7px;transition:color .15s}
+@media (hover:hover){#wpsList .del:hover{color:var(--bad)}}
+#wpsEmpty,#mapListEmpty{color:var(--dim2);font-size:12.5px;text-align:center;padding:14px 0}
+
+/* ---------- 网络卡片 ---------- */
+.wifi-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.wifi-row span{font-size:13.5px;color:var(--fg);font-variant-numeric:tabular-nums;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  display:inline-flex;align-items:center;gap:6px;min-width:0}
+.wifi-row button{padding:8px 15px;font-size:13px;flex:none}
+
+/* ---------- 地图库 ---------- */
+#mapList{max-height:224px;overflow-y:auto;font-size:12.5px;touch-action:pan-y}
+.map-row{display:flex;align-items:center;gap:10px;padding:8px 2px;
+  border-bottom:.5px solid var(--line);cursor:pointer;border-radius:8px;
+  transition:background .15s}
+.map-row:last-child{border-bottom:none}
+@media (hover:hover){.map-row:hover{background:var(--panel3)}}
+.map-radio{width:19px;height:19px;border-radius:50%;border:1.5px solid var(--dim2);
+  flex:none;position:relative;transition:border-color .18s,background .18s}
+.map-row.sel .map-radio{border-color:var(--acc);background:var(--acc)}
+.map-row.sel .map-radio::after{content:'';position:absolute;inset:0;
+  background:#fff;-webkit-mask:url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6.4 11.2 3.6 8.4l1-1 1.8 1.8 4.6-4.6 1 1z'/%3E%3C/svg%3E") center/contain no-repeat;
+          mask:url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6.4 11.2 3.6 8.4l1-1 1.8 1.8 4.6-4.6 1 1z'/%3E%3C/svg%3E") center/contain no-repeat}
+.map-hdr{display:flex;justify-content:space-between;align-items:center;gap:8px;
+  font-size:12px;color:var(--dim);padding:3px 0 7px}
+.map-hdr b{color:var(--fg);font-weight:590;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.map-hdr.running b{color:var(--acc)}
+.map-row.running{background:var(--acc-soft)}
+.running-tag{margin-left:7px;font-size:10px;font-weight:600;padding:1.5px 7px;
+  border-radius:var(--r-pill);background:var(--acc);color:#fff;vertical-align:1px}
+.map-info{flex:1;min-width:0}
+.map-info b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  font-weight:510;font-size:13.5px}
+.map-info small{color:var(--dim);font-variant-numeric:tabular-nums;font-size:11.5px}
+.map-edit,.map-del{flex:none;padding:5px;font-size:15px;cursor:pointer;
+  border-radius:8px;transition:background .15s,color .15s;
+  display:inline-flex;align-items:center;color:var(--dim2)}
+@media (hover:hover){.map-edit:hover{color:var(--acc)}.map-del:hover{color:var(--bad)}}
+@media (hover:hover){.map-edit:hover,.map-del:hover{background:var(--panel2)}}
+
+/* ---------- 地图编辑覆盖层 ---------- */
+#editOverlay{position:fixed;inset:0;background:var(--bg);z-index:50;
+  display:none;flex-direction:column}
+#editToolbar{display:flex;align-items:center;gap:8px;padding:10px 14px;
+  background:var(--glass);backdrop-filter:blur(24px) saturate(180%);
+  -webkit-backdrop-filter:blur(24px) saturate(180%);
+  border-bottom:.5px solid var(--line);flex-wrap:wrap}
+#editToolbar .etitle{font-weight:600;font-size:14px;margin-right:6px;letter-spacing:-.3px;
+  display:inline-flex;align-items:center;gap:6px}
+.ebtn{display:inline-flex;align-items:center;gap:6px}
+.ebtn{padding:8px 13px;border-radius:10px;border:none;font-family:inherit;
+  background:var(--panel2);color:var(--fg);font-size:13px;font-weight:510;cursor:pointer;
+  transition:background .16s,transform .1s}
+.ebtn:active{transform:scale(.96)}
+.ebtn.active{background:var(--acc);color:#fff}
+.ebtn.primary{background:var(--acc);color:#fff;font-weight:600}
+.ebtn.danger{background:var(--bad-soft);color:var(--bad)}
+#editToolbar input[type=range]{width:96px;accent-color:var(--acc)}
+#editCanvasWrap{flex:1;overflow:auto;display:flex;align-items:center;justify-content:center;
+  background:repeating-conic-gradient(var(--panel3) 0% 25%,transparent 0% 50%) 50%/16px 16px}
+#editCanvas{image-rendering:pixelated;cursor:crosshair;border-radius:4px;
+  box-shadow:0 4px 20px rgba(0,0,0,.25)}
+
+/* ---------- 日志 ---------- */
+#logBox{background:var(--panel3);border:.5px solid var(--line);border-radius:12px;
+  height:146px;overflow-y:auto;padding:9px 11px;
+  font:11.5px/1.6 ui-monospace,"SF Mono",Menlo,monospace;
+  color:var(--dim);white-space:pre-wrap;word-break:break-all;touch-action:pan-y}
+#logBox .hl{color:var(--warn);font-weight:600}
+
+/* ---------- Toast ---------- */
+#toasts{position:absolute;top:16px;left:50%;transform:translateX(-50%);
+  display:flex;flex-direction:column;gap:9px;align-items:center;z-index:20;pointer-events:none}
+.toast{background:var(--glass-strong);backdrop-filter:blur(24px) saturate(180%);
+  -webkit-backdrop-filter:blur(24px) saturate(180%);
+  border:.5px solid var(--line);border-left:3.5px solid var(--acc);
+  border-radius:14px;padding:12px 18px;font-size:14px;font-weight:510;
+  max-width:86vw;box-shadow:var(--shadow-lg);color:var(--fg);
+  animation:toastIn .32s cubic-bezier(.32,.72,0,1)}
+.toast.bad{border-left-color:var(--bad);color:var(--bad)}
+@keyframes toastIn{from{opacity:0;transform:translateY(-14px) scale(.96)}
+                   to{opacity:1;transform:none}}
+
+/* ---------- 图例 ---------- */
+/* 图例贴右下角(不再横跨整条底边)——否则会盖住左下角画在canvas上的比例尺 */
+#legend{position:absolute;right:14px;bottom:14px;max-width:calc(100% - 130px);
+  background:var(--glass);
+  backdrop-filter:blur(18px) saturate(180%);-webkit-backdrop-filter:blur(18px) saturate(180%);
+  border-radius:12px;padding:6px 10px;font-size:11px;border:.5px solid var(--line);
+  color:var(--dim);white-space:nowrap;overflow:hidden;text-align:right;
+  pointer-events:none;box-shadow:var(--shadow)}
+#legend span{display:inline-flex;align-items:center;white-space:nowrap;margin-left:9px}
+#legend span:first-child{margin-left:0}
+#legend i{display:inline-block;width:11px;height:11px;border-radius:3px;
+  margin-right:4px;vertical-align:-1px;border:.5px solid rgba(128,128,128,.28)}
+/* 可点击图层开关: 重新开启指针事件, 关闭态置灰 */
+#legend .tgl{pointer-events:auto;cursor:pointer;user-select:none;
+  border-radius:6px;padding:1px 4px;margin-left:5px;
+  transition:opacity .15s,background .15s}
+@media (hover:hover){#legend .tgl:hover{background:var(--panel2)}}
+#legend .tgl.off{opacity:.4}
+@media (max-width:760px){#legend{display:none}}
+
+/* ---------- 滚动条 ---------- */
+.panel-inner::-webkit-scrollbar,#logBox::-webkit-scrollbar,
+#mapList::-webkit-scrollbar,#wpsList::-webkit-scrollbar{width:5px}
+.panel-inner::-webkit-scrollbar-thumb,#logBox::-webkit-scrollbar-thumb,
+#mapList::-webkit-scrollbar-thumb,#wpsList::-webkit-scrollbar-thumb{
+  background:var(--dim2);border-radius:3px}
+.panel-inner::-webkit-scrollbar-track,#logBox::-webkit-scrollbar-track{background:transparent}
+
+@keyframes pulse{50%{opacity:.4}}
+button.b.wait{animation:pulse 1s infinite;pointer-events:none}
+
+@media (max-width:760px){
+  .side-panel{position:absolute;top:0;bottom:0;z-index:10;width:87vw!important;
+    max-width:330px;background:var(--bg);box-shadow:var(--shadow-lg);
+    transition:transform .28s cubic-bezier(.32,.72,0,1)}
+  .panel-inner{width:100%}
+  #leftPanel{left:0;transform:translateX(-105%)}
+  #rightPanel{right:0;transform:translateX(105%)}
+  #leftPanel:not(.panel-hidden){transform:none}
+  #rightPanel:not(.panel-hidden){transform:none}
+  #viewToolbar{top:10px;right:10px;gap:4px;padding:4px;max-width:calc(100% - 20px)}
+  #viewToolbar .cbtn{width:32px;height:32px}
+  #topbar{padding:8px 12px}
+  #taskBar{padding:9px 12px}
+}
+</style>
+</head>
+<body>
+<!-- 图标精灵: 统一的线性图标, 替代原来的 emoji。
+     emoji 在 iOS/Android/Linux 三套字形下长得都不一样, 自带颜色跟主题打架,
+     也没法跟着按钮变色(选中态白字时 emoji 还是原色)。这里全部走 currentColor,
+     尺寸用 em 跟随字号。 -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-map" viewBox="0 0 24 24"><path d="M15 5.5 9 3 3 5.5v15L9 18l6 2.5 6-2.5v-15L15 5.5zM9 3v15M15 5.5v15"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M12 3v11m0 0 4-4m-4 4-4-4M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></symbol>
+<symbol id="i-nav" viewBox="0 0 24 24"><path d="M12 2.5 4.5 21l7.5-4 7.5 4L12 2.5z"/></symbol>
+<symbol id="i-radar" viewBox="0 0 24 24"><path d="M12 19.5h.01M8.5 16a5 5 0 0 1 7 0M5 12.5a10 10 0 0 1 14 0M1.8 9a15 15 0 0 1 20.4 0"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2.2"/></symbol>
+<symbol id="i-estop" viewBox="0 0 24 24"><path d="M8.6 3h6.8L21 8.6v6.8L15.4 21H8.6L3 15.4V8.6L8.6 3zM12 8v5"/><path d="M12 16.4h.01"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3"/></symbol>
+<symbol id="i-route" viewBox="0 0 24 24"><circle cx="6" cy="18" r="2.2"/><circle cx="18" cy="6" r="2.2"/><path d="M8.4 17.5h3.6a4 4 0 0 0 4-4V8.4"/></symbol>
+<symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 21.5s7-6.4 7-11.5a7 7 0 1 0-14 0c0 5.1 7 11.5 7 11.5z"/><circle cx="12" cy="10" r="2.5"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.4-5.7M20.5 3.5v5h-5"/></symbol>
+<symbol id="i-xc" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M15 9l-6 6M9 9l6 6"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13l11-6.5-11-6.5z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 6.5h16M9.5 6.5v-2a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v2M6.5 6.5l.9 13.1a1 1 0 0 0 1 .9h7.2a1 1 0 0 0 1-.9l.9-13.1"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20h4L19.4 8.6a2.1 2.1 0 0 0-3-3L5 17v3zM14.6 6.4l3 3"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5.5v13M5.5 12h13"/></symbol>
+<symbol id="i-minus" viewBox="0 0 24 24"><path d="M5.5 12h13"/></symbol>
+<symbol id="i-rotl" viewBox="0 0 24 24"><path d="M3.5 4.5v6h6"/><path d="M4.3 10.5a8 8 0 1 0 2.1-3.4"/></symbol>
+<symbol id="i-rotr" viewBox="0 0 24 24"><path d="M20.5 4.5v6h-6"/><path d="M19.7 10.5a8 8 0 1 1-2.1-3.4"/></symbol>
+<symbol id="i-compass" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M15.6 8.4l-2.1 5.1-5.1 2.1 2.1-5.1 5.1-2.1z"/></symbol>
+<symbol id="i-fit" viewBox="0 0 24 24"><path d="M4 9V5.5A1.5 1.5 0 0 1 5.5 4H9M15 4h3.5A1.5 1.5 0 0 1 20 5.5V9M20 15v3.5a1.5 1.5 0 0 1-1.5 1.5H15M9 20H5.5A1.5 1.5 0 0 1 4 18.5V15"/></symbol>
+<symbol id="i-follow" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2.4" class="f"/><path d="M12 1.8v3.2M12 19v3.2M1.8 12h3.2M19 12h3.2"/></symbol>
+<symbol id="i-flame" viewBox="0 0 24 24"><path d="M12 21.5c3.9 0 6.4-2.6 6.4-6.1 0-3.8-3.4-5.5-3.4-9.1 0 0-2.5 1.5-2.5 4.4 0 2-1 2.5-1 2.5s-1-1.3-1-3c0 0-2.4 2.4-2.4 5.2 0 3.5 0 6.1 3.9 6.1z"/></symbol>
+<symbol id="i-hotspot" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.2" class="f"/><path d="M8.6 8.6a4.8 4.8 0 0 0 0 6.8M15.4 8.6a4.8 4.8 0 0 1 0 6.8M5.6 5.6a9 9 0 0 0 0 12.8M18.4 5.6a9 9 0 0 1 0 12.8"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.8 4.8L19 7"/></symbol>
+<symbol id="i-batt" viewBox="0 0 24 24"><rect x="2.5" y="7.5" width="16" height="9" rx="2.2"/><path d="M21.5 10.5v3"/></symbol>
+<symbol id="i-mem" viewBox="0 0 24 24"><rect x="5.5" y="5.5" width="13" height="13" rx="1.8"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 2.5v3M15 2.5v3M9 18.5v3M15 18.5v3M2.5 9h3M2.5 15h3M18.5 9h3M18.5 15h3"/></symbol>
+<symbol id="i-disk" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7.5" ry="3"/><path d="M4.5 6v12c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3V6M4.5 12c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3"/></symbol>
+<symbol id="i-temp" viewBox="0 0 24 24"><path d="M14 14.8V5a2 2 0 1 0-4 0v9.8a4 4 0 1 0 4 0z"/></symbol>
+<symbol id="i-cube" viewBox="0 0 24 24"><path d="M12 2.8 3.5 7.4v9.2L12 21.2l8.5-4.6V7.4L12 2.8zM3.5 7.4 12 12m0 0 8.5-4.6M12 12v9.2"/></symbol>
+<symbol id="i-chev" viewBox="0 0 24 24"><path d="M6 9.5l6 6 6-6"/></symbol>
+<symbol id="i-spk" viewBox="0 0 24 24"><path d="M4 9v6h3.5L13 20V4L7.5 9H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/></symbol>
+<symbol id="i-spkoff" viewBox="0 0 24 24"><path d="M4 9v6h3.5L13 20V4L7.5 9H4z"/><path d="M22 9.5l-5 5M17 9.5l5 5"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
+</defs></svg>
+<div id="app">
+  <!-- 状态栏: 只放状态信息 (连接/模式/电量/内存/磁盘/温度) -->
+  <div id="topbar">
+    <span class="dot" id="connDot"></span>
+    <span class="title">CAR 控制台</span>
+    <span class="badge" id="modeBadge">离线</span>
+    <!-- 系统时间 (客户端本地时间, 每秒刷新) -->
+    <span id="clock"><svg class="ic"><use href="#i-clock"/></svg><b>--:--:--</b></span>
+    <div id="stats"></div>
+    <!-- 语音播报开关: 点喇叭切换; 音量直接跟随系统音量 -->
+    <span class="iconbtn" id="voiceBtn" title="语音播报 (导航到达/失败、绑架恢复、急停等)"><svg class="ic"><use href="#i-spkoff"/></svg></span>
+  </div>
+  <!-- 操作栏: 任务按钮 + 传感器/坐标/地图名 显示 -->
+  <div id="taskBar">
+    <button class="b" id="bMap"><svg class="ic"><use href="#i-map"/></svg><span>建图</span></button>
+    <button class="b" id="bSave"><svg class="ic"><use href="#i-save"/></svg><span>保存地图</span></button>
+    <button class="b" id="bNav"><svg class="ic"><use href="#i-nav"/></svg><span>导航</span></button>
+    <button class="b" id="bLidar"><svg class="ic"><use href="#i-radar"/></svg><span>雷达测试</span></button>
+    <button class="b danger" id="bStop"><svg class="ic"><use href="#i-stop"/></svg><span>停止任务</span></button>
+    <!-- 左侧按钮 与 右侧信息 之间的竖向圆角分隔条 -->
+    <span class="v-sep"></span>
+    <!-- 右侧信息: 地图名(导航时) · 坐标(导航/建图时) · 传感器型号及状态 -->
+    <div id="taskInfo">
+      <span id="mapChip" style="display:none"></span>
+      <span id="poseChip" style="display:none"><svg class="ic"><use href="#i-pin"/></svg> --</span>
+      <!-- 传感器: 只显示当前这一个的名字, 点开下拉才切换(平时靠自动探测选好) -->
+      <label class="sensor-pick" id="sensorPick">
+        <span class="dot2" id="sensorDot"></span>
+        <select id="sensorSel">
+          <option value="mid360">MID360s</option>
+          <option value="n10plus">N10Plus</option>
+          <option value="odin1">Odin1</option>
+        </select>
+        <svg class="ic chev-i"><use href="#i-chev"/></svg>
+      </label>
+    </div>
+  </div>
+  <div id="main">
+    <div id="leftPanel" class="side-panel">
+      <div class="panel-inner">
+        <div class="card">
+          <h3 class="fold" data-key="maps">
+            <span>地图库</span>
+            <i class="chev">⌄</i>
+          </h3>
+          <div class="card-body">
+            <div class="map-hdr"><span>下次导航使用</span><b id="selectedMapLabel">默认地图</b></div>
+            <div class="map-hdr running" id="activeMapRow" style="display:none">
+              <span>正在导航</span><b id="activeMapLabel">--</b>
+            </div>
+            <div id="mapList"></div>
+            <div id="mapListEmpty">暂无已保存的地图</div>
+            <div class="tip">保存地图时会弹窗输入名字；导航前先在这里选一张要用的地图(不选则用默认地图名)。Odin1的.bin地图不支持编辑。</div>
+          </div>
+        </div>
+        <div class="card" id="navCard">
+          <h3 style="display:flex;justify-content:space-between;align-items:center">
+            导航状态 <span id="navState">空闲</span></h3>
+          <div class="row"><span>当前坐标</span><b id="nvPose">--</b></div>
+          <div class="row"><span>朝向</span><b id="nvYaw">--</b></div>
+          <div class="row" id="rGoal"><span>目标坐标</span><b id="nvGoal">--</b></div>
+          <div class="row" id="rDist"><span>剩余距离</span><b id="nvDist">--</b></div>
+          <div class="row" id="rTime"><span>导航用时</span><b id="nvTime">--</b></div>
+          <div class="row" id="rRecov"><span>恢复行为</span><b id="nvRecov">--</b></div>
+          <div class="row" id="rWp"><span>当前航点</span><b id="nvWp">--</b></div>
+        </div>
+        <div class="card">
+          <h3>导航操作</h3>
+          <div class="btnrow">
+            <button class="b tool" id="bGoal"><svg class="ic"><use href="#i-target"/></svg><span>单点目标</span></button>
+            <button class="b tool" id="bWps"><svg class="ic"><use href="#i-route"/></svg><span>多点路线</span></button>
+            <button class="b tool" id="bInit"><svg class="ic"><use href="#i-pin"/></svg><span>设初始位姿</span></button>
+            <button class="b" id="bReloc"><svg class="ic"><use href="#i-refresh"/></svg><span>自动重定位</span></button>
+            <button class="b" id="bCancel"><svg class="ic"><use href="#i-xc"/></svg><span>取消目标</span></button>
+            <button class="b danger" id="bEstop"><svg class="ic"><use href="#i-estop"/></svg><span>急停</span></button>
+          </div>
+          <div class="tip">急停: 立即刹车并取消当前目标。建图用摇杆遥控时, 松手即停。</div>
+        </div>
+        <div class="card" id="wpsCard" style="display:none">
+          <h3>航点路线 <span id="wpsCount" style="float:right"></span></h3>
+          <div id="wpsList"></div>
+          <div id="wpsEmpty">点击"多点路线"后在地图上依次点选航点<br>(按下=位置, 拖动=朝向)</div>
+          <div class="chkrow"><input type="checkbox" id="wpsLoop"><label for="wpsLoop">循环巡航 (到终点后从头再来)</label></div>
+          <div class="btnrow">
+            <button class="b primary" id="wpsGo"><svg class="ic"><use href="#i-play"/></svg><span>开始巡航</span></button>
+            <button class="b" id="wpsClear"><svg class="ic"><use href="#i-trash"/></svg><span>清空</span></button>
+            <button class="b full" id="wpsSave"><svg class="ic"><use href="#i-save"/></svg><span>保存路线到当前地图</span></button>
+          </div>
+          <div class="tip" id="wpsBindTip"></div>
+        </div>
+        <div class="card">
+          <h3 class="fold" data-key="navtune">
+            <span>自动导航调参 <small style="font-weight:400">(本次会话)</small></span>
+            <i class="chev">⌄</i>
+          </h3>
+          <div class="card-body">
+            <div class="slider">线速度上限<input type="range" id="navVx" min="0.1" max="0.6" step="0.05" value="0.5"><span id="navVxV">0.50 m/s</span></div>
+            <div class="slider">角速度上限<input type="range" id="navWz" min="0.3" max="2.0" step="0.1" value="1.2"><span id="navWzV">1.20 rad/s</span></div>
+            <div class="slider">避障膨胀半径<input type="range" id="obsR" min="0.15" max="0.8" step="0.05" value="0.35"><span id="obsRV">0.35 m</span></div>
+            <div class="slider">避障衰减系数<input type="range" id="obsC" min="1" max="15" step="0.5" value="3"><span id="obsCV">3.0</span></div>
+            <div class="btnrow" style="margin-top:8px">
+              <button class="b primary full" id="navApply"><svg class="ic"><use href="#i-check"/></svg><span>应用到当前导航</span></button>
+            </div>
+            <div class="tip">膨胀半径越大=避让越早更安全。需先启动导航才生效, 重启导航恢复默认值</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="canvasWrap">
+      <canvas id="view"></canvas>
+      <!-- 地图调节按钮: 悬浮在地图层右上角, 小尺寸, 与图例同风格 -->
+      <div id="viewToolbar">
+        <div class="cbtn" id="zoomIn" title="放大"><svg class="ic"><use href="#i-plus"/></svg></div>
+        <div class="cbtn" id="zoomOut" title="缩小"><svg class="ic"><use href="#i-minus"/></svg></div>
+        <div class="cbtn" id="rotL" title="逆时针旋转15°"><svg class="ic"><use href="#i-rotl"/></svg></div>
+        <div class="cbtn" id="rotR" title="顺时针旋转15°"><svg class="ic"><use href="#i-rotr"/></svg></div>
+        <div class="cbtn" id="rotReset" title="重置正北朝上 (双指也可旋转地图)">
+          <span id="compassNeedle"><svg class="ic"><use href="#i-compass"/></svg></span></div>
+        <div class="cbtn" id="fitBtn" title="地图居中"><svg class="ic"><use href="#i-fit"/></svg></div>
+        <div class="cbtn" id="followBtn" title="跟随小车"><svg class="ic"><use href="#i-follow"/></svg></div>
+      </div>
+      <div id="hint"></div>
+      <div class="panel-handle" id="leftHandle" title="导航面板">‹</div>
+      <div class="panel-handle right" id="rightHandle" title="建图面板">›</div>
+      <!-- 图例: 前几项纯说明; 带 .tgl 的可点击, 切换该图层在地图上显示/隐藏 -->
+      <div id="legend">
+        <span><i style="background:#fff"></i>可通行</span>
+        <span><i style="background:#273244"></i>障碍</span>
+        <span><i style="background:rgba(154,164,178,.4)"></i>未知</span>
+        <span><i style="background:#2563eb"></i>小车</span>
+        <span><i style="background:#e11d48"></i>激光</span>
+        <span><i style="background:#f59e0b"></i>航点</span>
+        <span class="tgl" data-layer="plan"><i style="background:#059669"></i>全局路径</span>
+        <span class="tgl" data-layer="local"><i style="background:#06b6d4"></i>局部路径</span>
+        <span class="tgl" data-layer="traj"><i style="background:#8b5cf6"></i>轨迹</span>
+        <span class="tgl" data-layer="costmap"><i style="background:linear-gradient(90deg,#fff0,#ff8c00 60%,#e00)"></i>代价地图</span>
+      </div>
+      <div id="toasts"></div>
+    </div>
+    <div id="rightPanel" class="side-panel">
+      <div class="panel-inner">
+        <div class="card">
+          <h3 class="fold" data-key="teleop">
+            <span>遥控速度限制 <small style="font-weight:400">(仅摇杆)</small></span>
+            <i class="chev">⌄</i>
+          </h3>
+          <div class="card-body">
+            <div class="slider">线速度<input type="range" id="sVx" min="0.1" max="0.6" step="0.05" value="0.3"><span id="sVxV">0.30 m/s</span></div>
+            <div class="slider">角速度<input type="range" id="sWz" min="0.2" max="1.2" step="0.1" value="0.8"><span id="sWzV">0.80 r/s</span></div>
+          </div>
+        </div>
+        <div class="card">
+          <h3 class="fold" data-key="wifi">
+            <span>网络</span>
+            <i class="chev">⌄</i>
+          </h3>
+          <div class="card-body">
+            <div class="wifi-row">
+              <span id="wifiSta">--</span>
+            </div>
+            <div class="wifi-row" style="margin-top:8px">
+              <span id="wifiAp">--</span>
+              <button class="b" id="bApToggle">--</button>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <h3 class="fold" data-key="log">
+            <span>日志</span>
+            <span style="display:flex;align-items:center">
+              <span class="no-fold" id="logClear" style="cursor:pointer;color:var(--acc);font-weight:400;font-size:12px">清空</span>
+              <i class="chev">⌄</i>
+            </span>
+          </h3>
+          <div class="card-body">
+            <div id="logBox"></div>
+            <div class="tip">MID360s: 建图→停止(存PCD)→保存地图→导航 · N10Plus/Odin1: 建图中直接点保存地图→停止→导航；建图与导航互斥</div>
+          </div>
+        </div>
+        <div class="card">
+          <h3>遥控摇杆</h3>
+          <div id="joyWrap">
+            <div id="joy"><div id="knob"></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="editOverlay">
+  <div id="editToolbar">
+    <span class="etitle"><svg class="ic"><use href="#i-edit"/></svg> 编辑地图: <span id="editMapName"></span></span>
+    <button class="ebtn active" data-c="255">⬜ 自由</button>
+    <button class="ebtn" data-c="0">⬛ 障碍</button>
+    <button class="ebtn" data-c="128">◻ 未知</button>
+    <label style="font-size:12px;color:var(--dim);display:flex;align-items:center;gap:4px">画笔
+      <input type="range" id="editBrush" min="1" max="24" value="4"></label>
+    <button class="ebtn" id="editUndo">撤销</button>
+    <button class="ebtn" id="editResetBtn"><svg class="ic"><use href="#i-refresh"/></svg>还原</button>
+    <span style="flex:1"></span>
+    <button class="ebtn" id="editCancel">取消</button>
+    <button class="ebtn primary" id="editSave"><svg class="ic"><use href="#i-save"/></svg>保存</button>
+  </div>
+  <div id="editCanvasWrap"><canvas id="editCanvas"></canvas></div>
+</div>
+
+<script>
+'use strict';
+/* ================= 语音播报 (后端预生成音频 + <audio>播放) =================
+   原来用 Web Speech API(speechSynthesis)在浏览器本地发声, 但红米平板等安卓系统
+   浏览器的 WebView 内核没有 TTS 引擎, 静默不出声。改为播放小车后端预生成的音频
+   文件(static/voice/*.mp3, 由 tools/gen_voice.py 用 edge-tts 生成), 播放 <audio>
+   几乎所有浏览器都支持, 跟有没有 TTS 引擎无关, 系统浏览器也能出声。
+   新增播报词: 改 tools/gen_voice.py 的 PHRASES 与下面 _files, 重跑脚本+重编译。 */
+const Voice={
+  on:localStorage.getItem('voiceOn')==='1',
+  // 不再自定义音量, 直接跟随系统音量 (audio.volume 保持默认 1)
+  supported:true,               // 播放预生成音频, 任何浏览器都支持
+  _el:null, _primed:false,
+  // 播报文本 -> 音频文件名(不含 .mp3), 须与 tools/gen_voice.py 一致
+  _files:{'已到达目标':'arrived','导航失败':'failed','导航已取消':'canceled',
+          '目标被拒绝':'rejected','重定位成功':'reloc','急停':'estop',
+          '语音播报已开启':'voice_on'},
+  _fileFor(text){
+    if(this._files[text])return this._files[text];
+    const m=/^到达第(\d+)个航点$/.exec(text);   // 动态: 到达第N个航点
+    if(m)return (+m[1]<=30)?('wp_'+m[1]):'wp_generic';
+    return null;
+  },
+  _audio(){if(!this._el){this._el=new Audio();this._el.preload='auto';}return this._el;},
+  // 移动端浏览器要求音频首次播放发生在用户手势里, 之后同一元素才能被脚本播放。
+  // 在首次点击/触摸时静音播一下预热, 解锁后续自动播报。
+  prime(){
+    if(this._primed)return; this._primed=true;
+    const a=this._audio();
+    try{a.src='voice/voice_on.mp3';a.volume=0;
+        const p=a.play();if(p)p.then(()=>{a.pause();a.currentTime=0;}).catch(()=>{});
+    }catch(e){}
+  },
+  say(text){
+    if(!this.on||!text)return;
+    const f=this._fileFor(text);
+    if(!f)return;               // 未预生成的短语直接跳过
+    const a=this._audio();
+    // volume=1 表示不额外衰减, 实际响度跟随系统音量 (prime 预热时置过 0, 这里恢复)
+    try{a.pause();a.src='voice/'+f+'.mp3';a.volume=1;a.currentTime=0;
+        const p=a.play();
+        if(p)p.catch(e=>console.warn('语音播放失败(先在页面上点一下解锁):',e));
+    }catch(e){console.error('语音播放异常:',e);}
+  }
+};
+// 任意首次用户手势都解锁音频(覆盖"刷新后播报开关本就是开着"的情况)
+['pointerdown','touchstart','click'].forEach(ev=>
+  window.addEventListener(ev,()=>Voice.prime(),{once:true,capture:true}));
+/* ================= WebSocket ================= */
+let ws=null, connected=false;
+const S={mode:'idle',sensor:'mid360',running:false,external:false,stopping:false,voltage:null,pcd_count:0};
+const NAV={state:'idle',kind:null,wp_index:0,wp_total:0,dist:null,time:0,recov:0};
+const SENSOR_LABEL={mid360:'MID360s',n10plus:'N10Plus',odin1:'Odin1'};
+// 各传感器可用的任务模式; bLidar(雷达测试)目前只有MID360有对应launch
+const SENSOR_HAS_LIDAR_TEST={mid360:true,n10plus:false,odin1:false};
+let curSensor=localStorage.getItem('sensor')||'mid360';
+if(!(curSensor in SENSOR_LABEL))curSensor='mid360';
+function connect(){
+  ws=new WebSocket('ws://'+location.host+'/ws');
+  ws.binaryType='arraybuffer';
+  ws.onopen=()=>{connected=true;dot.classList.add('on');toast('已连接小车');requestMapList();};
+  ws.onclose=()=>{connected=false;dot.classList.remove('on');modeBadge.textContent='离线';
+    setTimeout(connect,2000);};
+  ws.onerror=()=>ws.close();
+  ws.onmessage=e=>{
+    if(typeof e.data==='string'){onJson(JSON.parse(e.data));}
+    else{onBinary(e.data);}
+  };
+}
+function send(o){if(connected)ws.send(JSON.stringify(o));}
+
+/* ================= 状态/界面 ================= */
+const $=id=>document.getElementById(id);
+// 读 :root 上的CSS变量(供canvas绘制取色, 这样深色模式下画布底色能跟着变)
+const cssVar=(n,d)=>(getComputedStyle(document.documentElement)
+                     .getPropertyValue(n).trim()||d);
+/* 滑块已填充部分染成主题色: 原生 range 无法只给"左半边"上色, 这里把当前值
+   换算成百分比写进 --fill, CSS 用它做 background-size (见 .slider input)。 */
+function paintSlider(el){
+  const min=+el.min||0, max=+el.max||100;
+  el.style.setProperty('--fill',
+    ((+el.value-min)/(max-min)*100).toFixed(1)+'%');
+}
+function initSliders(){
+  document.querySelectorAll('.slider input[type=range]').forEach(el=>{
+    paintSlider(el);
+    el.addEventListener('input',()=>paintSlider(el));
+  });
+}
+if(document.readyState==='loading')
+  document.addEventListener('DOMContentLoaded',initSliders);
+else initSliders();
+const dot=$('connDot'),modeBadge=$('modeBadge'),statsEl=$('stats'),hint=$('hint');
+const MODE_NAME={idle:'空闲',mapping:'建图中',save_map:'保存地图中',navigation:'导航中',lidar_test:'雷达测试中'};
+function onJson(m){
+  if(m.t==='state'){Object.assign(S,m);renderState();}
+  else if(m.t==='pose'){robot.x=m.x;robot.y=m.y;robot.yaw=m.yaw;robot.frame=m.frame;robot.ok=true;
+    renderPose();
+    if(!tool)hint.textContent=(S.mode==='navigation'&&m.frame==='odom')?
+      '⚠ AMCL 尚未定位, 小车(灰色)与地图未对齐 — 等待自动重定位或"设初始位姿"':'';
+    if(follow){view.cx=m.x;view.cy=m.y;} draw();}
+  else if(m.t==='nav'){announceNav(m);Object.assign(NAV,m);renderNav();draw();}
+  else if(m.t==='log'){addLog(m.line);}
+  else if(m.t==='toast'){toast(m.msg,m.ok===false);}
+  else if(m.t==='clear'){clearLayers(m.what==='mapping');}
+  else if(m.t==='maps'){mapsBySensor[m.sensor==='odin1'?'odin1':'pgm']=m.maps||[];renderMapList();}
+  else if(m.t==='route'){
+    // 某张图存过的巡航航点回来了; 只在它仍是当前绑定的图时才应用(防止切图race)
+    if(m.name===effMap()){
+      wps=(m.points||[]).map(p=>({x:p.x,y:p.y,yaw:p.yaw||0}));
+      $('wpsLoop').checked=!!m.loop;
+      routeSaved=true;               // 刚从磁盘读出来, 视为"已保存"状态
+      renderWps();draw();
+    }
+  }
+}
+function renderState(){
+  // 有任务在跑时, 传感器选择器跟随服务端实际状态(不允许中途切换/显示不一致)
+  if((S.running||S.external)&&S.sensor&&S.sensor!==curSensor){
+    curSensor=S.sensor;localStorage.setItem('sensor',curSensor);
+    renderMapList();
+  }
+  renderSensorSeg();
+  maybeAutoPickSensor();
+  applyAutoPanels();
+  // 徽章只说状态, 不带传感器名(哪个传感器在跑, 旁边的选择器已经显示了)
+  let name=MODE_NAME[S.mode]||S.mode;
+  if(S.external)name='外部实例运行中';
+  if(S.stopping)name='停止中…';
+  modeBadge.textContent=name;
+  modeBadge.className='badge'+(S.running?' run':S.external?' ext':'');
+  // 导航中把实际加载的地图常驻显示在顶栏(后端 active_map 给的是真正 launch
+  // 进去的那张, 跟地图库里的"预选"不是一回事)
+  const mc=$('mapChip');
+  mc.style.display=S.active_map?'':'none';
+  updatePoseChipVis();   // 任务停止时坐标胶囊要立刻消失
+  if(S.active_map)mc.innerHTML='<svg class="ic"><use href="#i-map"/></svg><b></b>';
+  if(S.active_map)mc.querySelector('b').textContent=S.active_map;
+  // 状态每2秒推一次, 但地图列表只在"当前导航地图"真的变了时才重建 ——
+  // 无条件重建会在用户正要点某一行时把DOM换掉
+  if(S.active_map!==lastActiveMap){lastActiveMap=S.active_map;renderMapList();}
+  const busy=S.running||S.external||S.stopping;
+  for(const id of['bMap','bSave','bNav','bLidar','bStop'])$(id).classList.remove('wait');
+  for(const id of['bMap','bNav','bLidar'])$(id).classList.toggle('dim',busy);
+  if(curSensor==='mid360'){
+    $('bSave').classList.toggle('dim',busy||S.pcd_count===0);
+  }else{
+    const canSave=S.running&&S.sensor===curSensor&&S.mode==='mapping';
+    $('bSave').classList.toggle('dim',!canSave);
+  }
+  $('bStop').classList.toggle('dim',!(S.running||S.external));
+  // 工作流引导: 把"当前最该点的下一步"点亮成主色。
+  // 主线: 建图 →(停止存点云)→ 保存地图 → 导航。只在 建图/保存地图/导航 三个
+  // 前进按钮间移动高亮; 建图中(mid360)要先停止才能存图, 那一步没有单一前进键,
+  // 就不高亮(红色的"停止"本身已够显眼)。导航中/外部实例等边角情况也不高亮,
+  // 宁可不给提示也不误导。
+  for(const id of['bMap','bSave','bNav'])$(id).classList.remove('primary');
+  let nextStep=null;
+  if(!S.external&&!S.stopping){
+    if(S.mode==='mapping'){
+      if(curSensor!=='mid360')nextStep='bSave';         // N10/Odin1: 建图中直接存图
+    }else if(!S.running){                                // 空闲
+      if(curSensor==='mid360')
+        nextStep=S.pcd_count>0?'bSave':(S.has_map?'bNav':'bMap');
+      else nextStep=S.has_map?'bNav':'bMap';
+    }
+  }
+  if(nextStep&&!$(nextStep).classList.contains('dim'))
+    $(nextStep).classList.add('primary');
+  // 状态栏: 每项 图标 + 主值 + 灰色单位/总量, 用量一眼看清
+  const ico=n=>`<svg class="ic"><use href="#i-${n}"/></svg>`;
+  const sub=t=>`<span class="u">${t}</span>`;   // 灰色副文字(单位/总量)
+  let h='';
+  if(S.voltage!=null)
+    h+=`<span title="电池电压">${ico('batt')}<b>${S.voltage.toFixed(1)}</b>${sub('V')}</span>`;
+  if(S.mem_avail!=null&&S.mem_total){
+    // 内存改为"已用/总量", 用户要的是占用直观。available≈可回收后真正空闲
+    const used=Math.max(0,S.mem_total-S.mem_avail);
+    const c=S.mem_avail<0.5?'bad':S.mem_avail<1?'warn':'';
+    h+=`<span class="${c}" title="内存 已用/总量">${ico('mem')}`
+      +`<b>${used.toFixed(1)}</b>${sub('/'+S.mem_total+'G')}</span>`;}
+  if(S.disk_free!=null){
+    // 磁盘同样显示已用/总量; 拿不到总量时退回只显示剩余
+    const c=S.disk_free<3?'warn':'';
+    if(S.disk_total){const used=Math.max(0,S.disk_total-S.disk_free);
+      h+=`<span class="${c}" title="磁盘 已用/总量">${ico('disk')}`
+        +`<b>${used.toFixed(0)}</b>${sub('/'+Math.round(S.disk_total)+'G')}</span>`;}
+    else h+=`<span class="${c}" title="磁盘剩余">${ico('disk')}<b>${S.disk_free}</b>${sub('G 剩')}</span>`;}
+  if(S.cpu_temp!=null){const c=S.cpu_temp>80?'bad':S.cpu_temp>70?'warn':'';
+    h+=`<span class="${c}" title="CPU温度">${ico('temp')}<b>${S.cpu_temp}</b>${sub('°C')}</span>`;}
+  h+=`<span title="点云分段数(建图时每约10秒一段)">${ico('cube')}<b>${S.pcd_count}</b>${sub('PCD')}</span>`;
+  statsEl.innerHTML=h;
+  renderWifi();
+}
+function renderWifi(){
+  const w=S.wifi;
+  if(!w||!w.sta||!w.ap){return;}
+  // 两块网卡各自独立显示: 板载卡连家里WiFi, USB卡开热点, 可以同时在线。
+  const icon=n=>`<svg class="ic"><use href="#i-${n}"/></svg>`;
+  const dim=t=>`<span style="color:var(--dim)">${t}</span>`;
+  $('wifiSta').innerHTML=icon('radar')+(w.sta.up
+    ? ` ${w.sta.name||'WiFi'} ${dim('· '+(w.sta.ip||'--'))}`
+    : ` ${dim('未连接')}`);
+  const n=w.ap.clients||0;
+  $('wifiAp').innerHTML=icon('hotspot')+(w.ap.up
+    ? ` ${w.ap.ssid} ${dim('· '+(w.ap.ip||'--')+(n?` · ${n}台设备`:''))}`
+    : ` ${dim(w.ap.exists?'已关闭':'未配置')}`);
+  // 热点在线时整行用主色, 一眼能看出开着没
+  $('wifiAp').style.color=w.ap.up?'var(--acc)':'';
+  const btn=$('bApToggle');
+  btn.textContent=w.ap.up?'关闭热点':'开启热点';
+  btn.dataset.on=w.ap.up?'1':'0';
+  btn.disabled=!w.ap.exists;
+}
+function renderSensorSeg(){
+  const busy=isBusy();
+  $('sensorSel').value=curSensor;
+  // 探测到当前传感器在线就亮绿点; 每个选项名后缀"· 在线"标记检测状态
+  const online=!!(S.detected&&S.detected[curSensor]);
+  $('sensorPick').classList.toggle('online',online);
+  $('sensorPick').classList.toggle('busy',busy);
+  $('sensorSel').disabled=busy;
+  for(const o of $('sensorSel').options){
+    const on=!!(S.detected&&S.detected[o.value]);
+    o.textContent=SENSOR_LABEL[o.value]+(on?' · 在线':'');
+  }
+  $('bLidar').style.display=SENSOR_HAS_LIDAR_TEST[curSensor]?'':'none';
+  $('bSave').querySelector('span').textContent=curSensor==='mid360'?'保存地图':'保存地图(建图中)';
+}
+$('sensorSel').onchange=e=>{
+  if(isBusy()){toast('有任务在运行时不能切换传感器，请先停止',true);
+    e.target.value=curSensor;return;}
+  userPickedSensor=true;
+  curSensor=e.target.value;
+  localStorage.setItem('sensor',curSensor);
+  routeLoadedFor=null;   // 换传感器 → 强制重新拉新桶里当前图的巡航路线
+  renderSensorSeg();
+  renderMapList();requestMapList();
+};
+const FRAME_NAME={map:'map',odom:'里程计',lio:'建图'};
+// 坐标胶囊只在导航/建图(有实时位姿)时显示; 空闲时藏起来, 不留旧坐标
+function updatePoseChipVis(){
+  $('poseChip').style.display=(robot.ok&&(S.running||S.external))?'':'none';
+}
+function renderPose(){
+  updatePoseChipVis();
+  if(!robot.ok)return;
+  const deg=(robot.yaw*180/Math.PI).toFixed(0);
+  $('poseChip').innerHTML=`<svg class="ic"><use href="#i-pin"/></svg> <b>(${robot.x.toFixed(2)}, ${robot.y.toFixed(2)})</b> ${deg}° · ${FRAME_NAME[robot.frame]||robot.frame}`;
+  $('nvPose').textContent=`(${robot.x.toFixed(2)}, ${robot.y.toFixed(2)})`;
+  $('nvYaw').textContent=deg+'°';
+}
+const NAV_NAME={idle:'空闲',active:'导航中',succeeded:'已到达',aborted:'失败',
+  canceled:'已取消',rejected:'被拒绝'};
+// 导航状态/航点推进时播报; 只在"变化沿"触发, 不重复念
+function announceNav(m){
+  if(!Voice.on)return;
+  if(m.state&&m.state!==NAV.state){
+    const say={succeeded:'已到达目标',aborted:'导航失败',
+               canceled:'导航已取消',rejected:'目标被拒绝'}[m.state];
+    if(say)Voice.say(say);
+  }
+  // 多点巡航: 到达一个中间航点时报进度
+  if(m.kind==='follow'&&m.state==='active'
+     &&typeof m.wp_index==='number'&&m.wp_index!==NAV.wp_index&&m.wp_index>0){
+    Voice.say('到达第'+m.wp_index+'个航点');
+  }
+}
+function renderNav(){
+  const st=$('navState');
+  st.textContent=NAV_NAME[NAV.state]||NAV.state;
+  st.className=NAV.state;
+  const single=NAV.kind==='single';
+  $('rDist').style.display=single&&NAV.state==='active'?'':'none';
+  $('rTime').style.display=single&&NAV.state==='active'?'':'none';
+  $('rRecov').style.display=single&&NAV.state==='active'?'':'none';
+  $('rWp').style.display=NAV.kind==='follow'?'':'none';
+  if(NAV.dist!=null)$('nvDist').textContent=NAV.dist.toFixed(2)+' m';
+  $('nvTime').textContent=(NAV.time||0)+' s';
+  $('nvRecov').textContent=NAV.recov||0;
+  $('nvWp').textContent=NAV.wp_total?`${Math.min(NAV.wp_index+1,NAV.wp_total)} / ${NAV.wp_total}`:'--';
+  if(NAV.state==='succeeded'&&NAV.kind==='single'){goalMark=null;}
+  renderGoal();
+  renderWps();
+}
+// 目标坐标: 设了单点目标就显示它的 x/y 和朝向, 没有就隐藏这一行
+function renderGoal(){
+  const row=$('rGoal');
+  if(goalMark){
+    row.style.display='';
+    $('nvGoal').textContent=`(${goalMark.x.toFixed(2)}, ${goalMark.y.toFixed(2)}) `
+      +`${(goalMark.yaw*180/Math.PI).toFixed(0)}°`;
+  }else row.style.display='none';
+}
+function toast(msg,bad){
+  const d=document.createElement('div');d.className='toast'+(bad?' bad':'');d.textContent=msg;
+  $('toasts').appendChild(d);
+  while($('toasts').childNodes.length>3)$('toasts').removeChild($('toasts').firstChild);
+  setTimeout(()=>{d.style.opacity='0';d.style.transition='opacity .5s';},5200);
+  setTimeout(()=>d.remove(),5800);
+}
+const logBox=$('logBox');
+let _lastReloc=0;
+function addLog(line){
+  const at=logBox.scrollTop+logBox.clientHeight>=logBox.scrollHeight-10;
+  const s=document.createElement('div');
+  if(/error|错误|失败|ERROR|拒绝|aborted/i.test(line))s.className='hl';
+  // 绑架后自动重定位成功 → 播报(日志里会刷很多条, 5秒内只念一次)
+  if(Voice.on&&/重定位成功/.test(line)&&Date.now()-_lastReloc>5000){
+    _lastReloc=Date.now();Voice.say('重定位成功');
+  }
+  s.textContent=line;logBox.appendChild(s);
+  while(logBox.childNodes.length>400)logBox.removeChild(logBox.firstChild);
+  if(at)logBox.scrollTop=logBox.scrollHeight;
+}
+$('logClear').onclick=()=>logBox.innerHTML='';
+
+/* ================= 世界数据 ================= */
+const robot={x:0,y:0,yaw:0,ok:false,frame:''};
+let mapImg=null,mapMeta=null;
+let costmapImg=null,costmapMeta=null;
+// 图层可见性 (点击图例切换, 记住到 localStorage)
+const layerVis=Object.assign({plan:true,local:true,traj:true,costmap:true},
+  JSON.parse(localStorage.getItem('layerVis')||'{}'));
+let scanPts=new Float32Array(0);
+let planPts=new Float32Array(0);        // 全局规划路径 /plan
+let localPlanPts=new Float32Array(0);   // 局部规划路径 /local_plan
+let trajPts=[];
+let goalMark=null;
+let wps=[];                          // 航点 [{x,y,yaw}]
+const CLOUD_RES=0.05, CLOUD_N=2048;
+const cloudCv=document.createElement('canvas');cloudCv.width=cloudCv.height=CLOUD_N;
+const cloudCtx=cloudCv.getContext('2d');
+function clearLayers(clearMap){
+  // 任何任务启动时调用: 建图轨迹/点云、导航路径都是上一次会话的残留,
+  // 不清会导致比如"建图完成后切到导航, 旧轨迹还叠在新地图上"的困惑。
+  cloudCtx.clearRect(0,0,CLOUD_N,CLOUD_N);trajPts=[];planPts=new Float32Array(0);
+  localPlanPts=new Float32Array(0);
+  goalMark=null;costmapImg=null;costmapMeta=null;
+  if(clearMap){mapImg=null;mapMeta=null;}
+  resetNavTuning();
+  draw();
+}
+function resetNavTuning(){
+  // 导航重启会把配置文件默认值恢复, 之前会话里应用过的调参就失效了,
+  // 界面显示值也一起复位, 避免"看着是改过的但其实已经不生效"的误导。
+  $('navVx').value=0.5;$('navVxV').textContent='0.50 m/s';
+  $('navWz').value=1.2;$('navWzV').textContent='1.20 rad/s';
+  $('obsR').value=0.35;$('obsRV').textContent='0.35 m';
+  $('obsC').value=3;$('obsCV').textContent='3.0';
+  // 程序改 .value 不触发 input 事件, 填充色要手动重画
+  ['navVx','navWz','obsR','obsC'].forEach(id=>paintSlider($(id)));
+}
+/* ================= 地图库 ================= */
+// pgm地图(mid360/n10plus共享同一个目录, 后端list_2d_maps()不分传感器)
+// 和odin1的.bin地图分开两个桶; 每个桶各自记住"导航将使用"的选中地图名
+let mapsBySensor={pgm:[],odin1:[]};
+let lastActiveMap=undefined;   // 上次渲染时的 S.active_map, 用于避免无谓重建列表
+let selectedMapName={pgm:'',odin1:''};
+try{Object.assign(selectedMapName,JSON.parse(localStorage.getItem('selectedMapName')||'{}'));}catch(e){}
+function mapBucket(){return curSensor==='odin1'?'odin1':'pgm';}
+function requestMapList(){send({t:'list_maps',sensor:curSensor});}
+// launch自带默认地图名(跟后端 DEFAULT_MAP_NAME 一致), 没显式选图时巡航路线绑到它
+const DEFAULT_MAP={mid360:'WHEELTEC3D',n10plus:'N10PLUS_MAP',odin1:'odin1_map'};
+// 当前巡航路线绑定/保存到哪张图: 优先用户选的, 否则该传感器的默认图
+function effMap(){return selectedMapName[mapBucket()]||DEFAULT_MAP[curSensor]||'';}
+// 只有 effMap 真的变了才去后端拉航点, 否则会覆盖用户正在编辑的临时航点
+let routeLoadedFor=null, routeSaved=false;
+function syncRoute(){
+  const m=effMap();
+  if(m===routeLoadedFor)return;
+  routeLoadedFor=m;
+  if(m)send({t:'get_route',sensor:curSensor,name:m});
+  else{wps=[];routeSaved=false;renderWps();draw();}
+}
+function fmtMapTime(ts){
+  const d=new Date(ts*1000),p=n=>String(n).padStart(2,'0');
+  return `${d.getMonth()+1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function renderMapList(){
+  const bucket=mapBucket(), list=mapsBySensor[bucket]||[];
+  const wrap=$('mapList');
+  wrap.innerHTML='';
+  $('mapListEmpty').style.display=list.length?'none':'';
+  if(selectedMapName[bucket]&&!list.some(m=>m.name===selectedMapName[bucket])){
+    selectedMapName[bucket]='';
+    localStorage.setItem('selectedMapName',JSON.stringify(selectedMapName));
+  }
+  // "下次启动导航会用哪张" —— 这是本地预选, 跟当前正在跑的那张不是一回事
+  const nextName=selectedMapName[bucket]||'默认地图';
+  $('selectedMapLabel').textContent=nextName;
+  // 正在运行的导航实际加载的图(后端 active_map), 只有跟预选不一致时才单独提示,
+  // 一致的话下面列表里的"运行中"角标已经说明问题了, 不必重复占地方
+  const activeRow=$('activeMapRow');
+  if(S.active_map&&S.active_map!==nextName){
+    activeRow.style.display='';
+    $('activeMapLabel').textContent=S.active_map;
+  }else{
+    activeRow.style.display='none';
+  }
+  for(const m of list){
+    const running=(S.active_map===m.name);
+    const row=document.createElement('div');
+    row.className='map-row'+(selectedMapName[bucket]===m.name?' sel':'')
+                 +(running?' running':'');
+    row.innerHTML=`<span class="map-radio"></span>
+      <span class="map-info"><b></b><small></small></span>
+      ${bucket==='pgm'?'<span class="map-edit" title="编辑"><svg class="ic"><use href="#i-edit"/></svg></span>':''}
+      <span class="map-del" title="删除"><svg class="ic"><use href="#i-trash"/></svg></span>`;
+    row.querySelector('.map-info b').textContent=m.name;
+    row.querySelector('.map-info small').textContent=`${m.size_kb}KB · ${fmtMapTime(m.mtime)}`;
+    if(running){
+      // 角标放在 .map-info 外面 —— 放进 b 里会被那个 ellipsis 一起截掉
+      const tag=document.createElement('span');
+      tag.className='running-tag';tag.textContent='导航中';
+      row.querySelector('.map-info').after(tag);
+    }
+    const pick=()=>{
+      selectedMapName[bucket]=(selectedMapName[bucket]===m.name)?'':m.name;
+      localStorage.setItem('selectedMapName',JSON.stringify(selectedMapName));
+      renderMapList();
+    };
+    row.querySelector('.map-radio').onclick=pick;
+    row.querySelector('.map-info').onclick=pick;
+    const editBtn=row.querySelector('.map-edit');
+    if(editBtn)editBtn.onclick=e=>{e.stopPropagation();openMapEditor(m.name);};
+    row.querySelector('.map-del').onclick=e=>{
+      e.stopPropagation();
+      if(!confirm(`删除地图 "${m.name}" ?\n(它的巡航路线也会一起删除, 此操作不可恢复)`))return;
+      send({t:'delete_map',sensor:curSensor,name:m.name});
+    };
+    wrap.appendChild(row);
+  }
+  // 选中的图变了就加载对应的巡航路线(guard在syncRoute里, 不会覆盖正在编辑的)
+  syncRoute();
+}
+
+/* ================= 地图编辑(pgm重描) ================= */
+let editState=null;   // {name, undoStack:[ImageData,...]}
+let pendingEditName=null;
+let editColor=255, editBrush=4, editDrawing=false, editLastPt=null;
+const editCv=$('editCanvas'), editCtx=editCv.getContext('2d');
+function openMapEditor(name){
+  if(isBusy())toast('有任务运行时也能编辑, 但建议先停止任务再操作更安全');
+  pendingEditName=name;
+  $('editMapName').textContent=name;
+  toast('正在加载地图用于编辑...');
+  send({t:'load_map_edit',sensor:curSensor,name});
+}
+function startMapEdit(meta,img){
+  editState={name:pendingEditName,undoStack:[]};
+  editCv.width=meta.w;editCv.height=meta.h;
+  editCtx.imageSmoothingEnabled=false;
+  editCtx.drawImage(img,0,0);
+  const maxW=Math.min(innerWidth*0.94,1000), maxH=innerHeight-80;
+  const s=Math.max(1,Math.min(maxW/meta.w,maxH/meta.h,8));
+  editCv.style.width=(meta.w*s)+'px';
+  editCv.style.height=(meta.h*s)+'px';
+  $('editOverlay').style.display='flex';
+}
+function editCanvasPt(e){
+  const r=editCv.getBoundingClientRect();
+  return [(e.clientX-r.left)/r.width*editCv.width, (e.clientY-r.top)/r.height*editCv.height];
+}
+function editColorStr(){return editColor===255?'#fff':editColor===0?'#000':'#808080';}
+function editPushUndo(){
+  editState.undoStack.push(editCtx.getImageData(0,0,editCv.width,editCv.height));
+  if(editState.undoStack.length>30)editState.undoStack.shift();
+}
+editCv.addEventListener('pointerdown',e=>{
+  e.preventDefault();
+  editPushUndo();
+  editDrawing=true;editCv.setPointerCapture(e.pointerId);
+  const[x,y]=editCanvasPt(e);editLastPt=[x,y];
+  editCtx.fillStyle=editColorStr();
+  editCtx.beginPath();editCtx.arc(x,y,editBrush/2,0,Math.PI*2);editCtx.fill();
+});
+editCv.addEventListener('pointermove',e=>{
+  if(!editDrawing)return;
+  const[x,y]=editCanvasPt(e);
+  editCtx.strokeStyle=editColorStr();editCtx.lineWidth=editBrush;editCtx.lineCap='round';
+  editCtx.beginPath();editCtx.moveTo(editLastPt[0],editLastPt[1]);editCtx.lineTo(x,y);editCtx.stroke();
+  editLastPt=[x,y];
+});
+function editEndStroke(){editDrawing=false;}
+editCv.addEventListener('pointerup',editEndStroke);
+editCv.addEventListener('pointercancel',editEndStroke);
+document.querySelectorAll('#editToolbar .ebtn[data-c]').forEach(b=>{
+  b.onclick=()=>{editColor=+b.dataset.c;
+    document.querySelectorAll('#editToolbar .ebtn[data-c]').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');};
+});
+$('editBrush').oninput=function(){editBrush=+this.value;};
+$('editUndo').onclick=()=>{
+  if(!editState||!editState.undoStack.length){toast('没有可撤销的操作',true);return;}
+  editCtx.putImageData(editState.undoStack.pop(),0,0);
+};
+$('editResetBtn').onclick=()=>{
+  if(!confirm('放弃当前所有编辑, 重新加载原图?'))return;
+  send({t:'load_map_edit',sensor:curSensor,name:editState.name});
+};
+$('editCancel').onclick=()=>{$('editOverlay').style.display='none';editState=null;};
+$('editSave').onclick=()=>{
+  if(!editState)return;
+  editCv.toBlob(blob=>{
+    const reader=new FileReader();
+    reader.onload=()=>{
+      send({t:'save_map_edit',name:editState.name,png_b64:reader.result.split(',')[1]});
+      $('editOverlay').style.display='none';editState=null;
+    };
+    reader.readAsDataURL(blob);
+  },'image/png');
+};
+
+function zColor(z){ // 高度着色 蓝->青->绿->橙
+  const t=Math.max(0,Math.min(1,(z+0.3)/2.1));
+  const h=210-t*170;return `hsl(${h},75%,${40+t*8}%)`;
+}
+function onBinary(buf){
+  const u8=new Uint8Array(buf), type=u8[0];
+  if(type===1){
+    const len=new DataView(buf,1,4).getUint32(0,true);
+    mapMeta=JSON.parse(new TextDecoder().decode(new Uint8Array(buf,5,len)));
+    const blob=new Blob([new Uint8Array(buf,5+len)],{type:'image/png'});
+    const url=URL.createObjectURL(blob);const img=new Image();
+    img.onload=()=>{mapImg=img;URL.revokeObjectURL(url);draw();
+      if(!robot.ok)centerOnMap();};
+    img.src=url;
+  }else if(type===2){scanPts=new Float32Array(buf.slice(1));draw();}
+  else if(type===4){planPts=new Float32Array(buf.slice(1));draw();}
+  else if(type===8){localPlanPts=new Float32Array(buf.slice(1));draw();}
+  else if(type===6){
+    const len=new DataView(buf,1,4).getUint32(0,true);
+    costmapMeta=JSON.parse(new TextDecoder().decode(new Uint8Array(buf,5,len)));
+    const blob=new Blob([new Uint8Array(buf,5+len)],{type:'image/png'});
+    const url=URL.createObjectURL(blob);const img=new Image();
+    img.onload=()=>{costmapImg=img;URL.revokeObjectURL(url);draw();};
+    img.src=url;
+  }
+  else if(type===5){const a=new Float32Array(buf.slice(1));
+    for(let i=0;i<a.length;i+=2)trajPts.push([a[i],a[i+1]]);
+    if(trajPts.length>20000)trajPts.splice(0,trajPts.length-20000);draw();}
+  else if(type===3){
+    const a=new Float32Array(buf.slice(1));
+    for(let i=0;i<a.length;i+=3){
+      const px=CLOUD_N/2+a[i]/CLOUD_RES, py=CLOUD_N/2-a[i+1]/CLOUD_RES;
+      if(px<0||py<0||px>=CLOUD_N||py>=CLOUD_N)continue;
+      cloudCtx.fillStyle=zColor(a[i+2]);
+      cloudCtx.fillRect(px,py,1.3,1.3);
+    }
+    draw();
+  }
+  else if(type===7){
+    const len=new DataView(buf,1,4).getUint32(0,true);
+    const meta=JSON.parse(new TextDecoder().decode(new Uint8Array(buf,5,len)));
+    const blob=new Blob([new Uint8Array(buf,5+len)],{type:'image/png'});
+    const url=URL.createObjectURL(blob);const img=new Image();
+    img.onload=()=>{URL.revokeObjectURL(url);startMapEdit(meta,img);};
+    img.src=url;
+  }
+}
+function centerOnMap(){
+  if(!mapMeta)return;
+  view.cx=mapMeta.ox+mapMeta.w*mapMeta.res/2;
+  view.cy=mapMeta.oy+mapMeta.h*mapMeta.res/2;
+  const fit=Math.min((W*0.85)/(mapMeta.w*mapMeta.res),
+                     (H*0.85)/(mapMeta.h*mapMeta.res));
+  view.scale=Math.max(5,Math.min(150,fit));
+  draw();
+}
+
+/* ================= 画布渲染 ================= */
+const cv=$('view'),ctx=cv.getContext('2d');
+const view={cx:0,cy:0,scale:45,rot:0};   // rot: 视图旋转(弧度), 类似rviz可转动地图
+let follow=false;
+let W=0,H=0,DPR=Math.min(devicePixelRatio||1,2);
+function resize(){
+  const r=cv.parentElement.getBoundingClientRect();
+  W=r.width;H=r.height;cv.width=W*DPR;cv.height=H*DPR;draw();
+}
+addEventListener('resize',resize);
+// w2s/s2w 只做平移+缩放(不含旋转); 旋转在 _draw() 里整体施加于canvas变换,
+// 指针交互时用 unrotPoint/unrotDelta 把屏幕坐标换算回"未旋转"基准再喂给它们。
+const w2sx=x=>(x-view.cx)*view.scale+W/2;
+const w2sy=y=>H/2-(y-view.cy)*view.scale;
+const s2wx=x=>(x-W/2)/view.scale+view.cx;
+const s2wy=y=>view.cy-(y-H/2)/view.scale;
+function unrotPoint(sx,sy){
+  const dx=sx-W/2,dy=sy-H/2,c=Math.cos(view.rot),s=Math.sin(view.rot);
+  return {x:dx*c+dy*s+W/2, y:-dx*s+dy*c+H/2};
+}
+function unrotDelta(dx,dy){
+  const c=Math.cos(view.rot),s=Math.sin(view.rot);
+  return [dx*c+dy*s, -dx*s+dy*c];
+}
+function setRot(r){
+  view.rot=((r%(2*Math.PI))+2*Math.PI)%(2*Math.PI);
+  $('compassNeedle').style.transform=`rotate(${-view.rot}rad)`;
+  draw();
+}
+
+let drawPending=false;
+function draw(){if(drawPending)return;drawPending=true;requestAnimationFrame(_draw);}
+function _draw(){
+  drawPending=false;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  // 画布底色跟随系统浅色/深色模式(取CSS变量, 见 :root / prefers-color-scheme)
+  ctx.fillStyle=cssVar('--canvas-bg','#f7f8fa');ctx.fillRect(0,0,W,H);
+  ctx.save();
+  ctx.translate(W/2,H/2);ctx.rotate(view.rot);ctx.translate(-W/2,-H/2);
+  // 网格 (1m / 10m)
+  ctx.strokeStyle='#e8edf3';ctx.lineWidth=1;ctx.beginPath();
+  const step=view.scale>=12?1:10;
+  for(let x=Math.ceil(s2wx(0)/step)*step;x<=s2wx(W);x+=step){
+    const sx=w2sx(x);ctx.moveTo(sx,0);ctx.lineTo(sx,H);}
+  for(let y=Math.ceil(s2wy(H)/step)*step;y<=s2wy(0);y+=step){
+    const sy=w2sy(y);ctx.moveTo(0,sy);ctx.lineTo(W,sy);}
+  ctx.stroke();
+  // 原点十字
+  ctx.strokeStyle='#cbd5e1';ctx.lineWidth=1.5;ctx.beginPath();
+  ctx.moveTo(w2sx(-0.5),w2sy(0));ctx.lineTo(w2sx(0.5),w2sy(0));
+  ctx.moveTo(w2sx(0),w2sy(-0.5));ctx.lineTo(w2sx(0),w2sy(0.5));ctx.stroke();
+  // 2D地图
+  if(mapImg&&mapMeta){
+    ctx.imageSmoothingEnabled=false;
+    ctx.drawImage(mapImg,w2sx(mapMeta.ox),w2sy(mapMeta.oy+mapMeta.h*mapMeta.res),
+      mapMeta.w*mapMeta.res*view.scale,mapMeta.h*mapMeta.res*view.scale);
+  }
+  // 代价地图(避障膨胀区热力图, 叠在静态地图之上)
+  if(layerVis.costmap&&costmapImg&&costmapMeta){
+    ctx.imageSmoothingEnabled=false;
+    ctx.drawImage(costmapImg,w2sx(costmapMeta.ox),
+      w2sy(costmapMeta.oy+costmapMeta.h*costmapMeta.res),
+      costmapMeta.w*costmapMeta.res*view.scale,costmapMeta.h*costmapMeta.res*view.scale);
+  }
+  // 建图点云
+  ctx.imageSmoothingEnabled=true;
+  const cw=CLOUD_N*CLOUD_RES*view.scale;
+  ctx.drawImage(cloudCv,w2sx(-CLOUD_N/2*CLOUD_RES),w2sy(CLOUD_N/2*CLOUD_RES),cw,cw);
+  // 轨迹
+  if(layerVis.traj&&trajPts.length>1){
+    ctx.strokeStyle='#8b5cf6';ctx.lineWidth=2;ctx.beginPath();
+    ctx.moveTo(w2sx(trajPts[0][0]),w2sy(trajPts[0][1]));
+    for(const p of trajPts)ctx.lineTo(w2sx(p[0]),w2sy(p[1]));
+    ctx.stroke();
+  }
+  // 全局规划路径 (/plan): 绿色实线, 铺在下层——从当前位置到目标的整条路线
+  if(layerVis.plan&&planPts.length>3){
+    ctx.strokeStyle='#059669';ctx.lineWidth=2.5;ctx.lineCap='round';
+    ctx.lineJoin='round';ctx.beginPath();
+    ctx.moveTo(w2sx(planPts[0]),w2sy(planPts[1]));
+    for(let i=2;i<planPts.length;i+=2)ctx.lineTo(w2sx(planPts[i]),w2sy(planPts[i+1]));
+    ctx.stroke();
+  }
+  // 局部规划路径 (/transformed_global_plan): 青色粗线, 叠在上层——控制器正在跟踪的近距离路径
+  if(layerVis.local&&localPlanPts.length>3){
+    ctx.strokeStyle='#06b6d4';ctx.lineWidth=3.5;ctx.lineCap='round';
+    ctx.lineJoin='round';ctx.beginPath();
+    ctx.moveTo(w2sx(localPlanPts[0]),w2sy(localPlanPts[1]));
+    for(let i=2;i<localPlanPts.length;i+=2)
+      ctx.lineTo(w2sx(localPlanPts[i]),w2sy(localPlanPts[i+1]));
+    ctx.stroke();
+  }
+  // 激光扫描
+  if(scanPts.length&&robot.ok){
+    const c=Math.cos(robot.yaw),s=Math.sin(robot.yaw);
+    ctx.fillStyle='#e11d48';
+    for(let i=0;i<scanPts.length;i+=2){
+      const wx=robot.x+scanPts[i]*c-scanPts[i+1]*s;
+      const wy=robot.y+scanPts[i]*s+scanPts[i+1]*c;
+      ctx.fillRect(w2sx(wx)-1.2,w2sy(wy)-1.2,2.4,2.4);
+    }
+  }
+  // 航点
+  const curWp=(NAV.state==='active'&&NAV.kind==='follow')?NAV.wp_index:-1;
+  wps.forEach((p,i)=>drawWp(p,i,i===curWp));
+  // 单点目标
+  if(goalMark)drawArrow(goalMark.x,goalMark.y,goalMark.yaw,'#059669');
+  if(toolDrag)drawArrow(toolDrag.x,toolDrag.y,toolDrag.yaw,
+    tool==='init'?'#f59e0b':tool==='wps'?'#f59e0b':'#059669');
+  // 机器人
+  if(robot.ok){
+    const located=robot.frame!=='odom';
+    const r=Math.max(9,0.18*view.scale);
+    ctx.save();ctx.translate(w2sx(robot.x),w2sy(robot.y));ctx.rotate(-robot.yaw);
+    ctx.fillStyle=located?'rgba(37,99,235,0.15)':'rgba(100,116,139,0.15)';
+    ctx.beginPath();ctx.arc(0,0,r*1.5,0,7);ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(r*1.4,0);ctx.lineTo(-r*0.8,r*0.85);ctx.lineTo(-r*0.5,0);
+    ctx.lineTo(-r*0.8,-r*0.85);ctx.closePath();
+    ctx.fillStyle=located?'#2563eb':'#94a3b8';ctx.fill();
+    ctx.strokeStyle='#fff';ctx.lineWidth=1.5;ctx.stroke();
+    ctx.restore();
+  }
+  ctx.restore();     // 结束地图旋转变换; 以下比例尺按屏幕固定, 不随地图旋转
+  ctx.fillStyle='#94a3b8';ctx.font='11px sans-serif';
+  ctx.fillText(step+'m',12,H-14);
+  ctx.strokeStyle='#94a3b8';ctx.lineWidth=2;ctx.beginPath();
+  ctx.moveTo(10,H-8);ctx.lineTo(10+view.scale*step,H-8);ctx.stroke();
+}
+function drawWp(p,i,cur){
+  const sx=w2sx(p.x),sy=w2sy(p.y);
+  // 朝向短线
+  ctx.strokeStyle=cur?'#059669':'#f59e0b';ctx.lineWidth=3;
+  ctx.beginPath();ctx.moveTo(sx,sy);
+  ctx.lineTo(sx+16*Math.cos(-p.yaw),sy+16*Math.sin(-p.yaw));ctx.stroke();
+  if(cur){ctx.beginPath();ctx.arc(sx,sy,14,0,7);
+    ctx.strokeStyle='rgba(5,150,105,.45)';ctx.lineWidth=3;ctx.stroke();}
+  ctx.beginPath();ctx.arc(sx,sy,10,0,7);
+  ctx.fillStyle=cur?'#059669':'#f59e0b';ctx.fill();
+  ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();
+  ctx.fillStyle='#fff';ctx.font='bold 11px sans-serif';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText(i+1,sx,sy+0.5);
+  ctx.textAlign='start';ctx.textBaseline='alphabetic';
+}
+function drawArrow(x,y,yaw,color){
+  const L=Math.max(22,0.5*view.scale);
+  const sx=w2sx(x),sy=w2sy(y);
+  ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=3;
+  ctx.beginPath();ctx.arc(sx,sy,5,0,7);ctx.fill();
+  const ex=sx+L*Math.cos(-yaw),ey=sy+L*Math.sin(-yaw);
+  ctx.beginPath();ctx.moveTo(sx,sy);ctx.lineTo(ex,ey);ctx.stroke();
+  ctx.save();ctx.translate(ex,ey);ctx.rotate(Math.atan2(ey-sy,ex-sx));
+  ctx.beginPath();ctx.moveTo(0,0);ctx.lineTo(-9,5);ctx.lineTo(-9,-5);
+  ctx.closePath();ctx.fill();ctx.restore();
+}
+
+/* ================= 航点管理 ================= */
+function renderWps(){
+  const card=$('wpsCard'),list=$('wpsList');
+  card.style.display=(wps.length||tool==='wps')?'':'none';
+  $('wpsEmpty').style.display=wps.length?'none':'';
+  $('wpsCount').textContent=wps.length?wps.length+' 点':'';
+  $('wpsGo').disabled=!wps.length;
+  const curWp=(NAV.state==='active'&&NAV.kind==='follow')?NAV.wp_index:-1;
+  list.innerHTML='';
+  wps.forEach((p,i)=>{
+    const row=document.createElement('div');
+    row.className='wp'+(i===curWp?' cur':'');
+    row.innerHTML=`<span class="n">${i+1}</span>
+      <span>(${p.x.toFixed(2)}, ${p.y.toFixed(2)}) ${(p.yaw*180/Math.PI).toFixed(0)}°</span>
+      <span class="del" data-i="${i}"><svg class="ic"><use href="#i-xc"/></svg></span>`;
+    list.appendChild(row);
+  });
+  list.querySelectorAll('.del').forEach(el=>el.onclick=()=>{
+    wps.splice(+el.dataset.i,1);routeSaved=false;renderWps();draw();});
+  // 提示这条路线绑到哪张图, 以及有没有未保存的改动
+  const m=effMap();
+  $('wpsSave').classList.toggle('dim',!wps.length&&routeSaved);
+  $('wpsBindTip').innerHTML=wps.length
+    ? `这条路线将保存到地图 <b style="color:var(--fg)">${m}</b>`
+      +(routeSaved?' (已保存, 下次打开自动加载)':' <span style="color:var(--warn)">· 有未保存改动</span>')
+    : `在地图 <b style="color:var(--fg)">${m}</b> 上点选航点后可保存, 下次打开自动加载`;
+}
+$('wpsClear').onclick=()=>{wps=[];routeSaved=false;renderWps();draw();};
+$('wpsSave').onclick=()=>{
+  // 把当前航点持久化到当前绑定的地图(空航点=清除该图路线, 后端也接受)
+  send({t:'save_route',sensor:curSensor,name:effMap(),
+        points:wps,loop:$('wpsLoop').checked});
+  routeSaved=true;renderWps();
+};
+$('wpsGo').onclick=()=>{
+  if(!wps.length)return;
+  if(S.mode!=='navigation'&&!S.external){toast('请先启动"导航"',true);return;}
+  setTool(null);
+  send({t:'follow',points:wps,loop:$('wpsLoop').checked});
+};
+
+/* ================= 画布交互 ================= */
+let tool=null;                 // 'goal' | 'init' | 'wps'
+let toolDrag=null;
+const pointers=new Map();
+let pinchD0=0,pinchS0=0,pinchA0=0,pinchR0=0;
+cv.addEventListener('pointerdown',e=>{
+  cv.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId,{x:e.offsetX,y:e.offsetY});
+  if(pointers.size===2){
+    const p=[...pointers.values()];
+    pinchD0=Math.hypot(p[0].x-p[1].x,p[0].y-p[1].y);pinchS0=view.scale;
+    pinchA0=Math.atan2(p[1].y-p[0].y,p[1].x-p[0].x);pinchR0=view.rot;
+    toolDrag=null;
+  }else if(tool&&pointers.size===1){
+    const u=unrotPoint(e.offsetX,e.offsetY);
+    toolDrag={x:s2wx(u.x),y:s2wy(u.y),yaw:0,sx:e.offsetX,sy:e.offsetY};
+  }
+});
+cv.addEventListener('pointermove',e=>{
+  if(!pointers.has(e.pointerId))return;
+  const prev=pointers.get(e.pointerId);
+  pointers.set(e.pointerId,{x:e.offsetX,y:e.offsetY});
+  if(pointers.size===2){
+    const p=[...pointers.values()];
+    const d=Math.hypot(p[0].x-p[1].x,p[0].y-p[1].y);
+    const ang=Math.atan2(p[1].y-p[0].y,p[1].x-p[0].x);
+    if(pinchD0>0)view.scale=Math.max(5,Math.min(300,pinchS0*d/pinchD0));
+    setRot(pinchR0+(ang-pinchA0));
+  }else if(toolDrag){
+    const [udx,udy]=unrotDelta(e.offsetX-toolDrag.sx,e.offsetY-toolDrag.sy);
+    if(udx*udx+udy*udy>64)toolDrag.yaw=Math.atan2(-udy,udx);
+    draw();
+  }else if(pointers.size===1){
+    const [udx,udy]=unrotDelta(e.offsetX-prev.x,e.offsetY-prev.y);
+    view.cx-=udx/view.scale;
+    view.cy+=udy/view.scale;
+    follow=false;$('followBtn').classList.remove('active');
+    draw();
+  }
+});
+function endPointer(e){
+  pointers.delete(e.pointerId);
+  if(toolDrag&&pointers.size===0){
+    const m=toolDrag;toolDrag=null;
+    if(tool==='goal'){goalMark={x:m.x,y:m.y,yaw:m.yaw};
+      send({t:'goal',x:m.x,y:m.y,yaw:m.yaw});renderGoal();setTool(null);}
+    else if(tool==='init'){send({t:'initialpose',x:m.x,y:m.y,yaw:m.yaw});setTool(null);}
+    else if(tool==='wps'){wps.push({x:m.x,y:m.y,yaw:m.yaw});routeSaved=false;renderWps();}
+    draw();
+  }
+}
+cv.addEventListener('pointerup',endPointer);
+cv.addEventListener('pointercancel',endPointer);
+cv.addEventListener('wheel',e=>{
+  e.preventDefault();
+  const f=e.deltaY<0?1.15:0.87;
+  view.scale=Math.max(5,Math.min(300,view.scale*f));draw();
+},{passive:false});
+$('zoomIn').onclick=()=>{view.scale=Math.min(300,view.scale*1.3);draw();};
+$('zoomOut').onclick=()=>{view.scale=Math.max(5,view.scale/1.3);draw();};
+$('rotL').onclick=()=>setRot(view.rot-Math.PI/12);
+$('rotR').onclick=()=>setRot(view.rot+Math.PI/12);
+$('rotReset').onclick=()=>setRot(0);
+$('fitBtn').onclick=()=>centerOnMap();
+$('followBtn').onclick=function(){follow=!follow;this.classList.toggle('active',follow);
+  if(follow&&robot.ok){view.cx=robot.x;view.cy=robot.y;draw();}};
+function setTool(t){
+  if(t&&t!=='wps'&&S.mode!=='navigation'&&!S.external){
+    toast('该操作需要先启动"导航"',true);t=null;
+  }
+  tool=t;toolDrag=null;
+  $('bGoal').classList.toggle('active',t==='goal');
+  $('bInit').classList.toggle('active',t==='init');
+  $('bWps').classList.toggle('active',t==='wps');
+  hint.textContent=t==='goal'?'在地图上按下选点、拖动定方向、松开发送目标':
+    t==='init'?'在地图上按下选点、拖动定方向、松开设定初始位姿':
+    t==='wps'?'依次点选航点(按下=位置,拖动=朝向), 完成后点"开始巡航"':'';
+  renderWps();
+}
+$('bGoal').onclick=()=>setTool(tool==='goal'?null:'goal');
+$('bInit').onclick=()=>setTool(tool==='init'?null:'init');
+$('bWps').onclick=()=>setTool(tool==='wps'?null:'wps');
+
+/* ================= 摇杆 ================= */
+const joy=$('joy'),knob=$('knob');
+const JR=44;
+let joyId=null,joyVec=[0,0],joyTimer=null;
+function knobTo(dx,dy){knob.style.left=(44+dx)+'px';knob.style.top=(44+dy)+'px';}
+joy.addEventListener('pointerdown',e=>{
+  if(joyId!==null)return;
+  if(!S.running&&!S.external){
+    toast('底盘节点未运行, 遥控无效 — 请先启动"建图"或"导航"',true);return;
+  }
+  joyId=e.pointerId;joy.setPointerCapture(e.pointerId);joyMove(e);
+  joyTimer=setInterval(()=>{
+    const vmax=+$('sVx').value,wmax=+$('sWz').value;
+    send({t:'cmd_vel',vx:joyVec[1]*vmax,wz:joyVec[0]*-wmax});
+  },100);
+});
+function joyMove(e){
+  if(e.pointerId!==joyId)return;
+  const r=joy.getBoundingClientRect();
+  let dx=e.clientX-r.left-75,dy=e.clientY-r.top-75;
+  const d=Math.hypot(dx,dy);
+  if(d>JR){dx*=JR/d;dy*=JR/d;}
+  knobTo(dx,dy);
+  joyVec=[dx/JR,-dy/JR];
+}
+joy.addEventListener('pointermove',joyMove);
+function joyEnd(e){
+  if(e.pointerId!==joyId)return;
+  joyId=null;clearInterval(joyTimer);joyTimer=null;
+  joyVec=[0,0];knobTo(0,0);
+  send({t:'cmd_stop'});
+}
+joy.addEventListener('pointerup',joyEnd);
+joy.addEventListener('pointercancel',joyEnd);
+
+/* ================= 任务按钮 ================= */
+function isBusy(){return S.running||S.external||S.stopping;}
+function startMode(mode,confirmMsg,btnId,extra){
+  if(isBusy()){
+    toast(S.stopping?'正在停止上一个任务，请稍候再启动新任务…':
+      `已有任务(${SENSOR_LABEL[S.sensor]||''} ${MODE_NAME[S.mode]||S.mode})在运行，请先停止`,true);
+    return;
+  }
+  if(confirmMsg&&!confirm(confirmMsg))return;
+  if(btnId)$(btnId).classList.add('wait');
+  toast(`指令已发送, 正在启动 ${SENSOR_LABEL[curSensor]} ${(MODE_NAME[mode]||mode).replace('中','')} ...`);
+  send(Object.assign({t:'start',sensor:curSensor,mode},extra||{}));
+}
+function askMapName(title,def){
+  const name=prompt(title,def);
+  if(name===null)return null;          // 用户取消
+  const n=name.trim();
+  if(!n){toast('地图名不能为空',true);return null;}
+  return n;
+}
+$('bMap').onclick=()=>{
+  const extra={};
+  if(curSensor==='odin1'){
+    const n=askMapName('建图存储的地图名称(不含后缀, 中英文/数字/下划线/中划线):',
+      selectedMapName.odin1||'odin1_map');
+    if(n===null)return;
+    extra.map_name=n;
+  }
+  startMode('mapping',
+    `开始${SENSOR_LABEL[curSensor]}建图?\n`+
+    (curSensor==='mid360'?'注意: 会清空上次建图的PCD分段点云。':'')+
+    (curSensor==='odin1'?`地图将保存为 "${extra.map_name}"。\n`:'')+
+    '建图时请用摇杆慢速遥控。','bMap',extra);
+};
+$('bSave').onclick=()=>{
+  if(curSensor==='mid360'){
+    if(S.pcd_count===0&&!isBusy()){toast('没有建图点云可保存，请先建图',true);return;}
+    const n=askMapName('保存的地图名称(不含后缀):',selectedMapName.pgm||'WHEELTEC3D');
+    if(n===null)return;
+    startMode('save_map',`把最近一次建图的点云转换为2D导航地图 "${n}"?\n若同名地图已存在将被覆盖。`,'bSave',{map_name:n});
+    return;
+  }
+  const canSave=S.running&&S.sensor===curSensor&&S.mode==='mapping';
+  if(!canSave){toast(`${SENSOR_LABEL[curSensor]} 必须在建图运行中才能存图`,true);return;}
+  if(curSensor==='n10plus'){
+    const n=askMapName('保存的地图名称(不含后缀):',selectedMapName.pgm||'N10PLUS_MAP');
+    if(n===null)return;
+    if(!confirm(`保存当前地图为 "${n}"?\n若同名地图已存在将被覆盖。`))return;
+    send({t:'save_map_n10plus',name:n});
+    toast('存图指令已发送...');
+    return;
+  }
+  if(!confirm('保存当前Odin1地图?\n地图名为开始建图时输入的名称。'))return;
+  send({t:'save_map_odin1'});
+  toast('存图指令已发送...');
+};
+$('bNav').onclick=()=>{
+  const bucket=mapBucket(),extra={};
+  if(selectedMapName[bucket])extra.map_name=selectedMapName[bucket];
+  startMode('navigation',null,'bNav',extra);
+};
+$('bLidar').onclick=()=>startMode('lidar_test',null,'bLidar');
+const STOP_CONFIRM={mapping:'停止建图?',navigation:'停止导航?',
+  lidar_test:'停止雷达测试?',save_map:'停止保存地图?'};
+$('bStop').onclick=()=>{
+  if(!(S.running||S.external)){toast('当前没有任务在运行',true);return;}
+  let msg=STOP_CONFIRM[S.mode]||'停止当前任务?';
+  if(S.mode==='mapping')msg+=S.sensor==='mid360'?'\n(会自动保存PCD点云)':
+    '\n(如果还没点"保存地图", 停止后这次建的图就没法存了)';
+  if(confirm(msg))send({t:'stop'});
+};
+$('bReloc').onclick=()=>send({t:'relocalize'});
+$('bCancel').onclick=()=>{goalMark=null;renderGoal();$('wpsLoop').checked=false;send({t:'cancel_goal'});draw();};
+$('bEstop').onclick=()=>{goalMark=null;renderGoal();$('wpsLoop').checked=false;send({t:'estop'});Voice.say('急停');draw();};
+// 系统时间: 每秒刷新 (客户端本地时间)
+(function tickClock(){
+  const el=$('clock').querySelector('b');
+  const upd=()=>{const d=new Date(),p=n=>String(n).padStart(2,'0');
+    el.textContent=`${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;};
+  upd(); setInterval(upd,1000);
+})();
+// 语音播报开关 (状态栏喇叭); 音量直接跟随系统音量, 不再单独调
+function renderVoiceBtn(){
+  const b=$('voiceBtn');
+  b.classList.toggle('on',Voice.on);
+  b.querySelector('use').setAttribute('href',Voice.on?'#i-spk':'#i-spkoff');
+  b.title=Voice.on?'语音播报: 开 (点击关闭)':'语音播报: 关 (点击开启)';
+}
+renderVoiceBtn();
+$('voiceBtn').onclick=function(){
+  Voice.on=!Voice.on; localStorage.setItem('voiceOn',Voice.on?'1':'0');
+  renderVoiceBtn();
+  if(Voice.on)Voice.say('语音播报已开启');   // 顺便在用户手势里解锁音频
+};
+$('sVx').oninput=function(){$('sVxV').textContent=(+this.value).toFixed(2)+' m/s';};
+$('sWz').oninput=function(){$('sWzV').textContent=(+this.value).toFixed(2)+' r/s';};
+// 图例点击 = 切换对应图层显示 (全局路径/局部路径/轨迹/代价地图)
+document.querySelectorAll('#legend .tgl').forEach(el=>{
+  const k=el.dataset.layer;
+  el.classList.toggle('off',!layerVis[k]);   // 按存档初始化置灰态
+  el.onclick=()=>{
+    layerVis[k]=!layerVis[k];
+    el.classList.toggle('off',!layerVis[k]);
+    localStorage.setItem('layerVis',JSON.stringify(layerVis));
+    draw();
+  };
+});
+$('navVx').oninput=function(){$('navVxV').textContent=(+this.value).toFixed(2)+' m/s';};
+$('navWz').oninput=function(){$('navWzV').textContent=(+this.value).toFixed(2)+' rad/s';};
+$('obsR').oninput=function(){$('obsRV').textContent=(+this.value).toFixed(2)+' m';};
+$('obsC').oninput=function(){$('obsCV').textContent=(+this.value).toFixed(1);};
+$('navApply').onclick=()=>{
+  if(S.mode!=='navigation'&&!S.external){toast('请先启动"导航"再应用调参',true);return;}
+  send({t:'nav_speed',vx_max:+$('navVx').value,wz_max:+$('navWz').value});
+  send({t:'obstacle_params',inflation_radius:+$('obsR').value,cost_scaling_factor:+$('obsC').value});
+  toast('调参指令已发送...');
+};
+$('bApToggle').onclick=()=>{
+  const on=$('bApToggle').dataset.on==='1';
+  const ap=S.wifi&&S.wifi.ap;
+  // 关热点唯一会误伤的情况: 本页面自己就是通过热点访问的(地址栏IP == 热点IP),
+  // 这时关掉等于自断退路。走WiFi/有线访问的则完全不受影响, 不需要任何确认。
+  if(on&&ap&&ap.ip&&location.hostname===ap.ip){
+    if(!confirm('你正在通过热点访问本页面, 关闭热点会立即断开当前连接!\n'
+                +'确定关闭? (之后需要用连在同一WiFi/有线网的设备重新访问)'))return;
+  }
+  send({t:'ap_power',on:!on});
+};
+/* ================= 双侧栏 折叠/抽屉 ================= */
+function isMobile(){return matchMedia('(max-width:760px)').matches;}
+function setPanelHidden(id,hidden){
+  $(id).classList.toggle('panel-hidden',hidden);
+  // 侧栏宽度变化会改变画布可用尺寸, 但这不是浏览器window resize事件,
+  // 需要手动触发; 220ms后再补一次覆盖CSS收起动画结束时的最终尺寸。
+  if(!isMobile()){resize();setTimeout(resize,260);}
+}
+$('leftHandle').onclick=()=>{
+  const hidden=!$('leftPanel').classList.contains('panel-hidden');
+  setPanelHidden('leftPanel',hidden);
+  $('leftHandle').textContent=hidden?'›':'‹';
+};
+$('rightHandle').onclick=()=>{
+  const hidden=!$('rightPanel').classList.contains('panel-hidden');
+  setPanelHidden('rightPanel',hidden);
+  $('rightHandle').textContent=hidden?'‹':'›';
+};
+if(isMobile()){
+  setPanelHidden('leftPanel',true);setPanelHidden('rightPanel',true);
+  $('leftHandle').textContent='›';$('rightHandle').textContent='‹';
+}
+let lastAutoMode=null;
+function applyAutoPanels(){
+  if(S.mode===lastAutoMode)return;
+  lastAutoMode=S.mode;
+  if(S.mode==='navigation'){
+    setPanelHidden('rightPanel',true);$('rightHandle').textContent='‹';
+  }else if(S.mode==='mapping'){
+    setPanelHidden('leftPanel',true);$('leftHandle').textContent='›';
+  }else if(S.mode==='idle'&&!isMobile()){
+    setPanelHidden('leftPanel',false);setPanelHidden('rightPanel',false);
+    $('leftHandle').textContent='‹';$('rightHandle').textContent='›';
+  }
+}
+
+/* ================= 传感器自动识别 ================= */
+let userPickedSensor=false;
+function maybeAutoPickSensor(){
+  if(userPickedSensor||isBusy()||!S.detected)return;
+  const on=Object.keys(S.detected).filter(k=>S.detected[k]);
+  if(on.length===1&&on[0]!==curSensor){
+    curSensor=on[0];localStorage.setItem('sensor',curSensor);
+    renderSensorSeg();renderMapList();requestMapList();
+    toast(`检测到 ${SENSOR_LABEL[curSensor]} 已连接, 已自动切换`);
+  }
+}
+
+/* ================= 卡片折叠 ================= */
+// "地图库"是核心功能(选图/删图/编辑), 默认展开; 其余(遥控限速/导航调参/网络/日志)
+// 是次要设置, 默认折叠。用户手动展开/收起过的会记住(localStorage优先)。
+const FOLD_DEFAULT_OPEN={maps:true};
+document.querySelectorAll('.card h3.fold').forEach(h=>{
+  const card=h.closest('.card'), key='fold_'+h.dataset.key;
+  const stored=localStorage.getItem(key);
+  const collapsed=stored!=null?stored==='1':!FOLD_DEFAULT_OPEN[h.dataset.key];
+  if(collapsed)card.classList.add('collapsed');
+  h.addEventListener('click',e=>{
+    if(e.target.closest('.no-fold'))return;
+    card.classList.toggle('collapsed');
+    localStorage.setItem(key, card.classList.contains('collapsed')?'1':'0');
+  });
+});
+
+/* ================= 启动 ================= */
+resize();connect();renderNav();renderSensorSeg();renderMapList();
+</script>
+</body>
+</html>

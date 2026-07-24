@@ -1,0 +1,7 @@
+# Odin1 (留形科技 Manifold Tech) USB 权限规则
+# 来源: 官方文档 https://manifoldtechltd.github.io/wiki/odin_series/odin1/7.%20Odin1%20Quick%20start%20for%20ubuntu.html
+# 硬件到货后:
+#   sudo cp odin1.rules /etc/udev/rules.d/99-odin-usb.rules
+#   sudo udevadm control --reload && sudo udevadm trigger
+#   lsusb 里应能看到: ID 2207:0019 Fuzhou Rockchip Electronics Company hawk
+SUBSYSTEM=="usb", ATTR{idVendor}=="2207", ATTR{idProduct}=="0019", MODE="0666", GROUP="plugdev"

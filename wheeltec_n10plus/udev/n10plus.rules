@@ -1,0 +1,17 @@
+# N10Plus (镭神智能) 串口固定命名规则 —— 草稿, 硬件到货后必须核实
+#
+# 本机现有雷达/传感器 udev 规则(见 wheeltec_lidar_ros2/ldlidar_ros2/ldlidar_udev.sh)
+# 用的都是 WCH(南京沁恒) CH34x/CH9102 系列 USB转串口芯片, vendor id 固定 1a86,
+# N10Plus 大概率也是同厂芯片, 但具体 idProduct/序列号因批次而异, 不能照抄硬编码。
+#
+# 硬件到货后按以下步骤生成准确规则再替换本文件:
+#   1. 插上 N10Plus, 执行: udevadm info -a -n /dev/ttyUSB0  (或 ttyACM0/ttyCH343USB0)
+#      从输出里找到 idVendor / idProduct / serial 三项
+#   2. 用查到的真实值替换下面 ATTRS{idVendor}/idProduct/serial 的占位符
+#   3. sudo cp n10plus.rules /etc/udev/rules.d/wheeltec_n10plus.rules
+#      sudo udevadm control --reload && sudo udevadm trigger
+#   4. ls /dev/wheeltec_n10plus 确认软链接生成
+#
+# 下面这条是按 CH340/CH341(最常见, idVendor=1a86, idProduct=7523) 给的占位模板,
+# 不保证适用于实际拿到的这一款, 仅供参考起点。
+KERNEL=="ttyUSB*", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", MODE:="0777", GROUP:="dialout", SYMLINK+="wheeltec_n10plus"

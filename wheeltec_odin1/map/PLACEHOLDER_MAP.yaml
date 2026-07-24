@@ -1,0 +1,11 @@
+# 占位地图: Odin1 导航模式的 global_costmap 不使用 static_layer
+# (改用 rolling_window 的 obstacle_layer, 见 param_odin1.yaml),
+# 这张图只是用来满足 nav2 map_server 节点"必须加载一张地图"的硬性要求,
+# 内容(全自由空间)不影响实际避障/规划——真正的静态地图数据来自 Odin1 自己的
+# 空间记忆 + 实时 obstacle_layer。
+image: PLACEHOLDER_MAP.pgm
+resolution: 0.1
+origin: [-2.0, -2.0, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.25

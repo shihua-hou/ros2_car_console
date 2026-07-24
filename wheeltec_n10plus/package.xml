@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>wheeltec_n10plus</name>
+  <version>1.0.0</version>
+  <description>
+    N10Plus(镭神智能) 2D激光雷达 建图/导航集成包, 与 wheeltec_fastlio(MID360s+FAST-LIO)
+    是完全独立的可选模式, 复用同一套底盘/EKF/Nav2/重定位, 只替换雷达与建图算法(slam_toolbox)。
+    硬件到货前准备: 未接实际传感器测试。
+  </description>
+  <maintainer email="at15535377922@gmail.com">cat</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>lslidar_driver</exec_depend>
+  <exec_depend>lslidar_msgs</exec_depend>
+  <exec_depend>slam_toolbox</exec_depend>
+  <exec_depend>turn_on_wheeltec_robot</exec_depend>
+  <exec_depend>wheeltec_nav2</exec_depend>
+  <exec_depend>wheeltec_fastlio</exec_depend>
+  <exec_depend>nav2_waypoint_cycle</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

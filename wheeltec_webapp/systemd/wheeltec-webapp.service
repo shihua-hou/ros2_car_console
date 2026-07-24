@@ -1,0 +1,16 @@
+[Unit]
+Description=WHEELTEC Web Console (browser control for mapping/navigation)
+# Wants= 是必须的: 光有 After= 不会去激活 network-online.target, 那行就等于没写。
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=cat
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/cat/wheeltec_ros2/install/setup.bash && exec ros2 run wheeltec_webapp web --port 8080'
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
