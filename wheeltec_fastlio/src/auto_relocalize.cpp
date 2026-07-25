@@ -19,6 +19,7 @@
 #include <mutex>
 
 #include <rclcpp/rclcpp.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
@@ -74,12 +75,25 @@ public:
             res->message += " [警告: /initialpose 无订阅者, AMCL可能未激活]";
           }
         });
-    if (watchdog_en_) {
-      tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
-      tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
-      watchdog_timer_ = create_wall_timer(std::chrono::seconds(2),
-                                          [this]() { watchdogCheck(); });
-    }
+    // 看门狗定时器/TF 无条件创建, 是否真正打分重定位由运行期的 watchdog_en_ 决定
+    // (这样 webapp 可以在"里程计模式/自动重定位模式"之间实时切换, 无需重启导航)
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+    tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
+    watchdog_timer_ = create_wall_timer(std::chrono::seconds(2),
+                                        [this]() { watchdogCheck(); });
+    // 允许运行期通过 SetParameters 改看门狗行为 (里程计模式 = watchdog_en:false)
+    param_cb_handle_ = add_on_set_parameters_callback(
+        [this](const std::vector<rclcpp::Parameter> &ps) {
+          rcl_interfaces::msg::SetParametersResult r; r.successful = true;
+          for (const auto &p : ps) {
+            if (p.get_name() == "watchdog_en") watchdog_en_ = p.as_bool();
+            else if (p.get_name() == "watchdog_score") watchdog_score_ = p.as_double();
+            else if (p.get_name() == "watchdog_count") watchdog_count_ = (int)p.as_int();
+          }
+          RCLCPP_INFO(get_logger(), "重定位模式更新: 自动重定位看门狗=%s (score<%.2f 连续%d次)",
+                      watchdog_en_ ? "开" : "关", watchdog_score_, watchdog_count_);
+          return r;
+        });
     startup_timer_ = create_wall_timer(std::chrono::seconds(2), [this]() {
       if (!auto_on_startup_ || startup_done_) return;
       if (!field_ready_ || !haveScan()) return;
@@ -110,6 +124,7 @@ private:
   // 用当前激光给 AMCL 位姿(TF map->base_footprint)打分:
   // 小车被抱走后 AMCL 仍自信地输出旧位姿, 但激光和地图对不上, 分数会骤降
   void watchdogCheck() {
+    if (!watchdog_en_) return;   // 里程计模式: 不自动重定位, 侧重里程计(手动重定位仍可用)
     if (!field_ready_ || !haveScan() || !startup_done_) return;
     if ((now() - last_reloc_time_).seconds() < 15.0) return;  // 冷却期
     geometry_msgs::msg::TransformStamped tf;
@@ -347,6 +362,7 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_;
   rclcpp::TimerBase::SharedPtr startup_timer_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_handle_;
 };
 
 int main(int argc, char **argv) {

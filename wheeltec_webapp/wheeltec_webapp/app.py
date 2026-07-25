@@ -809,6 +809,7 @@ class WebConsole:
         self.last_scan_stamp = None
         self.last_plan_stamp = None
         self.last_local_plan_stamp = None
+        self.reloc_mode = 'auto'     # 'auto'=自动重定位模式 / 'odom'=里程计模式
         self.cmd_active = False
         self.cmd_last_t = 0.0
         self.ext_running = False
@@ -1146,6 +1147,20 @@ class WebConsole:
             await self._cancel_active()
         elif t == 'relocalize':
             await self._call_relocalize()
+        elif t == 'reloc_mode':
+            # 里程计模式(odom): 关掉自动重定位看门狗, 侧重里程计, 避免长走廊等
+            # 相似场景里频繁误重定位; 自动重定位模式(auto): 看门狗照常工作。
+            mode = 'odom' if msg.get('mode') == 'odom' else 'auto'
+            ok, err = await self._set_params('/auto_relocalize',
+                                             {'watchdog_en': (mode == 'auto')})
+            if ok:
+                self.reloc_mode = mode
+                self.send_json(t='toast', msg=(
+                    '已切到自动重定位模式' if mode == 'auto' else
+                    '已切到里程计模式 (自动重定位已停, 需要时点"手动重定位")'))
+            else:
+                self.send_json(t='toast', msg='切换失败: ' + err, ok=False)
+            self.send_json(t='reloc_mode', mode=self.reloc_mode)
         elif t == 'estop':
             self.cmd_active = False
             self.wps_loop = False
@@ -1374,8 +1389,15 @@ class WebConsole:
         if not cli.service_is_ready():
             return False, f'{node_fqn} 服务不在线(导航未启动?)'
         req = SetParameters.Request()
-        req.parameters = [Parameter(k, Parameter.Type.DOUBLE, float(v)).to_parameter_msg()
-                          for k, v in kv.items()]
+
+        def _mk(k, v):
+            # bool 要在 int 之前判断(Python 里 bool 是 int 的子类)
+            if isinstance(v, bool):
+                return Parameter(k, Parameter.Type.BOOL, v).to_parameter_msg()
+            if isinstance(v, int):
+                return Parameter(k, Parameter.Type.INTEGER, v).to_parameter_msg()
+            return Parameter(k, Parameter.Type.DOUBLE, float(v)).to_parameter_msg()
+        req.parameters = [_mk(k, v) for k, v in kv.items()]
         fut = cli.call_async(req)
         try:
             await asyncio.wait_for(self._wrap_future(fut), 5)

@@ -121,12 +121,13 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--fg);
 #stats .warn b{color:var(--warn)} #stats .bad b{color:var(--bad)}
 #stats .warn{color:var(--warn)} #stats .bad{color:var(--bad)}
 /* 状态栏图标按钮 (语音播报喇叭): off=灰, on=主色 */
-.iconbtn{width:30px;height:30px;flex:none;border-radius:9px;
+.iconbtn{width:30px;height:30px;flex:none;border:none;border-radius:9px;font-family:inherit;
   background:var(--panel2);color:var(--dim);display:inline-flex;align-items:center;
   justify-content:center;cursor:pointer;user-select:none;font-size:15px;
   transition:background .18s,color .18s,transform .1s}
 .iconbtn:active{transform:scale(.9)}
 .iconbtn.on{background:var(--acc-soft);color:var(--acc)}
+.iconbtn:disabled{opacity:.35;pointer-events:none}
 @media (hover:hover){.iconbtn:hover{color:var(--fg)}.iconbtn.on:hover{color:var(--acc)}}
 
 #taskBar{display:flex;align-items:center;gap:8px;padding:9px 16px;flex-wrap:wrap;z-index:7}
@@ -310,10 +311,9 @@ button.b.tool.active{background:var(--acc);color:#fff;box-shadow:0 2px 10px var(
 
 /* ---------- 网络卡片 ---------- */
 .wifi-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
-.wifi-row span{font-size:13.5px;color:var(--fg);font-variant-numeric:tabular-nums;
+.wifi-row span{flex:1;font-size:13.5px;color:var(--fg);font-variant-numeric:tabular-nums;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   display:inline-flex;align-items:center;gap:6px;min-width:0}
-.wifi-row button{padding:8px 15px;font-size:13px;flex:none}
 
 /* ---------- 地图库 ---------- */
 #mapList{max-height:224px;overflow-y:auto;font-size:12.5px;touch-action:pan-y}
@@ -475,6 +475,7 @@ button.b.wait{animation:pulse 1s infinite;pointer-events:none}
 <symbol id="i-spk" viewBox="0 0 24 24"><path d="M4 9v6h3.5L13 20V4L7.5 9H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/></symbol>
 <symbol id="i-spkoff" viewBox="0 0 24 24"><path d="M4 9v6h3.5L13 20V4L7.5 9H4z"/><path d="M22 9.5l-5 5M17 9.5l5 5"/></symbol>
 <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
+<symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3v9"/><path d="M7.4 6.3a8 8 0 1 0 9.2 0"/></symbol>
 </defs></svg>
 <div id="app">
   <!-- 状态栏: 只放状态信息 (连接/模式/电量/内存/磁盘/温度) -->
@@ -544,15 +545,20 @@ button.b.wait{animation:pulse 1s infinite;pointer-events:none}
         </div>
         <div class="card">
           <h3>导航操作</h3>
+          <!-- 定位模式切换: 自动重定位(看门狗持续纠正) / 里程计(侧重里程计, 不自动重定位) -->
+          <div class="seg" id="relocModeSeg">
+            <button class="seg-btn" data-mode="odom">里程计模式</button>
+            <button class="seg-btn active" data-mode="auto">自动重定位模式</button>
+          </div>
           <div class="btnrow">
             <button class="b tool" id="bGoal"><svg class="ic"><use href="#i-target"/></svg><span>单点目标</span></button>
             <button class="b tool" id="bWps"><svg class="ic"><use href="#i-route"/></svg><span>多点路线</span></button>
             <button class="b tool" id="bInit"><svg class="ic"><use href="#i-pin"/></svg><span>设初始位姿</span></button>
-            <button class="b" id="bReloc"><svg class="ic"><use href="#i-refresh"/></svg><span>自动重定位</span></button>
+            <button class="b" id="bReloc"><svg class="ic"><use href="#i-refresh"/></svg><span>手动重定位</span></button>
             <button class="b" id="bCancel"><svg class="ic"><use href="#i-xc"/></svg><span>取消目标</span></button>
             <button class="b danger" id="bEstop"><svg class="ic"><use href="#i-estop"/></svg><span>急停</span></button>
           </div>
-          <div class="tip">急停: 立即刹车并取消当前目标。建图用摇杆遥控时, 松手即停。</div>
+          <div class="tip"><b>定位模式</b>:「自动重定位」持续监测、定位丢失时自动全局重定位(默认);「里程计模式」侧重轮式里程计、<b>不</b>自动重定位——长直走廊等相似场景更稳,需要时点「手动重定位」。急停:立即刹车并取消目标。</div>
         </div>
         <div class="card" id="wpsCard" style="display:none">
           <h3>航点路线 <span id="wpsCount" style="float:right"></span></h3>
@@ -638,7 +644,7 @@ button.b.wait{animation:pulse 1s infinite;pointer-events:none}
             </div>
             <div class="wifi-row" style="margin-top:8px">
               <span id="wifiAp">--</span>
-              <button class="b" id="bApToggle">--</button>
+              <button class="iconbtn" id="bApToggle" title="热点开关"><svg class="ic"><use href="#i-power"/></svg></button>
             </div>
           </div>
         </div>
@@ -777,8 +783,11 @@ if(document.readyState==='loading')
 else initSliders();
 const dot=$('connDot'),modeBadge=$('modeBadge'),statsEl=$('stats'),hint=$('hint');
 const MODE_NAME={idle:'空闲',mapping:'建图中',save_map:'保存地图中',navigation:'导航中',lidar_test:'雷达测试中'};
+// 定位模式: 'auto'=自动重定位(看门狗) / 'odom'=里程计(不自动重定位)
+let relocMode=localStorage.getItem('relocMode')||'auto', _relocApplied=false;
 function onJson(m){
   if(m.t==='state'){Object.assign(S,m);renderState();}
+  else if(m.t==='reloc_mode'){relocMode=m.mode;localStorage.setItem('relocMode',relocMode);renderRelocMode();}
   else if(m.t==='pose'){robot.x=m.x;robot.y=m.y;robot.yaw=m.yaw;robot.frame=m.frame;robot.ok=true;
     renderPose();
     if(!tool)hint.textContent=(S.mode==='navigation'&&m.frame==='odom')?
@@ -824,6 +833,14 @@ function renderState(){
   // 状态每2秒推一次, 但地图列表只在"当前导航地图"真的变了时才重建 ——
   // 无条件重建会在用户正要点某一行时把DOM换掉
   if(S.active_map!==lastActiveMap){lastActiveMap=S.active_map;renderMapList();}
+  // 导航刚启动时把用户选的定位模式重新下发一次(节点默认 auto, 保证偏好跨重启生效)
+  const navRunning=S.running&&S.mode==='navigation';
+  if(navRunning&&!_relocApplied){
+    _relocApplied=true;
+    if(relocMode!=='auto')setTimeout(()=>{
+      if(S.running&&S.mode==='navigation')send({t:'reloc_mode',mode:relocMode});},4000);
+  }
+  if(!navRunning)_relocApplied=false;
   const busy=S.running||S.external||S.stopping;
   for(const id of['bMap','bSave','bNav','bLidar','bStop'])$(id).classList.remove('wait');
   for(const id of['bMap','bNav','bLidar'])$(id).classList.toggle('dim',busy);
@@ -893,7 +910,8 @@ function renderWifi(){
   // 热点在线时整行用主色, 一眼能看出开着没
   $('wifiAp').style.color=w.ap.up?'var(--acc)':'';
   const btn=$('bApToggle');
-  btn.textContent=w.ap.up?'关闭热点':'开启热点';
+  btn.classList.toggle('on',w.ap.up);   // 开着=主色电源图标, 关着=灰
+  btn.title=w.ap.up?'热点已开 (点击关闭)':'热点已关 (点击开启)';
   btn.dataset.on=w.ap.up?'1':'0';
   btn.disabled=!w.ap.exists;
 }
@@ -1642,6 +1660,19 @@ $('bStop').onclick=()=>{
   if(confirm(msg))send({t:'stop'});
 };
 $('bReloc').onclick=()=>send({t:'relocalize'});
+// 定位模式切换 (里程计 / 自动重定位)
+function renderRelocMode(){
+  document.querySelectorAll('#relocModeSeg .seg-btn').forEach(b=>
+    b.classList.toggle('active',b.dataset.mode===relocMode));
+}
+renderRelocMode();
+document.querySelectorAll('#relocModeSeg .seg-btn').forEach(b=>{
+  b.onclick=()=>{
+    if(relocMode===b.dataset.mode)return;
+    relocMode=b.dataset.mode; localStorage.setItem('relocMode',relocMode);
+    renderRelocMode(); send({t:'reloc_mode',mode:relocMode});
+  };
+});
 $('bCancel').onclick=()=>{goalMark=null;renderGoal();$('wpsLoop').checked=false;send({t:'cancel_goal'});draw();};
 $('bEstop').onclick=()=>{goalMark=null;renderGoal();$('wpsLoop').checked=false;send({t:'estop'});Voice.say('急停');draw();};
 // 系统时间: 每秒刷新 (客户端本地时间)
