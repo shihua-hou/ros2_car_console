@@ -16,6 +16,7 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch.conditions import IfCondition
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 PCD_DIR = '/home/cat/wheeltec_ros2/src/FAST_LIO/PCD'
 
@@ -26,7 +27,8 @@ def _clean_stale_dds_shm():
     probe = subprocess.run(
         ['pgrep', '-f',
          'component_container|livox_ros_driver2|wheeltec_robot_node|'
-         'fastlio_mapping|ekf_node|rviz2|pointcloud_to_laserscan'],
+         'fastlio_mapping|ekf_node|rviz2|pointcloud_to_laserscan|'
+         'astra_camera_node'],
         capture_output=True, text=True)
     if probe.stdout.strip():
         return
@@ -45,7 +47,7 @@ def _abort_if_already_running():
     probe = subprocess.run(
         ['pgrep', '-af',
          'component_container_isolated|livox_ros_driver2_node|'
-         'wheeltec_robot_node|fastlio_mapping'],
+         'wheeltec_robot_node|fastlio_mapping|astra_camera_node'],
         capture_output=True, text=True)
     lines = [l for l in probe.stdout.strip().splitlines() if l]
     if lines:
@@ -57,6 +59,35 @@ def _abort_if_already_running():
             '然后重新启动本 launch。')
 
 
+def _check_disk():
+    """建图前检查磁盘余量。
+
+    FAST-LIO 每 100 帧(约10秒)落一段 PCD, 每段约 16MB —— 也就是 **每分钟约 100MB**。
+    2026-08-06 实际发生过: 建图忘了关, 跑了 47 分钟, 攒下 286 段 4.6GB 把 29G 的盘
+    写满; 磁盘满之后连 colcon 的编译产物都会被写坏(install 里出现 0 字节文件)。
+    所以这里按余量分三档: <2G 直接拒绝启动, <5G 警告并给出可建图时长。
+    """
+    try:
+        st = os.statvfs(PCD_DIR)
+    except OSError:
+        return
+    free_gb = st.f_bavail * st.f_frsize / (1 << 30)
+    minutes = int(free_gb * 1024 / 100)      # 约 100MB/分钟
+    if free_gb < 2.0:
+        raise RuntimeError(
+            f'\n磁盘只剩 {free_gb:.1f}GB, 拒绝启动建图!\n'
+            f'建图每分钟约产生 100MB 的 PCD 分段, 现在最多只够建 {minutes} 分钟,\n'
+            f'而磁盘写满会导致编译产物损坏(实测踩过)。请先腾空间:\n'
+            f'  rm -f {PCD_DIR}/*.pcd        # 清上次建图的点云(存过图就可以删)\n'
+            f'  sudo journalctl --vacuum-size=50M\n'
+            f'  df -h /')
+    if free_gb < 5.0:
+        print(f'\n\033[33m[警告] 磁盘剩余 {free_gb:.1f}GB, 约够建图 {minutes} 分钟'
+              f'(每分钟约100MB)。建图结束记得 save_map 后清理 PCD。\033[0m\n')
+    else:
+        print(f'磁盘剩余 {free_gb:.1f}GB, 约够建图 {minutes} 分钟(每分钟约100MB)')
+
+
 def generate_launch_description():
     _abort_if_already_running()
     _clean_stale_dds_shm()
@@ -64,16 +95,24 @@ def generate_launch_description():
     # (如需保留上次的3D点云, 启动建图前请自行备份 PCD 目录)
     for f in glob.glob(os.path.join(PCD_DIR, 'scans*.pcd')):
         os.remove(f)
+    _check_disk()
     pkg_dir = get_package_share_directory('wheeltec_fastlio')
     wheeltec_launch_dir = os.path.join(
         get_package_share_directory('turn_on_wheeltec_robot'), 'launch')
 
     rviz_use = LaunchConfiguration('rviz', default='false')
-    # 雷达在小车上的安装位置(相对base_footprint), 按实际安装修改默认值
-    lidar_x = LaunchConfiguration('lidar_x', default='-0.20')
+    # 雷达安装外参(相对base_footprint) —— 2026-08-06 雷达移到相机上方下倾约45°、
+    # 同日又前移了一次, 以下为前移后的终值。完整标定记录见 navigation.launch.py 的同名段落。
+    #   pitch/roll: IMU重力法 vs 地面拟合两法差 0.71°, 取地面拟合
+    #   lidar_z:    地面拟合
+    #   lidar_x:    车前0.5m放纸箱, 雷达和相机比较各自到该立面的垂距, 向量投影解出
+    # **建图和导航两处必须完全一致**, 改一处就要改另一处。
+    lidar_x = LaunchConfiguration('lidar_x', default='0.08')
     lidar_y = LaunchConfiguration('lidar_y', default='0.0')
-    lidar_z = LaunchConfiguration('lidar_z', default='0.34')
+    lidar_z = LaunchConfiguration('lidar_z', default='0.28')
     lidar_yaw = LaunchConfiguration('lidar_yaw', default='0.0')
+    lidar_pitch = LaunchConfiguration('lidar_pitch', default='0.292')  # +16.7° 下倾(2026-08-07 傍晚重新固定雷达后实测)
+    lidar_roll = LaunchConfiguration('lidar_roll', default='0.006')   # +0.32°
 
     # 小车底盘(串口+EKF: odom_combined->base_footprint)
     wheeltec_robot = IncludeLaunchDescription(
@@ -99,6 +138,13 @@ def generate_launch_description():
         ],
     )
 
+    # 【正后方扇区屏蔽】建图时人跟在车后遥控, 不屏蔽的话人会被当成静态结构建进
+    # 地图(而且他一直在动, 喂给里程计也是负担)。默认 90 = 屏蔽正后方 ±45°。
+    # 实测该扇区占全部点的 26%, 屏蔽后仍有 270° 视野, 对 FAST-LIO 的约束绰绰有余。
+    # 不想屏蔽就 blind_back_deg:=0。屏蔽只作用于建图链路(FAST-LIO 的 preprocess),
+    # 导航的 /scan 走 pointcloud_to_laserscan, 不受影响 —— 导航时后方仍然能看见。
+    blind_back_deg = LaunchConfiguration('blind_back_deg', default='90.0')
+
     # FAST-LIO2 建图, TF: camera_init -> body
     fast_lio = Node(
         package='fast_lio',
@@ -107,6 +153,10 @@ def generate_launch_description():
         parameters=[
             os.path.join(pkg_dir, 'config', 'wheeltec_mid360.yaml'),
             {'use_sim_time': False},
+            # 必须显式声明 value_type: 不写的话 launch 把 '90.0' 当字符串传下去,
+            # 而节点声明的是 double, 起不来会直接报 InvalidParameterTypeException
+            {'preprocess.blind_back_deg':
+                ParameterValue(blind_back_deg, value_type=float)},
         ],
     )
 
@@ -116,8 +166,39 @@ def generate_launch_description():
         executable='static_transform_publisher',
         name='base_to_livox_tf',
         arguments=['--x', lidar_x, '--y', lidar_y, '--z', lidar_z,
-                   '--yaw', lidar_yaw, '--pitch', '0', '--roll', '0',
+                   '--yaw', lidar_yaw, '--pitch', lidar_pitch, '--roll', lidar_roll,
                    '--frame-id', 'base_footprint', '--child-frame-id', 'livox_frame'],
+    )
+
+    # 建图时也起相机 —— **只起彩色流, 不起深度、不起 depth_obstacle_filter**。
+    # 建图本身完全不用相机(定位靠雷达), 这一路纯粹是给网页控制台看实时画面用的:
+    # 遥控建图时能看见车头前方, 比盯着点云好判断该往哪走。
+    # 320x240@15 的彩色流开销很小(建图阶段 FAST-LIO 才是 CPU 大头), 不影响建图。
+    # 不需要就 use_camera:=false。
+    use_camera = LaunchConfiguration('use_camera', default='true')
+    astra_camera = Node(
+        condition=IfCondition(use_camera),
+        package='astra_camera',
+        executable='astra_camera_node',
+        name='camera',
+        namespace='camera',
+        output='screen',
+        parameters=[{
+            'camera_name': 'camera',
+            'camera_link_frame_id': 'camera_mount_link',
+            'vendor_id': '0x2bc5',
+            'device_num': 1,
+            'connection_delay': 100,
+            'enable_point_cloud': False,
+            'enable_colored_point_cloud': False,
+            'enable_depth': False,      # 建图不需要深度, 省 CPU 和带宽
+            'enable_color': True,
+            'color_width': 640, 'color_height': 480, 'color_fps': 30,
+            'enable_ir': False,
+            'publish_tf': False,        # 建图期间不挂相机TF, 免得和 camera_init 树混淆
+            'depth_registration': False,
+            'oni_log_level': 'none',
+        }],
     )
 
     rviz_node = Node(
@@ -129,13 +210,22 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument('rviz', default_value='false'),
-        DeclareLaunchArgument('lidar_x', default_value='-0.20'),
+        DeclareLaunchArgument('lidar_x', default_value='0.08'),
         DeclareLaunchArgument('lidar_y', default_value='0.0'),
-        DeclareLaunchArgument('lidar_z', default_value='0.34'),
+        DeclareLaunchArgument('lidar_z', default_value='0.28'),
         DeclareLaunchArgument('lidar_yaw', default_value='0.0'),
+        DeclareLaunchArgument('lidar_pitch', default_value='0.292',
+            description='雷达俯仰角(弧度); 已改回水平安装'),
+        DeclareLaunchArgument('lidar_roll', default_value='0.006',
+            description='雷达横滚角(弧度); 已改回水平安装'),
+        DeclareLaunchArgument('use_camera', default_value='true',
+            description='建图时是否起相机(仅彩色流, 给网页看实时画面; 不参与建图)'),
+        DeclareLaunchArgument('blind_back_deg', default_value='90.0',
+            description='屏蔽雷达正后方多少度的扇区(全角), 防止跟车的人被建进地图; 0=不屏蔽'),
         wheeltec_robot,
         livox_driver,
         fast_lio,
         lidar_tf,
+        astra_camera,
         rviz_node,
     ])

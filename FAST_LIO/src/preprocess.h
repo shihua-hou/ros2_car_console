@@ -156,7 +156,23 @@ class Preprocess
   bool feature_enabled, given_offset_time;
   // ros::Publisher pub_full, pub_surf, pub_corn;
 
+  /* WHEELTEC patch: 正后方扇区屏蔽(建图时把跟在车后遥控的人挡在地图外)。
+     blind_back_deg = 扇区**全角**(度), 0=不屏蔽, 90=屏蔽正后方 ±45°。
+     判据不用 atan2(每点一次三角函数, MID360 每帧两万点): 点在 -x 半空间、
+     且与 -x 轴夹角 < 半角 <=> x<0 且 x² > cos²(半角)·(x²+y²)。
+     只按方位角判, 不看高度 —— 人是从地面到头顶整条都在那个扇区里。 */
+  void set_back_blind(double full_deg);
+  bool in_back_blind(float x, float y) const
+  {
+    if (!back_blind_en_ || x >= 0.f) return false;
+    return (double)x * x > back_blind_cos2_ * ((double)x * x + (double)y * y);
+  }
+
 private:
+  bool   back_blind_en_ = false;
+  double back_blind_cos2_ = 0.0;   // cos²(半角)
+
+
   void avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg);
   void oust64_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);
   void velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg);

@@ -2,6 +2,7 @@
 build/
 install/
 log/
+COLCON_IGNORE
 
 # Python
 __pycache__/
@@ -14,12 +15,60 @@ FAST_LIO/PCD/*.pcd
 *.bag
 *.pgm.bak
 
+# 建图产出的地图: 只保留 WHEELTEC3D 作为示例, 日期快照不入库
+wheeltec_robot_nav2/map/*
+!wheeltec_robot_nav2/map/WHEELTEC3D.pgm
+!wheeltec_robot_nav2/map/WHEELTEC3D.yaml
+
 # 运行日志
 *.log
 .ros/
 
-# 编辑器 / 系统
+# 工具 / 编辑器 / 系统
+.claude/
 .vscode/
 .idea/
 .DS_Store
 *.swp
+
+# ---------------------------------------------------------------------------
+# 本仓库只收录「本项目原创 + 已打补丁」的包。工作区里其余的原厂 wheeltec 包、
+# 上游第三方源码(navigation2 源码树、URDF 网格、语音/大模型等)不随仓库分发,
+# 请从各自上游或原厂 SDK 获取。清单见 README.md「包说明」。
+# ---------------------------------------------------------------------------
+aruco_ros-humble-devel/
+auto_recharge_ros2/
+depend/
+interfaces/
+largemodel/
+msc/
+nav2_waypoint_cycle/
+navigation2-humble/
+odin_ros_driver/
+ollama_ros_chat-ros2/
+ros2_astra_camera-master/
+simple_follower_ros2/
+tts_make_ros2/
+usb_cam-ros2/
+web_video_server-ros2/
+wheeltec_bodyreader/
+wheeltec_gps/
+wheeltec_imu/
+wheeltec_joy/
+wheeltec_mic/
+wheeltec_mic_aiui/
+wheeltec_multi/
+wheeltec_path_follow/
+wheeltec_radar/
+wheeltec_robot_kcf/
+wheeltec_robot_keyboard/
+wheeltec_robot_msg/
+wheeltec_robot_rrt2/
+wheeltec_robot_rtab/
+wheeltec_robot_slam/
+wheeltec_robot_urdf/
+wheeltec_rrt_msg/
+wheeltec_rviz2/
+
+# 原厂常用指令速查(含源机路径), 非本项目源码
+ROS2-V5.0(humble)常用指令.txt

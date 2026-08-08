@@ -24,10 +24,19 @@ ament_target_dependencies(pcd2pgm rclcpp nav_msgs)
 add_executable(auto_relocalize src/auto_relocalize.cpp)
 ament_target_dependencies(auto_relocalize rclcpp nav_msgs sensor_msgs geometry_msgs std_srvs tf2_ros)
 
-install(TARGETS pcd2pgm auto_relocalize
+add_executable(depth_obstacle_filter src/depth_obstacle_filter.cpp)
+ament_target_dependencies(depth_obstacle_filter rclcpp sensor_msgs geometry_msgs tf2_ros)
+
+install(TARGETS pcd2pgm auto_relocalize depth_obstacle_filter
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch config map rviz
   DESTINATION share/${PROJECT_NAME})
+
+# clean_map.py: 用实时激光把地图里"已经挪走的障碍"擦掉
+# (nav2 的 static_layer 清不掉这些, 见脚本头部注释)
+# blackbox.py: 1Hz fsync 的机器状态记录, 查整机卡死用(journald 断电会丢)
+install(PROGRAMS scripts/clean_map.py scripts/blackbox.py
+  DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

@@ -1,0 +1,98 @@
+docking_node:
+  ros__parameters:
+    # ── Navigation (Nav2 pre-docking) ──
+    navigation.enable: true
+    navigation.pre_dock_distance: 1.0        # m — distance in front of tag
+    navigation.position_tolerance: 0.1        # m
+    navigation.yaw_tolerance_deg: 5.0         # degrees
+    navigation.nav2_action_name: "navigate_to_pose"
+    navigation.nav2_timeout_sec: 60.0
+    navigation.pre_dock_frame: "map"
+
+    # ── Camera / Timing ──
+    # 自适应位姿时效窗口: 实际取 max(max_latency_ms, 实测检测间隔 × latency_interval_margin)。
+    # 程序自动适应相机真实帧率 (6Hz→窗口~500ms, 30Hz→窗口~100ms 但受下限保护),
+    # 走停模式下 6Hz 足够, 无需追求 30fps。
+    camera.max_latency_ms: 150                # ms — 时效窗口下限 (高帧率时生效)
+    camera.latency_interval_margin: 3.0       # 窗口 = 检测间隔 × 此值 (容忍 ~2 帧丢失)
+    camera.expected_fps: 30
+
+    # ── Tag Identification ──
+    tag.family: "36h11"
+    tag.size: 0.16                            # m — tag edge length
+    tag.frame: "tag36h11:0"                   # TF frame name
+    tag.id: 0                                 # tag ID to dock to
+    tag.fresh_timeout_sec: 2.0                # tag considered stale after N seconds (6fps + 转向盲区, 放宽避免误判 TAG_LOST)
+    tag.ema_alpha: 0.5                        # EMA smoothing factor (0=heavier, 1=raw)
+    tag.max_pose_jump_m: 0.3                  # reject single-frame jumps > N meters
+
+    # ── TF Frames ──
+    camera_frame: "camera_color_optical_frame"
+    base_frame: "base_link"
+    # measure_frame: empty = use base_frame; set to e.g. "base_footprint" for
+    # direct base→tag TF (dist=tx.x, lat=tx.y). When empty, converts from
+    # camera optical frame (dist=tz, lat=-tx).
+    measure_frame: ""
+
+    # ── Dock Target (final desired pose relative to tag) ──
+    dock_target.distance: 0.55                # m — 底盘距 tag 停泊距离
+    dock_target.lateral_offset: 0.0           # m — 0 = centered
+    dock_target.yaw_offset_deg: 0.0           # degrees — yaw offset from facing tag
+
+    # ── Base Type ──
+    #   "diff_drive" — unicycle control (vx + wz only)
+    #   "omni"       — full 3-DOF (vx, vy, wz) via cmd_vel
+    #   "quadruped"  — SDK move(vx, vy, yaw_rate) callback
+    base.type: "diff_drive"
+    base.cmd_vel_topic: "cmd_vel"
+
+    # ── Stop-and-Go Parameters ──
+    stopgo.lateral_threshold: 0.05           # m — 左右横偏容许 ±5cm, 超过才转向对准
+    stopgo.yaw_threshold_deg: 10.0           # deg — 角度容许 ±10°, 超过才转向
+    stopgo.tune_angle: 0.0                   # rad — oblique correction (diff-drive), 0=disabled
+    stopgo.jog_min: 0.05                     # m — minimum jog distance per step
+    stopgo.jog_max: 0.15                     # m — maximum jog distance per step (小步: 运动期短, tag 不易因模糊丢失)
+    stopgo.jog_linear_rate: 0.08             # m/s — constant speed during forward jog
+    stopgo.jog_angular_rate: 0.3             # rad/s — constant speed during turn
+    stopgo.turn_creep_linear: 0.0            # m/s — 已弃用: "边走边转"叠加前进会驶出目标横向范围; 固定纯原地转, 角度靠里程计校准 (此参数不再被读取, 保留仅为兼容)
+    stopgo.lateral_rate: 0.08                # m/s — constant speed during lateral jog (omni)
+    stopgo.turn_settle_sec: 0.8              # s — wait after turn for image to clear (加长: 避免模糊帧被 jump rejection 误拒)
+    stopgo.turn_undershoot: 0.75             # fraction — turn only x% of commanded angle
+    stopgo.max_turn_step: 0.17               # rad (~10°) — 单次转向硬上限, 小步转+每步重看, 低帧率下 tag 不易转出视野而丢失
+    stopgo.small_turn_rad: 0.1               # rad — below this, turn at half speed
+    stopgo.theta_shrink_ratio: 2.0           # dynamic bearing tolerance: max(yaw_threshold, dist/ratio)
+    stopgo.drift_tol: 0.15                   # rad — bearing drift limit during jog
+
+    # ── Final Servo (stability confirmation) ──
+    final_servo.max_linear_speed: 0.05        # m/s — (legacy, not used in stop-and-go)
+    final_servo.max_yaw_speed: 0.2            # rad/s — (legacy)
+    final_servo.distance: 0.20                # m — enter FINAL_SERVO within this distance
+
+    # ── Docking Tolerance ──
+    tolerance.position_m: 0.05                # m — 前后 ±5cm 视为到位
+    tolerance.yaw_deg: 10.0                   # degrees — ±10° 视为对准
+    tolerance.stable_time_sec: 1.0            # s — must be stable for this long
+
+    # ── Safety ──
+    safety.minimum_distance_m: 0.15           # m — stop if closer than this
+    timeout_sec: 120.0                        # overall docking timeout
+
+    # ── Search Behavior ──
+    search.angular_speed: 0.3                 # rad/s — rotation speed
+    search.rotate_time_sec: 0.8               # s — rotate for this long
+    search.pause_time_sec: 1.5                # s — pause for detection
+    search.hold_time_sec: 0.5                 # s — tag must be visible this long to lock
+    search.search_direction: 1                # +1 = CCW, -1 = CW
+    search.timeout_sec: 60.0                  # overall search timeout
+
+    # ── Per-State Timeouts ──
+    align_timeout_sec: 15.0
+    approach_timeout_sec: 60.0
+    final_servo_timeout_sec: 30.0
+
+    # ── Pose Buffer ──
+    pose_buffer.size: 30                      # max buffered poses
+
+    # ── Topics ──
+    detection_topic: "/detections"
+    odom_topic: "/odom"

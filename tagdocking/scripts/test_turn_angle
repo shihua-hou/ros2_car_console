@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Rotation-angle accuracy test script.
+
+Commands a rotation and reports the difference between commanded
+angle and actual angle measured by odometry.
+
+    + 正角度 → 逆时针 (CCW, 左转)
+    - 负角度 → 顺时针 (CW,  右转)
+
+Usage:
+    # 顺时针转 90°
+    python3 test_turn_angle --angle -90
+
+    # 逆时针转 180°，慢速（精度优先）
+    python3 test_turn_angle --angle 180 --speed 0.2
+
+    # 右转 45°，快速
+    python3 test_turn_angle --angle -45 --speed 0.5
+"""
+
+import argparse
+import math
+import sys
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+
+from tagdocking.utils import normalize_angle, yaw_from_quat
+
+# 本脚本是一个「一次性转过指定角度」的开环定速 + 里程计闭环判停测试。
+# 它有意不使用 ActionExecutor：后者为 docking 的多步迭代流程设计，
+# 其 start_turn 会施加 undershoot(0.75) 与 max_turn_step(0.5rad) 截断，
+# 用在这里会把 90° 目标砍到 ~28.6° 就停。这里直接以完整 --angle 为目标。
+_SETTLE = 1.0          # s   — 停车后等待里程计稳定的时间
+_SLOW_RAD = math.radians(8.0)   # 距目标剩此值内时速度减半，减轻惯性过冲
+# 判停提前量：从达到目标那一帧到机器人真正停下之间存在控制周期(50ms)+
+# 里程计延迟+底盘惯性造成的滞后。提前在距目标 _LEAD rad 时发零速，
+# 让惯性正好把车带到目标。按速度标定(快→惯性大→提前更多)，避免小角度过冲。
+_LEAD_PER_SPEED = 0.15         # rad / (rad/s) — 提前量与速度成线性
+_STOP_BRAKE_TICKS = 4          # 到达后强制补发零速的帧数，确保底盘收到停车指令
+
+
+class TestTurnAngle(Node):
+    """Test turn-angle accuracy."""
+
+    def __init__(self, angle_deg=90.0, speed=0.3,
+                 cmd_vel_topic='cmd_vel', odom_topic='/odom'):
+        super().__init__('test_turn_angle')
+
+        self.declare_parameter('cmd_vel_topic', cmd_vel_topic)
+        self.declare_parameter('odom_topic', odom_topic)
+        self.declare_parameter('angle_deg', angle_deg)
+        self.declare_parameter('speed', speed)
+
+        self._angle_rad = math.radians(self._p('angle_deg'))
+        self._speed = abs(self._p('speed'))
+
+        # ── Odometry ───────────────────────────────────────────────
+        self._odom_x = 0.0
+        self._odom_y = 0.0
+        self._odom_yaw = 0.0
+        self._has_odom = False
+        self._start_yaw = None
+        self._turn_start_yaw = 0.0
+        self._final_yaw = None
+
+        self._odom_sub = self.create_subscription(
+            Odometry, self._p('odom_topic'), self._on_odom, 10)
+
+        # ── Publisher ──────────────────────────────────────────────
+        self._pub = self.create_publisher(
+            Twist, self._p('cmd_vel_topic'), 10)
+
+        # ── 旋转方向 ───────────────────────────────────────────────
+        # 正角度 → CCW(左转)，angular.z 为正
+        self._turn_sign = 1.0 if self._angle_rad >= 0 else -1.0
+
+        self._phase = 'wait_odom'
+        self._phase_start_ns = 0
+        self._brake_ticks = 0
+
+        # ── Timer ──────────────────────────────────────────────────
+        self._timer = self.create_timer(0.05, self._loop)
+
+        dir_str = 'CCW(左转)' if self._angle_rad >= 0 else 'CW(右转)'
+        self.get_logger().info(
+            f'Turn test ready | {abs(self._p("angle_deg")):.0f}° {dir_str} '
+            f'| speed={self._speed:.2f} rad/s')
+
+    def _p(self, name):
+        return self.get_parameter(name).value
+
+    def _on_odom(self, msg: Odometry):
+        self._odom_x = msg.pose.pose.position.x
+        self._odom_y = msg.pose.pose.position.y
+        self._odom_yaw = yaw_from_quat(msg.pose.pose.orientation)
+        if not self._has_odom:
+            self._has_odom = True
+            self.get_logger().info(
+                f'里程计已连接 | 当前朝向: {math.degrees(self._odom_yaw):.1f}°')
+
+    def _loop(self):
+        now_ns = self.get_clock().now().nanoseconds
+
+        if self._phase == 'wait_odom':
+            if self._has_odom:
+                self._start_yaw = self._odom_yaw
+                self._turn_start_yaw = self._odom_yaw
+                self._phase = 'turn'
+                self._phase_start_ns = now_ns
+                # 提前量按速度标定：速度越大，停车惯性越大，越早发零速
+                self._lead = _LEAD_PER_SPEED * self._speed
+                self.get_logger().info(
+                    f'开始旋转 | {abs(math.degrees(self._angle_rad)):.1f}° '
+                    f'{"逆时针" if self._angle_rad>=0 else "顺时针"} | '
+                    f'起始朝向={math.degrees(self._start_yaw):.1f}°')
+
+        elif self._phase == 'turn':
+            target = abs(self._angle_rad)
+            turned = abs(normalize_angle(self._odom_yaw - self._turn_start_yaw))
+            # 提前量判停：到达 (target - lead) 即发零速，用惯性把车带到目标。
+            # 但 lead 不超过目标的一半，避免极小角度还没起步就停。
+            lead = min(self._lead, target * 0.5)
+            if turned >= target - lead:
+                self._pub_twist(0.0)
+                self._brake_ticks = _STOP_BRAKE_TICKS
+                self._phase = 'brake'
+                self.get_logger().info('旋转完成，制动停车…')
+            else:
+                # 接近目标时减速，减轻惯性过冲；不缩减目标
+                remaining = target - turned
+                speed = self._speed * 0.5 if remaining < _SLOW_RAD else self._speed
+                self._pub_twist(self._turn_sign * speed)
+
+        elif self._phase == 'brake':
+            # 强制补发几帧零速，确保底盘控制器收到并执行停车
+            self._pub_twist(0.0)
+            self._brake_ticks -= 1
+            if self._brake_ticks <= 0:
+                self._phase = 'settle'
+                self._phase_start_ns = now_ns
+                self.get_logger().info('等待里程计稳定…')
+
+        elif self._phase == 'settle':
+            self._pub_twist(0.0)
+            if (now_ns - self._phase_start_ns) * 1e-9 >= _SETTLE:
+                self._final_yaw = self._odom_yaw
+                self._phase = 'report'
+                self._print_report()
+
+        elif self._phase == 'report':
+            self._pub_twist(0.0)
+
+    def _pub_twist(self, angular: float):
+        msg = Twist()
+        msg.angular.z = float(angular)
+        self._pub.publish(msg)
+
+    def _print_report(self):
+        actual = normalize_angle(self._final_yaw - self._start_yaw)
+        error = math.degrees(normalize_angle(actual - self._angle_rad))
+        actual_deg = math.degrees(actual)
+        cmd_deg = math.degrees(self._angle_rad)
+
+        self.get_logger().info('')
+        self.get_logger().info('=' * 55)
+        self.get_logger().info('  旋转精度报告')
+        self.get_logger().info('=' * 55)
+        self.get_logger().info(f'  指令角度:     {cmd_deg:8.1f}°')
+        self.get_logger().info(f'  起始朝向:     {math.degrees(self._start_yaw):8.1f}°')
+        self.get_logger().info(f'  终止朝向:     {math.degrees(self._final_yaw):8.1f}°')
+        self.get_logger().info(f'  实际转过:     {actual_deg:8.1f}°')
+        self.get_logger().info(f'  误差:         {error:8.1f}°  '
+                               f'({abs(error / max(abs(cmd_deg), 0.1)):.1f}%)')
+        self.get_logger().info(f'  旋转速度:     {self._speed:.2f} rad/s')
+        self.get_logger().info(f'  闭环:         里程计判停，目标=完整指令角度')
+        passed = abs(error) < 5.0
+        if passed:
+            self.get_logger().info(f'  结果:         ✓ PASS (误差<5°)')
+        else:
+            self.get_logger().info(f'  结果:         ✗ 误差偏大 (>{5.0}°)')
+            self.get_logger().info(f'                建议: 若误差为过冲，降低 --speed 重试')
+        self.get_logger().info('=' * 55)
+        self.get_logger().info('')
+        self.get_logger().info('测试完成，按 Ctrl+C 退出。')
+        self._phase = 'done'
+
+
+def main(args=None):
+    argv = sys.argv[1:] if args is None else args
+    try:
+        ros_idx = argv.index('--ros-args')
+        argv = argv[:ros_idx]
+    except ValueError:
+        pass
+
+    parser = argparse.ArgumentParser(
+        description='旋转角度精度测试',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  python3 test_turn_angle --angle -90           # 顺时针(右转) 90°
+  python3 test_turn_angle --angle 180            # 逆时针(左转) 180°
+  python3 test_turn_angle --angle -45 --speed 0.5  # 右转45°, 快速
+
+speed 默认 0.3 rad/s (≈ 17°/s).
+  太小 → 太慢；太大 → 惯性过冲/打滑 → 测量不准。
+  如果不确定，先用默认值跑一次看结果。""")
+    parser.add_argument('--angle', type=float, required=True,
+                        help='旋转角度（度）。正=逆时针/左转, 负=顺时针/右转')
+    parser.add_argument('--speed', type=float, default=0.3,
+                        help='旋转角速度 (rad/s)，默认 0.3。降低可减少惯性误差')
+    parser.add_argument('--cmd-vel-topic', default='cmd_vel', help=argparse.SUPPRESS)
+    parser.add_argument('--odom-topic', default='/odom', help=argparse.SUPPRESS)
+    cli = parser.parse_args(argv)
+
+    rclpy.init(args=sys.argv if args is None else args)
+    node = TestTurnAngle(
+        angle_deg=cli.angle, speed=cli.speed,
+        cmd_vel_topic=cli.cmd_vel_topic, odom_topic=cli.odom_topic)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # 先发零速停车，再销毁节点/shutdown —— 顺序反了会因 context 失效抛异常
+        try:
+            node._pub_twist(0.0)
+        except Exception:
+            pass
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

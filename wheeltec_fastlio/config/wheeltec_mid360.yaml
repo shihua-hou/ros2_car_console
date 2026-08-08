@@ -22,6 +22,11 @@
             blind: 0.5
             timestamp_unit: 3
             scan_rate: 10
+            # 正后方扇区屏蔽(全角, 度)。建图时人跟在车后遥控, 不屏蔽会被当成静态
+            # 结构建进地图, 而且人一直在动、喂给里程计也是负担。
+            # 90 = 屏蔽正后方 ±45°(实测约占全部点的 26%), 剩 270° 视野约束足够。
+            # 0 = 关闭。可用 mapping.launch.py 的 blind_back_deg 参数临时覆盖。
+            blind_back_deg: 90.0
 
         mapping:
             acc_cov: 0.1

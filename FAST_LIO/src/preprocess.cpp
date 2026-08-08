@@ -44,6 +44,15 @@ void Preprocess::set(bool feat_en, int lid_type, double bld, int pfilt_num)
   point_filter_num = pfilt_num;
 }
 
+// WHEELTEC patch: 见 preprocess.h 里 in_back_blind() 的说明
+void Preprocess::set_back_blind(double full_deg)
+{
+  back_blind_en_ = (full_deg > 0.1 && full_deg < 359.0);
+  const double half = full_deg * 0.5 * M_PI / 180.0;
+  const double c = std::cos(half);
+  back_blind_cos2_ = c * c;
+}
+
 void Preprocess::process(const livox_ros_driver2::msg::CustomMsg::UniquePtr &msg, PointCloudXYZI::Ptr& pcl_out)
 {
   avia_handler(msg);
@@ -116,6 +125,7 @@ void Preprocess::avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr
   {
     for (uint i = 1; i < plsize; i++)
     {
+      if (in_back_blind(msg->points[i].x, msg->points[i].y)) continue;  // WHEELTEC patch
       if ((msg->points[i].line < N_SCANS) &&
           ((msg->points[i].tag & 0x30) == 0x10 || (msg->points[i].tag & 0x30) == 0x00))
       {
@@ -167,6 +177,7 @@ void Preprocess::avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr
   {
     for (uint i = 1; i < plsize; i++)
     {
+      if (in_back_blind(msg->points[i].x, msg->points[i].y)) continue;  // WHEELTEC patch
       if ((msg->points[i].line < N_SCANS) &&
           ((msg->points[i].tag & 0x30) == 0x10 || (msg->points[i].tag & 0x30) == 0x00))
       {

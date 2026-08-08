@@ -825,6 +825,10 @@ public:
         this->declare_parameter<int>("preprocess.scan_line", 16);
         this->declare_parameter<int>("preprocess.timestamp_unit", US);
         this->declare_parameter<int>("preprocess.scan_rate", 10);
+        // WHEELTEC patch: 正后方扇区屏蔽(全角, 度)。建图时遥控的人跟在车后, 不屏蔽
+        // 会被当成静态结构建进地图; 而且人是运动的, 喂给里程计也是负担。
+        // 0=关闭; 90=屏蔽正后方 ±45°。屏蔽后仍有 270° 视野, 约束绰绰有余。
+        this->declare_parameter<double>("preprocess.blind_back_deg", 0.0);
         this->declare_parameter<int>("point_filter_num", 2);
         this->declare_parameter<bool>("feature_extract_enable", false);
         this->declare_parameter<bool>("runtime_pos_log_enable", false);
@@ -861,6 +865,13 @@ public:
         this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
         this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
         this->get_parameter_or<int>("preprocess.scan_rate", p_pre->SCAN_RATE, 10);
+        double blind_back_deg = 0.0;   // WHEELTEC patch
+        this->get_parameter_or<double>("preprocess.blind_back_deg", blind_back_deg, 0.0);
+        p_pre->set_back_blind(blind_back_deg);
+        if (blind_back_deg > 0.1)
+            RCLCPP_WARN(this->get_logger(),
+                        "已屏蔽雷达正后方 %.0f° 扇区(±%.0f°): 跟车的人不会被建进地图; "
+                        "同时该扇区不参与里程计约束", blind_back_deg, blind_back_deg / 2);
         this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
         this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
         this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);

@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Forward-jog distance accuracy test script.
+
+Commands a straight-line jog and reports the difference between
+commanded distance and actual displacement measured by odometry.
+
+Usage:
+    # 前进 0.5m（默认速度 0.1 m/s）
+    python3 test_jog_distance --distance 0.5
+
+    # 前进 1.0m，快速
+    python3 test_jog_distance --distance 1.0 --speed 0.2
+
+    # 前进 0.3m，慢速（精度优先）
+    python3 test_jog_distance --distance 0.3 --speed 0.05
+"""
+
+import argparse
+import math
+import sys
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+
+from tagdocking.action_executor import ActionExecutor
+from tagdocking.utils import normalize_angle, yaw_from_quat
+
+_DRIFT_TOL = 0.3   # rad — 直行时偏航漂移超过此值会提前停下
+_SETTLE = 1.0      # s   — 停车后等待里程计稳定
+
+
+class TestJogDistance(Node):
+    """Test forward-jog distance accuracy."""
+
+    def __init__(self, distance=0.5, speed=0.1,
+                 cmd_vel_topic='cmd_vel', odom_topic='/odom'):
+        super().__init__('test_jog_distance')
+
+        self.declare_parameter('cmd_vel_topic', cmd_vel_topic)
+        self.declare_parameter('odom_topic', odom_topic)
+        self.declare_parameter('distance', distance)
+        self.declare_parameter('speed', speed)
+
+        self._distance = self._p('distance')
+        self._speed = abs(self._p('speed'))
+
+        # ── Odometry ───────────────────────────────────────────────
+        self._odom_x = 0.0
+        self._odom_y = 0.0
+        self._odom_yaw = 0.0
+        self._has_odom = False
+        self._start_x = None
+        self._start_y = None
+        self._start_yaw = None
+        self._final_x = None
+        self._final_y = None
+        self._final_yaw = None
+
+        self._odom_sub = self.create_subscription(
+            Odometry, self._p('odom_topic'), self._on_odom, 10)
+
+        # ── Publisher ──────────────────────────────────────────────
+        self._pub = self.create_publisher(
+            Twist, self._p('cmd_vel_topic'), 10)
+
+        # ── ActionExecutor ─────────────────────────────────────────
+        self._exec = ActionExecutor(
+            turn_settle_sec=0.0,
+            turn_undershoot=0.75,
+            max_turn_step=0.5)
+
+        self._phase = 'wait_odom'
+        self._phase_start_ns = 0
+
+        # ── Timer ──────────────────────────────────────────────────
+        self._timer = self.create_timer(0.05, self._loop)
+
+        self.get_logger().info(
+            f'Jog test ready | distance={self._distance:.3f}m '
+            f'| speed={self._speed:.2f} m/s')
+
+    def _p(self, name):
+        return self.get_parameter(name).value
+
+    def _on_odom(self, msg: Odometry):
+        self._odom_x = msg.pose.pose.position.x
+        self._odom_y = msg.pose.pose.position.y
+        self._odom_yaw = yaw_from_quat(msg.pose.pose.orientation)
+        if not self._has_odom:
+            self._has_odom = True
+            self.get_logger().info('里程计已连接')
+
+    def _loop(self):
+        now_ns = self.get_clock().now().nanoseconds
+
+        if self._phase == 'wait_odom':
+            if self._has_odom:
+                self._start_x = self._odom_x
+                self._start_y = self._odom_y
+                self._start_yaw = self._odom_yaw
+                self._exec.start_jog(self._distance, self._speed)
+                self._exec.set_odom_ref(
+                    self._odom_x, self._odom_y, self._odom_yaw, bearing=0.0)
+                self._phase = 'jog'
+                self._phase_start_ns = now_ns
+                self.get_logger().info(
+                    f'开始直行 | {self._distance:.3f}m | '
+                    f'起点=({self._start_x:.3f}, {self._start_y:.3f}) '
+                    f'朝向={math.degrees(self._start_yaw):.1f}°')
+
+        elif self._phase == 'jog':
+            if self._exec.is_active:
+                done = self._exec.update(
+                    self._odom_x, self._odom_y, self._odom_yaw,
+                    False, None,
+                    lambda: 0.0, lambda: 0.1,
+                    0.0, _DRIFT_TOL, now_ns)
+                if self._exec.is_active:
+                    self._pub_jog(self._exec.linear_cmd)
+                else:
+                    self._pub_jog(0.0)
+                    self._exec.mark_stop_time(now_ns)
+                    self._phase = 'settle'
+                    self._phase_start_ns = now_ns
+                    self.get_logger().info('直行完成，等待里程计稳定…')
+
+        elif self._phase == 'settle':
+            self._pub_jog(0.0)
+            if (now_ns - self._phase_start_ns) * 1e-9 >= _SETTLE:
+                self._final_x = self._odom_x
+                self._final_y = self._odom_y
+                self._final_yaw = self._odom_yaw
+                self._phase = 'report'
+                self._print_report()
+
+        elif self._phase == 'report':
+            self._pub_jog(0.0)
+
+    def _pub_jog(self, linear: float):
+        msg = Twist()
+        msg.linear.x = float(linear)
+        self._pub.publish(msg)
+
+    def _print_report(self):
+        dx = self._final_x - self._start_x
+        dy = self._final_y - self._start_y
+        actual = math.hypot(dx, dy)
+        error = actual - self._distance
+        pct = error / max(abs(self._distance), 0.01) * 100
+        yaw_drift = math.degrees(normalize_angle(self._final_yaw - self._start_yaw))
+
+        self.get_logger().info('')
+        self.get_logger().info('=' * 55)
+        self.get_logger().info('  直行距离精度报告')
+        self.get_logger().info('=' * 55)
+        self.get_logger().info(f'  指令距离:     {self._distance:8.3f} m')
+        self.get_logger().info(f'  起点:         ({self._start_x:.3f}, {self._start_y:.3f})')
+        self.get_logger().info(f'  终点:         ({self._final_x:.3f}, {self._final_y:.3f})')
+        self.get_logger().info(f'  Δx / Δy:      {dx:8.3f} / {dy:.3f} m')
+        self.get_logger().info(f'  实际位移:     {actual:8.3f} m')
+        self.get_logger().info(f'  误差:         {error:8.3f} m  ({pct:+.1f}%)')
+        self.get_logger().info(f'  偏航漂移:     {yaw_drift:8.2f}°')
+        self.get_logger().info(f'  行驶速度:     {self._speed:.2f} m/s')
+        passed = abs(pct) < 10
+        if passed:
+            self.get_logger().info(f'  结果:         ✓ PASS (误差<10%)')
+        else:
+            self.get_logger().info(f'  结果:         ✗ 误差偏大 (>{10}%)')
+            self.get_logger().info(f'                建议: 检查轮径参数 / 降低 --speed 重试')
+        self.get_logger().info('=' * 55)
+        self.get_logger().info('')
+        self.get_logger().info('测试完成，按 Ctrl+C 退出。')
+        self._phase = 'done'
+
+
+def main(args=None):
+    argv = sys.argv[1:] if args is None else args
+    try:
+        ros_idx = argv.index('--ros-args')
+        argv = argv[:ros_idx]
+    except ValueError:
+        pass
+
+    parser = argparse.ArgumentParser(
+        description='直行距离精度测试',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  python3 test_jog_distance --distance 0.5           # 前进 0.5m
+  python3 test_jog_distance --distance 1.0 --speed 0.2  # 前进 1m, 较快
+
+speed 默认 0.1 m/s (10 cm/s).
+  太小 → 太慢；太大 → 惯性冲过头/轮子打滑 → 测量不准。
+  如果不确定，先用默认值跑一次看结果。""")
+    parser.add_argument('--distance', type=float, required=True,
+                        help='行驶距离（米）')
+    parser.add_argument('--speed', type=float, default=0.1,
+                        help='行驶线速度 (m/s)，默认 0.1。降低可减少惯性误差')
+    parser.add_argument('--cmd-vel-topic', default='cmd_vel', help=argparse.SUPPRESS)
+    parser.add_argument('--odom-topic', default='/odom', help=argparse.SUPPRESS)
+    cli = parser.parse_args(argv)
+
+    rclpy.init(args=sys.argv if args is None else args)
+    node = TestJogDistance(
+        distance=cli.distance, speed=cli.speed,
+        cmd_vel_topic=cli.cmd_vel_topic, odom_topic=cli.odom_topic)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node._pub_jog(0.0)
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

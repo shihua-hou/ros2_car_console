@@ -1,0 +1,3143 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>WHEELTEC 控制台</title>
+<!--
+  双模式控制台 (2026-08-06 起)。挂在 /v2, 与老版 index.html 并存, 说的是同一套 WS 协议。
+
+  为什么另起一个文件而不是原地改: 这次是整页重构(双模式框架 / 导航模式全屏浮层 /
+  建图模式3D点云), 中途必然有不可用的状态, 而这台车的控制台要一直能用。
+  验收通过后再把 / 指过来。
+
+  【布局约定】
+    首页(2026-08-07 改成仪表盘): 左栏 = 时钟(左列 时间+日期 | 右列 运行时间) +
+      2×3 指标磁贴(标题左上、副标题右上、大数居中、趋势曲线铺底) + 一排状态胶囊;
+      右栏 = 四个入口横向长条卡, 每条带实时状态副标题和右侧读数。
+      磁贴的趋势样本在收到 state 时采(pushHist), 不在 renderHome 里采。
+    顶栏 = 模式开关(导航/建图) + 该模式的操作按钮 + 右侧状态区 + 设置
+    导航模式: 全屏2D地图, 相机浮左上, 图标按钮列在相机下方, 摇杆浮右下, 日志浮在摇杆上方
+    建图模式: 全屏3D点云(WebGL), 相机浮左上, 按钮列在相机下方, 摇杆+日志浮右侧
+
+  【语音播报】音频离线预生成在 static/voice/<key>.mp3, key 就是文件名。
+    新增一条: SPEAK 表加一行 + tools/gen_voice.py 的 PHRASES 加同名一行, 重跑脚本。
+-->
+<style>
+:root{
+  --bg:#f4f6f9; --panel:#fff; --panel2:#eef1f6; --fg:#1a2130; --dim:#68748a; --dim2:#a8b2c2;
+  --line:#e3e8f0; --accent:#2f7ef7; --accent-soft:#2f7ef714; --ok:#17b978; --ok-soft:#17b9781a;
+  --cyan:#06b6d4; --cyan-soft:#06b6d414;
+  --warn:#f5a524; --err:#ec4b4b; --r:14px; --r-pill:999px;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
+  --shadow:0 1px 2px #0b1a330a,0 6px 20px #0b1a3310;
+  --shadow-lg:0 2px 6px #0b1a330d,0 16px 44px #0b1a3316;
+}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#0f1420; --panel:#161d2b; --panel2:#1e2636; --fg:#e8edf6; --dim:#94a1b6;
+        --dim2:#5b6779; --line:#26303f; --accent:#4d92ff; --accent-soft:#4d92ff26;
+        --cyan:#22d3ee; --cyan-soft:#22d3ee1f;
+        --shadow:0 1px 2px #0004,0 6px 20px #0006;
+        --shadow-lg:0 2px 6px #0005,0 16px 44px #0008;}
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+/* 长按选中文字会连带出现拖拽行为, 画布类界面上纯属干扰 */
+body{-webkit-user-select:none;user-select:none}
+input,textarea{-webkit-user-select:text;user-select:text}
+/* 全屏时整页仍能被拖动/回弹 —— 只设 overflow:hidden 不够, 移动端浏览器的
+   overscroll 和触摸平移是另一套。position:fixed 钉死 + overscroll-behavior:none
+   + touch-action:none, 三者缺一不可。用 100dvh 避开移动端地址栏导致的高度跳变。 */
+html,body{margin:0;padding:0;width:100%;height:100%;height:100dvh;position:fixed;
+  inset:0;overflow:hidden;overscroll-behavior:none;touch-action:none;
+  -webkit-text-size-adjust:100%;background:var(--bg);color:var(--fg);
+  font:14px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Noto Sans CJK SC",sans-serif}
+button{font:inherit;color:inherit;border:none;background:none;cursor:pointer}
+.ic{width:1.15em;height:1.15em;fill:none;stroke:currentColor;stroke-width:2;
+  stroke-linecap:round;stroke-linejoin:round;display:block}
+
+/* ---------------- 顶栏 ---------------- */
+#top{position:fixed;top:0;left:0;right:0;height:54px;z-index:40;display:flex;align-items:center;
+  gap:10px;padding:0 14px;background:color-mix(in srgb,var(--panel) 92%,transparent);
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  border-bottom:1px solid var(--line);padding-top:env(safe-area-inset-top);
+  position:fixed}
+#top::after{content:'';position:absolute;left:0;right:0;bottom:-1px;height:1px;
+  background:linear-gradient(90deg,transparent,var(--accent),var(--cyan),transparent);
+  opacity:.5}
+/* 模式开关: 两段式胶囊, 是整个界面的总闸 */
+#modeSw{flex:none;display:flex;background:var(--panel2);border-radius:var(--r-pill);padding:3px;gap:2px}
+#modeSw button{padding:6px 14px;border-radius:var(--r-pill);font-weight:600;font-size:13px;
+  color:var(--dim);display:flex;align-items:center;gap:6px;transition:.15s}
+#modeSw button.on{background:var(--panel);color:var(--accent);box-shadow:var(--shadow)}
+#modeSw button:disabled{opacity:.45;cursor:not-allowed}
+#menu{flex:1;display:flex;align-items:center;gap:6px;overflow-x:auto;scrollbar-width:none}
+#menu::-webkit-scrollbar{display:none}
+.mbtn{flex:none;display:flex;align-items:center;gap:6px;padding:8px 14px;border-radius:var(--r-pill);
+  background:var(--panel2);font-size:13px;font-weight:600;white-space:nowrap;
+  transition:transform .12s,background .15s}
+.mbtn{border:1px solid transparent}
+.mbtn:hover{background:var(--line)}
+.mbtn:active{transform:scale(.96)}
+.mbtn:not(.primary):not(.danger){border-color:var(--line)}
+.mbtn.primary{box-shadow:0 2px 10px #2f7ef73d}
+.mbtn.primary{background:var(--accent);color:#fff}
+.mbtn.danger{background:#ec4b4b1a;color:var(--err)}
+.mbtn:disabled{opacity:.4;cursor:not-allowed}
+#status{flex:none;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim)}
+.chip{display:inline-flex;align-items:center;gap:5px;background:var(--panel2);
+  border-radius:var(--r-pill);padding:5px 10px;white-space:nowrap;max-width:190px;overflow:hidden;
+  text-overflow:ellipsis}
+.chip b{color:var(--fg);font-weight:600}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--dim2);flex:none}
+/* WiFi 信号: 弧形图标, 按强度点亮内层到外层。
+   不用四根竖条 —— 竖条是手机蜂窝信号的画法, 一眼看过去像 4G。 */
+.wsig{display:inline-flex;align-items:center}
+.wsig svg{width:17px;height:17px;display:block;fill:none;stroke:var(--dim2);
+  stroke-width:2.1;stroke-linecap:round}
+.wsig .a0{fill:var(--dim2);stroke:none}
+.wsig[data-lv="1"] .a1,
+.wsig[data-lv="2"] .a1,.wsig[data-lv="2"] .a2,
+.wsig[data-lv="3"] .a1,.wsig[data-lv="3"] .a2,.wsig[data-lv="3"] .a3{stroke:var(--ok)}
+.wsig[data-lv="1"] .a0,.wsig[data-lv="2"] .a0,.wsig[data-lv="3"] .a0{fill:var(--ok)}
+.wsig[data-lv="0"]{opacity:.5}
+.wsig[data-lv="0"] .sl{stroke:var(--err);opacity:.9}   /* 没连上时画一道斜杠 */
+.wsig .sl{display:none}
+.wsig[data-lv="0"] .sl{display:block}
+.apdot{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;
+  border-radius:8px;background:var(--panel2);color:var(--dim2)}
+.apdot.on{background:var(--ok-soft);color:var(--ok)}
+.dot.on{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft),0 0 8px var(--ok);
+  animation:breathe 2.4s ease-in-out infinite}
+@keyframes breathe{0%,100%{opacity:1}50%{opacity:.55}}
+.dot.off{background:var(--dim2)}
+#btnSet{flex:none;width:34px;height:34px;border-radius:50%;background:var(--panel2);
+  display:flex;align-items:center;justify-content:center}
+#btnSet:hover{background:var(--line)}
+
+/* ---------------- 首页(驾驶舱仪表盘) ----------------
+   左 = 遥测: 一行时钟 + 2×3 指标磁贴(带迷你趋势条) + 一排状态胶囊
+   右 = 四个入口, 横向长条卡, 每条第二行是该入口的实时状态副标题
+   磁贴的取值/趋势见 JS 的 renderHome/pushHist。 */
+/* 左栏拿 46%: 磁贴要塞下"图标+标题+大数+副标题+趋势条", 37% 时明显偏挤,
+   而右边四张长条卡本来就宽松, 匀过去正好。 */
+#home{position:fixed;inset:0;z-index:30;display:none;overscroll-behavior:none;
+  grid-template-columns:minmax(400px,46%) 1fr;gap:16px;padding:16px;
+  padding-top:calc(16px + env(safe-area-inset-top));
+  background:
+    radial-gradient(1100px 620px at 12% -10%, color-mix(in srgb,var(--accent) 11%,transparent), transparent 62%),
+    radial-gradient(900px 560px at 105% 108%, color-mix(in srgb,#8b5cf6 10%,transparent), transparent 60%),
+    var(--bg)}
+#home.show{display:grid}
+/* min-height:0 是给下面 #hTiles 的 flex:1 留出压缩空间的 —— 没有它, flex 子项
+   按内容高度撑着不肯缩, 短屏(如 960x600 的平板)上左栏就会超出一屏、变成可拖动。 */
+#hLeft{background:var(--panel);border-radius:20px;box-shadow:var(--shadow-lg);padding:16px;
+  overflow-y:auto;display:flex;flex-direction:column;border:1px solid var(--line);
+  touch-action:pan-y;overscroll-behavior:none;min-height:0}
+#hHead{display:flex;align-items:center;gap:12px;padding-bottom:13px;
+  border-bottom:1px solid var(--line)}
+#hHead .logo{width:46px;height:46px;border-radius:14px;flex:none;display:flex;
+  align-items:center;justify-content:center;color:#fff;position:relative;
+  background:linear-gradient(140deg,#2f7ef7,#22d3ee);box-shadow:0 6px 18px #2f7ef751}
+#hHead .logo::after{content:'';position:absolute;inset:-5px;border-radius:19px;
+  background:inherit;filter:blur(14px);opacity:.4;z-index:-1}
+#hHead .logo .ic{width:25px;height:25px}
+#hLeft h2{margin:0;font-size:19px;letter-spacing:-.3px;font-weight:650}
+#hLeft .sub{color:var(--dim);font-size:12.5px;display:flex;align-items:center;gap:6px;
+  margin-top:3px}
+/* 时钟: 左列 时间+日期, 右列 运行时间**单独一列**(和时间叠在一列里读起来费劲) */
+#hClock{margin:13px 0 0;padding:11px 15px 10px;border-radius:14px;position:relative;
+  overflow:hidden;border:1px solid var(--line);flex:none;
+  display:flex;align-items:center;gap:14px;
+  background:linear-gradient(120deg,color-mix(in srgb,var(--accent) 10%,var(--panel2)),
+             color-mix(in srgb,var(--cyan) 7%,var(--panel2)))}
+/* 背景里一层很淡的网格, 机器人仪表的味道 */
+#hClock::before{content:'';position:absolute;inset:0;pointer-events:none;opacity:.5;
+  background-image:linear-gradient(var(--line) 1px,transparent 1px),
+                   linear-gradient(90deg,var(--line) 1px,transparent 1px);
+  background-size:22px 22px;
+  -webkit-mask:linear-gradient(105deg,#000,transparent 72%);
+  mask:linear-gradient(105deg,#000,transparent 72%)}
+#hClock>*{position:relative}
+#hClock .r1{min-width:0}
+#hTime{font-size:27px;font-weight:300;letter-spacing:1.5px;line-height:1;
+  font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--fg);
+  text-shadow:0 0 22px color-mix(in srgb,var(--accent) 30%,transparent)}
+#hDate{margin-top:6px;font-size:13.5px;font-weight:600;color:var(--fg)}
+/* 运行时间自己一列: 靠右, 一条竖线和时间那列分开 */
+#hUp{margin-left:auto;flex:none;padding-left:14px;text-align:right;
+  border-left:1px solid var(--line)}
+#hUp .k{display:block;font-size:11.5px;letter-spacing:.4px;color:var(--dim2)}
+#hUp b{display:block;margin-top:5px;font-size:15.5px;font-weight:600;color:var(--fg);
+  font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+
+/* ---- 2×3 指标磁贴 ----
+   flex:1 + minmax(74px,1fr) + max-height: 高屏上不超过 460px(再高就是空), 短屏上
+   一路压到 74px 也不会把左栏顶出一屏。目标是**任何平板尺寸首页都正好一屏** ——
+   一屏装得下就没得拖, 用户反馈的"还能拖动摇晃"本质是内容超出后在滚容器里滑。 */
+#hTiles{display:grid;grid-template-columns:1fr 1fr;
+  grid-template-rows:repeat(3,minmax(74px,1fr));gap:10px;margin-top:12px;
+  flex:1;min-height:0;max-height:460px}
+.tile{position:relative;overflow:hidden;border:1px solid var(--line);border-radius:13px;
+  background:var(--panel2);padding:10px 12px 12px;min-height:0;
+  display:flex;flex-direction:column}
+/* 左上角一道极细的状态色, 平时是主色, 报警时整块跟着变 —— 余光扫一眼就知道有没有事 */
+.tile::before{content:'';position:absolute;left:0;top:0;bottom:0;width:2.5px;
+  background:var(--accent);opacity:.55}
+.tile.ok::before{background:var(--ok)}
+.tile.warn::before{background:var(--warn);opacity:1}
+.tile.err::before{background:var(--err);opacity:1}
+.tile.warn{border-color:color-mix(in srgb,var(--warn) 45%,var(--line))}
+.tile.err{border-color:color-mix(in srgb,var(--err) 55%,var(--line));
+  background:color-mix(in srgb,var(--err) 7%,var(--panel2))}
+.tile .th{display:flex;align-items:center;gap:6px;font-size:12.5px;font-weight:650;
+  letter-spacing:.4px;color:var(--dim2)}
+.tile .th .ic{width:14px;height:14px;stroke-width:2.2;flex:none}
+.tile .th .tn{flex:none}
+/* 上下各一个 auto 把富余高度**均分**成两段 —— 磁贴被拉高时数值不会孤零零吊在
+   顶上, 矮的时候 auto 归零, 自动退回紧凑排布。
+   z-index:1: 趋势条是定位元素、在 DOM 里又排在后面, 不抬一手线会从数字上横穿过去。 */
+.tile .tv{margin:auto 0;padding-top:5px;font-size:27px;font-weight:600;line-height:1.1;
+  font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-1px;
+  color:var(--fg);white-space:nowrap;position:relative;z-index:1}
+.tile .tv i{font-style:normal;font-size:13px;font-weight:500;color:var(--dim);
+  margin-left:3px;letter-spacing:0}
+.tile.warn .tv{color:var(--warn)} .tile.err .tv{color:var(--err)}
+/* 副标题挪到右上角(跟标题同一行, 靠右): 原来压在磁贴底部, 和趋势曲线抢同一块地方,
+   字骑在线上两边都看不清。挪上来之后底部整幅留给曲线。 */
+.tile .ts{margin-left:auto;min-width:0;padding-left:8px;text-align:right;
+  font-size:11.5px;font-weight:500;letter-spacing:0;color:var(--dim);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* 迷你趋势条: 贴着磁贴底部整幅铺开, 在文字下面走。
+   高度按磁贴百分比给 —— 磁贴被拉高时曲线跟着长, 空出来的地方是数据而不是留白。 */
+.spk{position:absolute;left:0;right:0;bottom:0;width:100%;pointer-events:none;
+  height:38%;min-height:26px;max-height:62px}
+/* preserveAspectRatio=none 会把线宽也横向拉扁, non-scaling-stroke 才能保持粗细 */
+.spk .ln{fill:none;stroke:var(--accent);stroke-width:1.6;stroke-linejoin:round;
+  stroke-linecap:round;vector-effect:non-scaling-stroke}
+.spk .ar{stroke:none;fill:var(--accent);opacity:.13}
+.tile.ok .spk .ln{stroke:var(--ok)}    .tile.ok .spk .ar{fill:var(--ok)}
+.tile.warn .spk .ln{stroke:var(--warn)}.tile.warn .spk .ar{fill:var(--warn)}
+.tile.err .spk .ln{stroke:var(--err)}  .tile.err .spk .ar{fill:var(--err)}
+/* 网络磁贴不是一个数, 用两行 "灯+名字" 代替大数字(整组和别的磁贴数值一样上下居中) */
+.tile.net .nw{margin:auto 0;padding-top:5px;min-width:0}
+.tile.net .nr{display:flex;align-items:center;gap:7px;font-size:13px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tile.net .nr+.nr{margin-top:7px}
+.tile.net .nr b{font-weight:600;overflow:hidden;text-overflow:ellipsis}
+.tile.net .nr .k{color:var(--dim2);flex:none;width:30px}
+
+/* ---- 状态胶囊 ---- */
+#hChips{display:flex;flex-wrap:wrap;gap:7px;padding-top:12px;flex:none}
+.chip{display:flex;align-items:center;gap:6px;font-size:12.5px;padding:5px 11px;
+  border-radius:var(--r-pill);background:var(--panel2);color:var(--dim);
+  border:1px solid var(--line);white-space:nowrap}
+.chip b{color:var(--fg);font-weight:600}
+
+/* ---- 右侧四个入口: 横向长条 ---- */
+#hRight{display:grid;grid-template-columns:1fr;grid-template-rows:repeat(4,1fr);gap:14px}
+.hbtn{background:var(--panel);border-radius:20px;box-shadow:var(--shadow);display:flex;
+  flex-direction:row;align-items:center;gap:16px;padding:18px 20px;
+  transition:transform .18s cubic-bezier(.2,.8,.3,1),box-shadow .18s;
+  position:relative;overflow:hidden;text-align:left;border:1px solid var(--line)}
+.hbtn .glow{position:absolute;inset:0;opacity:0;transition:opacity .18s;
+  background:linear-gradient(100deg,var(--accent-soft),transparent 55%);pointer-events:none}
+.hbtn:hover .glow{opacity:1}
+.hbtn::after{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;opacity:0;
+  transition:opacity .18s;background:linear-gradient(180deg,var(--accent),var(--cyan))}
+.hbtn:hover{transform:translateX(3px);box-shadow:var(--shadow-lg);border-color:transparent}
+.hbtn:hover::after{opacity:1}
+.hbtn:active{transform:translateX(1px) scale(.995)}
+.hbtn>*{position:relative;z-index:1}
+.hbtn::before{content:'';position:absolute;right:-34px;top:-34px;width:120px;height:120px;
+  border:1px solid var(--line);border-radius:50%;opacity:.6;pointer-events:none}
+.hbtn .hi{width:60px;height:60px;border-radius:18px;flex:none;display:flex;
+  align-items:center;justify-content:center;color:#fff;position:relative}
+.hbtn .hi::after{content:'';position:absolute;inset:-6px;border-radius:24px;
+  background:inherit;filter:blur(16px);opacity:.30;z-index:-1}
+.hbtn .hi .ic{width:31px;height:31px;stroke-width:1.8}
+.hbtn .hx{flex:1;min-width:0}
+.hbtn b{display:block;font-size:20px;letter-spacing:-.3px;font-weight:650}
+.hbtn small{display:block;margin-top:3px;color:var(--dim);font-size:12.5px;font-weight:400;
+  line-height:1.45;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 右侧读数: 长条卡横向很宽, 只放标题+副标题右半边会空掉一大片 */
+.hbtn .hm{flex:none;text-align:right;padding-left:8px}
+.hbtn .hm em{display:block;font-style:normal;font-size:18px;font-weight:650;
+  font-family:var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.5px;
+  color:var(--fg);white-space:nowrap}
+.hbtn .hm span{display:block;margin-top:2px;font-size:10.5px;color:var(--dim2);
+  letter-spacing:.4px;white-space:nowrap}
+.hbtn .chev{width:18px;height:18px;flex:none;color:var(--dim2);stroke-width:2.4}
+.hbtn .tag{flex:none;font-size:11px;padding:4px 10px;border-radius:var(--r-pill);
+  background:var(--ok-soft);color:var(--ok);font-weight:600;
+  display:flex;align-items:center;gap:5px}
+.hbtn .tag::before{content:'';width:6px;height:6px;border-radius:50%;background:var(--ok);
+  animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.8)}}
+@media (max-width:760px){
+  /* 窄屏改成上下: 遥测在上(高度自适应), 入口在下。长条卡这时反而比方块好按。 */
+  #home{grid-template-columns:1fr;grid-template-rows:auto auto;overflow:auto;gap:12px;
+    padding:12px;padding-top:calc(12px + env(safe-area-inset-top))}
+  #hLeft{overflow:visible;flex:none}
+  /* 手机上磁贴压矮(高度不再跟着屏幕走, 整页是滚动的), 下面的四个入口才能露出来 */
+  #hTiles{grid-template-rows:repeat(3,minmax(76px,100px));gap:8px;flex:none;max-height:none}
+  .tile{padding:8px 10px 10px}
+  .tile .tv{font-size:23px}
+  .tile .th{font-size:12px}
+  /* 窄屏磁贴一行塞"标题+右上角副标题"很紧, 副标题再收一号, 放不下的截断(有 title) */
+  .tile .ts{font-size:11px;padding-left:6px}
+  #hTime{font-size:27px}
+  .spk{max-height:34px}
+  #hRight{grid-template-rows:repeat(4,auto);gap:10px}
+  .hbtn{padding:14px 16px;gap:13px;border-radius:17px}
+  .hbtn .hi{width:46px;height:46px;border-radius:14px}
+  .hbtn .hi .ic{width:24px;height:24px}
+  .hbtn b{font-size:16px}
+  .hbtn small{font-size:11.5px}
+  /* 手机上一条卡里塞不下"图标+标题+副标题+读数+箭头", 读数让位(副标题里已经有了) */
+  .hbtn .hm{display:none}
+}
+/* ---------------- 全屏子页(地图库/设置) ---------------- */
+.page{position:fixed;inset:54px 0 0 0;z-index:25;background:var(--bg);display:none;
+  overflow-y:auto;overflow-x:hidden;padding:20px 16px 28px;
+  touch-action:pan-y;overscroll-behavior:none;-webkit-overflow-scrolling:touch}
+.page.show{display:block}
+.page .card{max-width:620px;margin:0 auto 14px;background:var(--panel);border-radius:16px;
+  box-shadow:var(--shadow);overflow:hidden;border:1px solid var(--line)}
+.page .card h4{margin:0;padding:12px 16px;font-size:13px;color:var(--dim);
+  border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px}
+.page .card .in{padding:12px 16px}
+#back{flex:none;display:flex;align-items:center;gap:6px;padding:7px 12px;border-radius:var(--r-pill);
+  background:var(--panel2);font-size:13px;font-weight:560}
+#back:hover{background:var(--line)}
+#title{flex:none;font-size:15px;font-weight:600;margin-right:4px}
+
+/* ---------------- 主画布 ---------------- */
+#stage{position:fixed;inset:54px 0 0 0;overflow:hidden;touch-action:none}
+#stage::after{content:'';position:absolute;inset:0;pointer-events:none;z-index:5;
+  background:radial-gradient(120% 90% at 50% 50%,transparent 55%,#0b1a3314 100%)}
+#cv2d,#cv3d{position:absolute;inset:0;width:100%;height:100%;display:block;touch-action:none}
+#cv3d{display:none}
+
+/* ---------------- 浮层通用 ---------------- */
+.float{position:absolute;z-index:20;background:color-mix(in srgb,var(--panel) 80%,transparent);
+  backdrop-filter:blur(14px) saturate(1.2);-webkit-backdrop-filter:blur(14px) saturate(1.2);
+  border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow-lg)}
+/* 【浮层布局】左上相机 → 其下面板 → 左下日志; 右侧一列操作按钮; 右下摇杆;
+   底部居中图例+比例尺。 */
+#pip{left:14px;top:14px;width:320px;overflow:hidden;padding:0}
+#pip .pip-body{position:relative;width:100%;aspect-ratio:4/3;background:#0007}
+#pipImg{width:100%;height:100%;object-fit:cover;display:block}
+#pipMini{position:absolute;inset:0;width:100%;height:100%;display:none}
+#pipHint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  font-size:12px;color:#fff9;text-align:center;padding:0 12px}
+#pipTop{display:flex;align-items:center;justify-content:space-between;
+  padding:7px 10px 7px 13px;font-size:11.5px;color:var(--dim);font-weight:600;
+  position:relative;border-bottom:1px solid var(--line)}
+#pipTop::before{content:'';position:absolute;left:0;top:7px;bottom:7px;width:3px;
+  border-radius:0 3px 3px 0;background:var(--cyan);opacity:.7}
+#pipTop>span:first-child{display:flex;align-items:center;gap:6px}
+#pipTop .sp{cursor:pointer;opacity:.6;padding:0 4px}
+#pipTop .sp:hover{opacity:1}
+#pip.fold .pip-body,#pip.fold #pipBar{display:none}
+#pipBar{display:flex;align-items:center;justify-content:space-between;padding:5px 8px;
+  font-size:11px;color:var(--dim)}
+/* 操作按钮: 右侧一列(上半操作, 分隔线以下视图控制), 底止于摇杆上方 */
+#tools{right:14px;top:14px;bottom:206px;display:flex;flex-direction:column;gap:6px;
+  padding:7px;width:54px;overflow-y:auto;scrollbar-width:none;align-items:center;
+  touch-action:pan-y}
+#tools::-webkit-scrollbar{display:none}
+#tools .sep{width:26px;height:1px;background:var(--line);flex:none;margin:2px 0}
+
+/* ---------------- 地图编辑页 ----------------
+   整屏画布 + 右侧工具列 + 底部材质/笔刷条。touch-action:none 是必须的:
+   不写的话 pad 上一拖就变成页面滚动, 画不出线。 */
+#pgEdit{position:fixed;inset:54px 0 0 0;overflow:hidden;display:none;
+  background:var(--bg);z-index:26;touch-action:none}
+#pgEdit.show{display:block}
+#edCv{position:absolute;inset:0;width:100%;height:100%;display:block;
+  touch-action:none;cursor:crosshair}
+#edTools{right:14px;top:14px;display:flex;flex-direction:column;gap:6px;
+  padding:7px;width:54px;align-items:center;max-height:calc(100% - 120px);
+  overflow-y:auto;scrollbar-width:none}
+#edTools::-webkit-scrollbar{display:none}
+#edTools .sep{width:26px;height:1px;background:var(--line);flex:none;margin:2px 0}
+/* width:max-content 不能省 —— 绝对定位 + left:50% 的元素按"收缩到适应"算宽度,
+   可用宽度只剩容器的一半(1280 屏上只有 640), 内容会被莫名其妙地折行。 */
+#edBar{left:50%;transform:translateX(-50%);bottom:14px;display:flex;align-items:center;
+  gap:12px;padding:9px 14px;width:max-content;max-width:calc(100vw - 92px);
+  flex-wrap:wrap;justify-content:center}
+#edBar .grp{display:flex;align-items:center;gap:7px}
+#edBar .lb{font-size:11.5px;color:var(--dim);font-weight:600;white-space:nowrap}
+#edBar .div{width:1px;align-self:stretch;background:var(--line);margin:0 2px}
+/* 材质色块: 直接显示写进 PGM 的那三种像素值, 所见即所存 */
+.mat{width:34px;height:34px;border-radius:10px;border:2px solid var(--line);
+  position:relative;flex:none;transition:transform .12s,border-color .15s}
+.mat.on{border-color:var(--accent);transform:scale(1.06)}
+.mat.on::after{content:'';position:absolute;inset:-6px;border-radius:13px;
+  border:1.5px solid var(--accent);opacity:.45}
+.mat[data-m="2"]{background:#000}
+.mat[data-m="1"]{background:#fff}
+.mat[data-m="0"]{background:#808080}
+#edSize{width:104px;accent-color:var(--accent)}
+#edZoom{font-family:var(--mono);font-size:11.5px;color:var(--dim);min-width:52px;
+  text-align:right}
+.ebtn{display:flex;align-items:center;gap:5px;padding:8px 12px;border-radius:11px;
+  background:var(--panel2);font-size:12.5px;font-weight:600;white-space:nowrap}
+.ebtn:hover{background:var(--line)}
+.ebtn .ic{width:15px;height:15px}
+.ebtn.pri{background:var(--accent);color:#fff}
+.ebtn.pri:hover{filter:brightness(1.08)}
+#edPos{font-family:var(--mono);font-size:11.5px;color:var(--dim2);min-width:96px}
+#edName{position:absolute;left:14px;top:14px;z-index:20;display:flex;align-items:center;
+  gap:8px;padding:8px 13px;font-size:12.5px;font-weight:600}
+#edName .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);flex:none}
+#edName.dirty .dot{background:var(--warn)}
+#edName small{color:var(--dim);font-weight:500}
+#edHint{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:40;
+  background:var(--panel);border:1px solid var(--line);border-radius:18px;
+  box-shadow:var(--shadow-lg);padding:18px 22px;font-size:13px;display:none;
+  max-width:min(90vw,340px)}
+#edHint.show{display:block}
+#edHint b{display:block;font-size:14px;margin-bottom:10px}
+#edHint div{display:flex;gap:10px;padding:4px 0;color:var(--dim);align-items:baseline}
+#edHint i{font-style:normal;color:var(--fg);font-weight:600;min-width:74px;flex:none}
+#edHint .tail{display:block;color:var(--dim2);font-size:11.5px;margin-top:10px;
+  line-height:1.5}
+#edHint button{margin-top:12px;width:100%;padding:9px;border-radius:11px;
+  background:var(--accent);color:#fff;font-weight:600;font-size:13px}
+.tool{width:40px;height:40px;border-radius:12px;background:var(--panel2);display:flex;
+  align-items:center;justify-content:center;position:relative;flex:none;
+  transition:transform .12s,background .15s,color .15s}
+.tool:hover{background:var(--line)}
+.tool:active{transform:scale(.92)}
+.tool.on{background:var(--accent);color:#fff;
+  box-shadow:0 2px 10px #2f7ef766,inset 0 0 0 1px #ffffff33}
+.tool.danger{color:var(--err)}
+.tool.danger:hover{background:#ec4b4b1a}
+.tool:disabled{opacity:.32;cursor:not-allowed}
+.tool .ic{width:19px;height:19px}
+/* 长按提示 */
+#tip{position:fixed;z-index:70;background:#000c;color:#fff;font-size:12px;padding:6px 10px;
+  border-radius:8px;pointer-events:none;opacity:0;transition:opacity .12s;white-space:nowrap}
+#tip.show{opacity:1}
+
+#needle{display:flex;transition:transform .2s}
+/* 图例+比例尺: 底部居中一条 */
+/* 图例: 顶部, 起点对齐实时画面右缘, 单行不换行(放不下就横向滚) */
+#legend{position:absolute;left:346px;right:80px;top:14px;z-index:21;
+  display:flex;align-items:center;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;
+  gap:14px;padding:9px 16px;border-radius:var(--r-pill);
+  font-size:11px;color:var(--dim);
+  background:color-mix(in srgb,var(--panel) 86%,transparent);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  border:1px solid var(--line);box-shadow:var(--shadow)}
+#legend{touch-action:pan-x}
+#legend::-webkit-scrollbar{display:none}
+#legend span{display:inline-flex;align-items:center;gap:5px;white-space:nowrap;flex:none}
+#legend i{width:10px;height:10px;border-radius:3px;flex:none}
+#legend .tg{cursor:pointer;user-select:none;transition:.14s}
+#legend .tg:hover{color:var(--fg)}
+#legend .tg.off{opacity:.32;text-decoration:line-through}
+/* 3D 手势速查卡: 建图页左下角, 避开右侧工具列和右下摇杆 */
+#gesHint{position:absolute;left:14px;bottom:14px;z-index:6;display:none;
+  background:color-mix(in srgb,var(--panel) 94%,transparent);
+  border:1px solid var(--line);border-radius:12px;padding:11px 13px 10px;
+  font-size:12.5px;color:var(--dim);max-width:min(74vw,270px);
+  box-shadow:0 6px 22px rgba(0,0,0,.28);backdrop-filter:blur(6px)}
+#gesHint.show{display:block}
+#gesHint b{display:block;color:var(--fg);font-size:13px;margin-bottom:6px}
+#gesHint div{display:flex;align-items:center;gap:8px;line-height:1.9}
+#gesHint i{font-style:normal;flex:none;min-width:66px;color:var(--fg);font-weight:600}
+/* tail 不能继承上面那条 display:flex —— 它是一句会换行的整话, 用 flex 会把
+   中间那个图标挤成独立一行 */
+#gesHint .tail{display:block;margin-top:7px;padding-top:7px;line-height:1.7;
+  border-top:1px solid var(--line);font-size:12px}
+/* 全局 .ic 是 display:block, 在这句行内文字里必须改回 inline, 否则图标自己
+   独占一行, 一句话被拆成三行 */
+#gesHint .tail .ic{display:inline-block;width:15px;height:15px;
+  vertical-align:-3.5px;margin:0 2px;color:var(--acc)}
+#gesHint button{margin-top:9px;width:100%;padding:6px 0;border-radius:8px;cursor:pointer;
+  border:1px solid var(--line);background:transparent;color:var(--fg);font-size:12.5px}
+#gesHint button:active{background:var(--line)}
+/* 比例: 网格本身就是尺子, 图例里说明一格多大即可 */
+#scale{display:inline-flex;align-items:center;gap:6px;color:var(--fg);font-weight:600;
+  padding-left:12px;border-left:1px solid var(--line);cursor:pointer}
+#scale .sq{width:11px;height:11px;border:1.5px solid var(--dim);border-radius:2px;flex:none}
+/* 摇杆: 右下 */
+#joy{right:14px;bottom:14px;width:180px;height:180px;border-radius:50%;padding:0;
+  display:flex;align-items:center;justify-content:center;touch-action:none;
+  background:
+    radial-gradient(circle at 50% 50%, color-mix(in srgb,var(--panel) 88%,transparent) 62%,
+                    color-mix(in srgb,var(--panel) 62%,transparent) 100%)}
+#joy{border:1px solid var(--line)}
+#joy::after{content:'';position:absolute;width:74%;height:74%;border-radius:50%;
+  border:1px dashed var(--line);pointer-events:none}
+#joy::before{content:'';position:absolute;inset:8px;border-radius:50%;pointer-events:none;
+  background:conic-gradient(from 0deg,var(--line) 0 1deg,transparent 1deg 44deg,
+    var(--line) 44deg 45deg,transparent 45deg 89deg,var(--line) 89deg 90deg,
+    transparent 90deg 134deg,var(--line) 134deg 135deg,transparent 135deg 179deg,
+    var(--line) 179deg 180deg,transparent 180deg 224deg,var(--line) 224deg 225deg,
+    transparent 225deg 269deg,var(--line) 269deg 270deg,transparent 270deg 314deg,
+    var(--line) 314deg 315deg,transparent 315deg 359deg);
+  -webkit-mask:radial-gradient(circle,transparent 0 46%,#000 46% 50%,transparent 50%);
+  mask:radial-gradient(circle,transparent 0 46%,#000 46% 50%,transparent 50%);opacity:.8}
+#joyKnob{width:74px;height:74px;border-radius:50%;
+  background:radial-gradient(circle at 38% 34%,#6aa6ff,var(--accent));
+  box-shadow:0 4px 16px #2f7ef766,inset 0 -2px 6px #0002;
+  transition:background .15s,transform .05s;z-index:1}
+#joy.act #joyKnob{background:radial-gradient(circle at 38% 34%,#4ed9a4,var(--ok));
+  box-shadow:0 4px 18px #17b97866,inset 0 -2px 6px #0002}
+/* 日志: 摇杆正上方 */
+/* 日志: 左下角。半透明+等宽, 只做"能扫一眼"的密度 */
+/* 与上方实时画面同宽同列(320), 背景比其它浮层更透一档 —— 日志是背景信息,
+   不该跟地图抢注意力 */
+/* 日志: 底部横向平铺, 右边让开摇杆(180+间距)。默认 5 行, 可展开到 12 行 */
+/* 日志: 下方中部 —— 左让开导航面板(14+320+12), 右让开摇杆(180+14+12)。
+   默认合并(.min), 需要时点标题栏展开。 */
+#logBox{left:346px;right:206px;bottom:14px;display:flex;flex-direction:column;
+  padding:0;overflow:hidden;background:color-mix(in srgb,var(--panel) 58%,transparent)}
+#logBody{height:calc(5 * 1.55 * 11.5px + 14px)}
+#logBox.big #logBody{height:calc(12 * 1.55 * 11.5px + 14px)}
+#logHead{display:flex;align-items:center;gap:7px;padding:7px 10px 7px 13px;font-size:11.5px;
+  color:var(--dim);border-bottom:1px solid var(--line);flex:none;position:relative}
+#logHead::before{content:'';position:absolute;left:0;top:7px;bottom:7px;width:3px;
+  border-radius:0 3px 3px 0;background:var(--cyan);opacity:.7}
+#logHead b{color:var(--fg);font-weight:600;font-size:12px}
+#logHead .sp{cursor:pointer;opacity:.6;padding:0 4px}
+#logHead .sp:hover{opacity:1}
+#logBody{overflow:auto;padding:6px 10px 8px;transition:height .18s;touch-action:pan-y;
+  font:11.5px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dim);
+  white-space:pre-wrap;word-break:break-all}
+#logBody::-webkit-scrollbar{width:5px}
+#logBody::-webkit-scrollbar-thumb{background:var(--line);border-radius:3px}
+#logBody div{padding:1px 0;border-left:2px solid transparent;padding-left:7px;margin-left:-7px;opacity:.9}
+#logBody .e{color:var(--err);border-left-color:var(--err);background:#ec4b4b0f}
+#logBody .w{color:var(--warn);border-left-color:var(--warn)}
+#logBox.min #logBody{height:0;padding:0}
+#logBox.min #logBody{display:none}
+
+/* 导航面板(单点/多点): 按钮列右侧 */
+/* 面板紧贴相机下方, 与相机同宽同列 */
+/* 底部止于日志上方(日志高180 + 间距) —— 用 top+bottom 约束, 内容多了自己滚,
+   不会再压到日志上 */
+#navPanel{left:14px;top:0;bottom:14px;width:320px;padding:0;display:none;
+  overflow:auto;scrollbar-width:none;touch-action:pan-y}
+#navPanel::-webkit-scrollbar{display:none}
+#navPanel .ph{display:flex;align-items:center;gap:8px;padding:11px 13px 11px 16px;
+  font-size:13px;font-weight:600;border-bottom:1px solid var(--line);position:relative;
+  background:linear-gradient(90deg,var(--accent-soft),transparent 60%)}
+#navPanel .ph::before{content:'';position:absolute;left:0;top:9px;bottom:9px;width:3px;
+  border-radius:0 3px 3px 0;background:var(--accent)}
+#navPanel .ph .x{margin-left:auto;color:var(--dim);cursor:pointer;opacity:.7}
+#navPanel .ph .x:hover{opacity:1}
+#navPanel .pb{padding:10px 11px}
+/* 状态大字: 一眼能看到在干什么 */
+.nst{display:flex;align-items:baseline;gap:8px;margin-bottom:10px}
+.nst b{font-size:17px;font-weight:650;letter-spacing:-.3px}
+.nst .pill{font-size:11px;padding:2px 8px;border-radius:var(--r-pill);
+  background:var(--panel2);color:var(--dim)}
+.nst.run b{color:var(--accent)} .nst.ok b{color:var(--ok)} .nst.bad b{color:var(--err)}
+/* 两列指标 */
+.mets{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:9px}
+.met{background:var(--panel2);border-radius:9px;padding:6px 8px}
+.met small{display:block;color:var(--dim);font-size:11px;margin-bottom:2px}
+.met b{font-size:14px;font-weight:650;font-family:var(--mono);letter-spacing:-.4px}
+.met b.sm{font-size:12px}   /* 坐标那种两段式的数字, 14px 会挤到换行 */
+.hintline{font-size:11.5px;color:var(--dim);line-height:1.5;margin:0 0 10px}
+.wp-list{max-height:150px;overflow:auto;margin:0 0 9px;
+  border:1px solid var(--line);border-radius:10px}
+.wp-list:empty{display:none}
+.wp{display:flex;align-items:center;gap:9px;padding:6px 9px;font-size:12px;
+  border-bottom:1px solid var(--line)}
+.wp:last-child{border-bottom:none}
+.wp:hover{background:var(--panel2)}
+.wp .n{width:21px;height:21px;border-radius:50%;background:var(--accent);color:#fff;
+  display:flex;align-items:center;justify-content:center;font-size:11px;flex:none;font-weight:600}
+.wp .co{font-variant-numeric:tabular-nums;color:var(--dim)}
+.wp .d{margin-left:auto;color:var(--dim2);cursor:pointer;padding:2px}
+.wp .d:hover{color:var(--err)}
+.wp.cur{background:var(--accent-soft)}
+.wp.cur .co{color:var(--fg)}
+.row{display:flex;gap:7px;margin-top:7px}
+.row button{flex:1;padding:9px;border-radius:10px;background:var(--panel2);font-size:12.5px;
+  font-weight:600;transition:.15s}
+.row button:hover{background:var(--line)}
+.row button.primary{background:var(--accent);color:#fff}
+.row button.primary:hover{filter:brightness(1.08)}
+.row button.danger{background:#ec4b4b1a;color:var(--err)}
+.row button:disabled{opacity:.35;cursor:not-allowed}
+
+/* ---------------- 弹窗 ---------------- */
+#mask{position:fixed;inset:0;background:#0006;backdrop-filter:blur(3px);z-index:80;
+  display:none;align-items:center;justify-content:center;padding:16px}
+#mask.show{display:flex}
+.dlg{background:var(--panel);border-radius:18px;box-shadow:var(--shadow-lg);width:100%;
+  max-width:420px;max-height:86vh;display:flex;flex-direction:column;overflow:hidden}
+.dlg h3{margin:0;padding:14px 16px;font-size:15px;border-bottom:1px solid var(--line);
+  display:flex;align-items:center;gap:8px}
+.dlg h3 .x{margin-left:auto;cursor:pointer;color:var(--dim)}
+.dlg .body{padding:14px 16px;overflow:auto;touch-action:pan-y}
+.dlg .foot{padding:10px 16px;border-top:1px solid var(--line);display:flex;gap:8px}
+.dlg .foot button{flex:1;padding:9px;border-radius:10px;background:var(--panel2);font-weight:600}
+.dlg .foot button.primary{background:var(--accent);color:#fff}
+.fld{margin-bottom:14px}
+.fld label{display:flex;justify-content:space-between;font-size:12px;color:var(--dim);margin-bottom:5px}
+.fld label b{color:var(--fg)}
+.fld input[type=range]{width:100%;accent-color:var(--accent)}
+.fld input[type=text]{width:100%;padding:8px 10px;border-radius:9px;border:1px solid var(--line);
+  background:var(--panel2);color:var(--fg);font:inherit}
+.sw{display:flex;align-items:center;justify-content:space-between;padding:9px 0}
+.sw .t{font-size:13px}
+.sw .t small{display:block;color:var(--dim);font-size:11px}
+.tgl{width:44px;height:26px;border-radius:999px;background:var(--line);position:relative;flex:none;
+  transition:.18s;cursor:pointer}
+.tgl::after{content:'';position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;
+  background:#fff;transition:.18s;box-shadow:0 1px 3px #0003}
+.tgl.on{background:var(--ok)}
+.tgl.on::after{transform:translateX(18px)}
+.maprow{display:flex;align-items:center;gap:10px;padding:11px 10px;border-radius:12px;
+  cursor:pointer;transition:.14s}
+.maprow:hover{background:var(--panel2)}
+.maprow:active{transform:scale(.995)}
+.maprow.sel{background:var(--accent-soft)}
+.maprow .mi{flex:1;min-width:0}
+.maprow .mi b{display:block;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.maprow .mi small{color:var(--dim);font-size:11px}
+.maprow .act{color:var(--dim);padding:4px}
+.maprow.fresh{animation:fresh 2.4s ease-out}
+@keyframes fresh{0%,60%{background:var(--ok-soft)}100%{background:transparent}}
+#toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%) translateY(8px);z-index:90;
+  background:#000d;backdrop-filter:blur(8px);color:#fff;padding:11px 18px;
+  border-radius:var(--r-pill);font-size:13px;font-weight:500;box-shadow:var(--shadow-lg);
+  opacity:0;transition:opacity .2s,transform .2s;pointer-events:none;max-width:80vw;text-align:center}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+#toast.err{background:#dc2626e6}
+@media (max-width:640px){
+  #pip{width:190px} #navPanel{width:190px}
+  #logBox{left:212px;right:162px} #joy{width:140px;height:140px}
+  #navPanel{bottom:14px} #legend{left:auto;right:70px;width:auto;max-width:60%}
+  #tools{bottom:168px;width:48px} .tool{width:36px;height:36px}
+  #legend{max-width:calc(100% - 250px);font-size:10px}
+  #status .chip.hide-s{display:none}
+}
+</style>
+</head>
+<body>
+<svg style="display:none">
+<symbol id="i-nav" viewBox="0 0 24 24"><path d="M3 11l19-9-9 19-2-8-8-2z"/></symbol>
+<symbol id="i-map" viewBox="0 0 24 24"><path d="M9 3L3 6v15l6-3 6 3 6-3V3l-6 3-6-3z"/><path d="M9 3v15M15 6v15"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><path d="M6 4l14 8-14 8z"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/></symbol>
+<symbol id="i-tune" viewBox="0 0 24 24"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></symbol>
+<symbol id="i-lib" viewBox="0 0 24 24"><path d="M4 19.5V5a2 2 0 012-2h13v18H6a2 2 0 01-2-2.5z"/><path d="M8 7h8M8 11h6"/></symbol>
+<symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.6 1.6 0 00-1.8-.3 1.6 1.6 0 00-1 1.5V21a2 2 0 11-4 0v-.1A1.6 1.6 0 008 19.4a1.6 1.6 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.6 1.6 0 00.3-1.8 1.6 1.6 0 00-1.5-1H2a2 2 0 110-4h.1A1.6 1.6 0 004.6 8a1.6 1.6 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.6 1.6 0 001.8.3H9a1.6 1.6 0 001-1.5V2a2 2 0 114 0v.1a1.6 1.6 0 001 1.5 1.6 1.6 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.6 1.6 0 00-.3 1.8V9a1.6 1.6 0 001.5 1H22a2 2 0 110 4h-.1a1.6 1.6 0 00-1.5 1z"/></symbol>
+<symbol id="i-pin" viewBox="0 0 24 24"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 1118 0z"/><circle cx="12" cy="10" r="3"/></symbol>
+<symbol id="i-route" viewBox="0 0 24 24"><circle cx="6" cy="19" r="3"/><circle cx="18" cy="5" r="3"/><path d="M9 19h6a3 3 0 003-3V8"/></symbol>
+<symbol id="i-swap" viewBox="0 0 24 24"><path d="M16 3h5v5"/><path d="M4 20L21 3"/><path d="M21 16v5h-5"/><path d="M15 15l6 6"/><path d="M4 4l5 5"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M1 12h4M19 12h4"/></symbol>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="M3 10l9-7 9 7v10a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4v16h16v-7"/><path d="M18.5 2.5a2.1 2.1 0 013 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 11-3-6.7L21 8"/><path d="M21 3v5h-5"/></symbol>
+<symbol id="i-cam" viewBox="0 0 24 24"><path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/><circle cx="12" cy="13" r="4"/></symbol>
+<symbol id="i-cube" viewBox="0 0 24 24"><path d="M21 16V8l-9-5-9 5v8l9 5 9-5z"/><path d="M3.3 7.3L12 12l8.7-4.7M12 22V12"/></symbol>
+<symbol id="i-wifi" viewBox="0 0 24 24"><path d="M5 12.5a11 11 0 0114 0M8.5 16a6 6 0 017 0"/><circle cx="12" cy="19.5" r="1"/></symbol>
+<symbol id="i-ap" viewBox="0 0 24 24"><path d="M12 20v-8"/><circle cx="12" cy="9" r="2"/><path d="M7.8 13.2a6 6 0 010-8.4M16.2 4.8a6 6 0 010 8.4"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+<symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+<symbol id="i-rotl" viewBox="0 0 24 24"><path d="M3 12a9 9 0 109-9 9 9 0 00-6.4 2.6L3 8"/><path d="M3 3v5h5"/></symbol>
+<symbol id="i-rotr" viewBox="0 0 24 24"><path d="M21 12a9 9 0 11-9-9 9 9 0 016.4 2.6L21 8"/><path d="M21 3v5h-5"/></symbol>
+<symbol id="i-compass" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M15.5 8.5l-2 5-5 2 2-5z"/></symbol>
+<symbol id="i-fit" viewBox="0 0 24 24"><path d="M3 8V5a2 2 0 012-2h3M16 3h3a2 2 0 012 2v3M21 16v3a2 2 0 01-2 2h-3M8 21H5a2 2 0 01-2-2v-3"/></symbol>
+<symbol id="i-follow" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2.4"/><path d="M12 1.8v3.2M12 19v3.2M1.8 12h3.2M19 12h3.2"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/></symbol>
+<symbol id="i-robot" viewBox="0 0 24 24"><rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 8V4M9 4h6"/><circle cx="9" cy="13" r="1.2"/><circle cx="15" cy="13" r="1.2"/><path d="M9.5 17h5M1.5 12v4M22.5 12v4"/></symbol>
+<symbol id="i-level" viewBox="0 0 24 24"><path d="M2 17l20-10"/><path d="M3 12h18"/><circle cx="12" cy="12" r="2"/></symbol>
+<symbol id="i-ceil" viewBox="0 0 24 24"><path d="M3 4h18"/><path d="M3 20h18"/><path d="M12 8v8M9 11l3-3 3 3"/></symbol>
+<symbol id="i-scene" viewBox="0 0 24 24"><path d="M2 19h20"/><path d="M5 19V9l4-3 4 3v10"/><path d="M14 19v-6l4-2 3 1.5V19"/><circle cx="18.5" cy="4.5" r="1.6"/></symbol>
+<symbol id="i-hand" viewBox="0 0 24 24"><path d="M12 3v9"/><path d="M5 12l7 8 7-8"/><path d="M8 9l4-4 4 4"/></symbol>
+<symbol id="i-orbit" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><ellipse cx="12" cy="12" rx="10" ry="4.4" transform="rotate(-25 12 12)"/></symbol>
+<symbol id="i-charge" viewBox="0 0 24 24"><path d="M13 2L4.5 13H11l-1 9 8.5-11H12z"/></symbol>
+<symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></symbol>
+<symbol id="i-chip" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M4 10h3M4 14h3M17 10h3M17 14h3M10 4v3M14 4v3M10 17v3M14 17v3"/></symbol>
+<symbol id="i-hdd" viewBox="0 0 24 24"><path d="M3 14h18M5.5 14L7 5h10l1.5 9v4a1 1 0 01-1 1h-11a1 1 0 01-1-1z"/><circle cx="16" cy="17" r=".8"/></symbol>
+<symbol id="i-temp" viewBox="0 0 24 24"><path d="M13 14.8V4.5a2 2 0 10-4 0v10.3a4 4 0 104 0z"/></symbol>
+<symbol id="i-mem" viewBox="0 0 24 24"><rect x="2.5" y="8" width="19" height="8" rx="1.5"/><path d="M6.5 16v2.5M12 16v2.5M17.5 16v2.5"/></symbol>
+<symbol id="i-stopnav" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9 9h6v6H9z"/></symbol>
+<symbol id="i-brush" viewBox="0 0 24 24"><path d="M9.5 14.5L4 20c1.8 1.2 4.2.8 5.5-.8.9-1.1.8-2.6 0-3.7z"/><path d="M11 13l8.2-8.2a1.7 1.7 0 012.4 2.4L13.4 15.4"/></symbol>
+<symbol id="i-line" viewBox="0 0 24 24"><path d="M5 19L19 5"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="5" r="2"/></symbol>
+<symbol id="i-rect" viewBox="0 0 24 24"><rect x="4" y="6" width="16" height="12" rx="1.5"/><path d="M8 10h8M8 14h8"/></symbol>
+<symbol id="i-fill" viewBox="0 0 24 24"><path d="M4.5 12.5l7-7 7 7-7 7z"/><path d="M20.5 15.5c0 1.1-.7 2-1.6 2s-1.6-.9-1.6-2 1.6-3 1.6-3 1.6 1.9 1.6 3z"/></symbol>
+<symbol id="i-undo" viewBox="0 0 24 24"><path d="M4 8h10a5.5 5.5 0 010 11H8"/><path d="M8 4L4 8l4 4"/></symbol>
+<symbol id="i-redo" viewBox="0 0 24 24"><path d="M20 8H10a5.5 5.5 0 000 11h6"/><path d="M16 4l4 4-4 4"/></symbol>
+<symbol id="i-saveas" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><path d="M8 3v5h7"/><path d="M12 12v6M9 15h6"/></symbol>
+</svg>
+
+<div id="top">
+  <button id="back"><svg class="ic"><use href="#i-x"/></svg>返回</button>
+  <span id="title"></span>
+  <div id="menu"></div>
+  <div id="status"></div>
+</div>
+
+<!-- 首页(仪表盘): 左=遥测(时钟一行 + 2×3磁贴 + 状态胶囊), 右=四个入口长条 -->
+<div id="home">
+  <div id="hLeft">
+    <div id="hHead">
+      <span class="logo"><svg class="ic"><use href="#i-robot"/></svg></span>
+      <div><h2>机器人控制台</h2>
+        <div class="sub"><span class="dot" id="hDot"></span><span id="hSub">正在连接…</span></div></div>
+    </div>
+    <div id="hClock">
+      <div class="r1"><div id="hTime">--:--:--</div><div id="hDate">——</div></div>
+      <div id="hUp"><span class="k">已运行</span><b id="hUpV">--</b></div>
+    </div>
+    <div id="hTiles"></div>
+    <div id="hChips"></div>
+  </div>
+  <div id="hRight">
+    <button class="hbtn" data-go="nav"><span class="glow"></span>
+      <span class="hi" style="background:linear-gradient(135deg,#2f7ef7,#5aa0ff)">
+        <svg class="ic"><use href="#i-nav"/></svg></span>
+      <span class="hx"><b>导航</b><small id="sbNav">加载地图, 单点/多点自动导航</small></span>
+      <span class="tag" id="tagNav" style="display:none">运行中</span>
+      <span class="hm"><em id="hmNav">--</em><span>状态</span></span>
+      <svg class="ic chev"><use href="#i-chev"/></svg></button>
+    <button class="hbtn" data-go="map"><span class="glow"></span>
+      <span class="hi" style="background:linear-gradient(135deg,#17b978,#4ed9a4)">
+        <svg class="ic"><use href="#i-cube"/></svg></span>
+      <span class="hx"><b>建图</b><small id="sbMap">MID360s 三维建图, 生成导航地图</small></span>
+      <span class="tag" id="tagMap" style="display:none">运行中</span>
+      <span class="hm"><em id="hmMap">0</em><span>点云分段</span></span>
+      <svg class="ic chev"><use href="#i-chev"/></svg></button>
+    <button class="hbtn" data-go="maps"><span class="glow"></span>
+      <span class="hi" style="background:linear-gradient(135deg,#8b5cf6,#b18cff)">
+        <svg class="ic"><use href="#i-lib"/></svg></span>
+      <span class="hx"><b>地图</b><small id="sbMaps">地图库: 查看 / 选择 / 删除</small></span>
+      <span class="hm"><em id="hmMaps">0</em><span>张已存</span></span>
+      <svg class="ic chev"><use href="#i-chev"/></svg></button>
+    <button class="hbtn" data-go="settings"><span class="glow"></span>
+      <span class="hi" style="background:linear-gradient(135deg,#f5a524,#ffc35c)">
+        <svg class="ic"><use href="#i-gear"/></svg></span>
+      <span class="hx"><b>设置</b><small id="sbSet">语音 / 热点 / 遥控速度</small></span>
+      <span class="hm"><em id="hmSet">--</em><span>遥控上限</span></span>
+      <svg class="ic chev"><use href="#i-chev"/></svg></button>
+  </div>
+</div>
+
+<div class="page" id="pgMaps"></div>
+<div class="page" id="pgSet"></div>
+
+<!-- 地图编辑: 整屏画布, 不用 .page 的卡片版式(那是 620px 居中列, 画不开图) -->
+<div id="pgEdit">
+  <canvas id="edCv"></canvas>
+  <div class="float" id="edName"><span class="dot"></span><span id="edNameT"></span>
+    <small id="edNameS"></small></div>
+  <div class="float" id="edTools"></div>
+  <div class="float" id="edBar">
+    <div class="grp"><span class="lb">画</span>
+      <span class="mat" data-m="2" title="障碍(黑)"></span>
+      <span class="mat" data-m="1" title="可通行(白)"></span>
+      <span class="mat" data-m="0" title="未知(灰)"></span></div>
+    <div class="div"></div>
+    <div class="grp"><span class="lb">笔刷</span>
+      <input type="range" id="edSize" min="1" max="41" step="2" value="5">
+      <span class="lb" id="edSizeV" style="min-width:56px"></span></div>
+    <div class="div"></div>
+    <div class="grp"><span id="edZoom"></span><span id="edPos"></span></div>
+    <div class="div"></div>
+    <!-- 保存类动作不放进右侧图标列: 那列已经很长, 而且"覆盖原图"这种事
+         只给个图标太容易点错, 写清楚字更稳妥 -->
+    <div class="grp"><button class="ebtn pri" id="edDoSave">
+        <svg class="ic"><use href="#i-save"/></svg>保存</button>
+      <button class="ebtn" id="edDoSaveAs">
+        <svg class="ic"><use href="#i-saveas"/></svg>另存为</button>
+      <button class="ebtn" id="edDoReload">
+        <svg class="ic"><use href="#i-refresh"/></svg>放弃</button></div>
+  </div>
+  <div id="edHint">
+    <b>地图编辑手势</b>
+    <div><i>单指拖</i>画(按当前工具和材质)</div>
+    <div><i>双指拖</i>平移画面</div>
+    <div><i>双指捏合</i>缩放</div>
+    <div><i>双击</i>适应窗口</div>
+    <span class="tail">放大到能看清格子再画 —— 一格就是一个 0.05m 的栅格。
+      右侧 ✋ 可把单指改成平移(单手拿平板时用)。触控笔画的时候会自动忽略手掌。</span>
+    <button id="edHintOk">知道了</button>
+  </div>
+</div>
+
+<div id="stage">
+  <canvas id="cv2d"></canvas>
+  <canvas id="cv3d"></canvas>
+
+  <div class="float" id="pip">
+    <div id="pipTop"><span><svg class="ic" style="width:13px;height:13px"><use href="#i-cam"/></svg>
+      实时画面</span><span class="sp" id="pipFold" title="收起(同时停止推流)">—</span></div>
+    <div class="pip-body">
+      <img id="pipImg" alt="">
+      <canvas id="pipMini"></canvas>
+      <div id="pipHint">实时画面<br><small>导航启动后可见</small></div>
+    </div>
+    <div id="pipBar"><span id="pipLabel">实时画面</span><span id="pipFps"></span></div>
+  </div>
+
+  <div class="float" id="tools"></div>
+  <div class="float" id="navPanel"></div>
+
+  <!-- 3D 手势速查: 进建图页时自动露一下, 之后点掉就不再弹(记在 localStorage)。
+       点云视图没有任何可见的操作提示, 不说一声没人知道双指能平移。 -->
+  <div id="gesHint">
+    <b>3D 视图手势</b>
+    <div><i>单指拖</i>旋转视角</div>
+    <div><i>双指拖</i>平移(上下左右挪画面)</div>
+    <div><i>双指捏合</i>缩放</div>
+    <div><i>双击</i>复位视角</div>
+    <div class="tail">单手操作可点右侧 <svg class="ic"><use href="#i-orbit"/></svg>
+      把单指改成平移</div>
+    <button id="gesOk">知道了</button>
+  </div>
+
+  <div id="legend"></div>
+
+  <div class="float min" id="logBox">
+    <div id="logHead"><svg class="ic" style="width:14px;height:14px"><use href="#i-lib"/></svg>
+      <b>运行日志</b><span id="logCnt"></span>
+      <span class="sp" id="logBig" title="展开/还原" style="margin-left:auto">⌃</span>
+      <span class="sp" id="logMin" title="展开/收起">+</span></div>
+    <div id="logBody"></div>
+  </div>
+  <div class="float" id="joy"><div id="joyKnob"></div></div>
+</div>
+
+<div id="mask"><div class="dlg" id="dlg"></div></div>
+<div id="toast"></div>
+<!-- 长按提示气泡: 必须放在 #stage **外面**。放里面的话, 地图编辑页(#stage 是
+     display:none)上的长按提示永远弹不出来 —— 父节点不显示, 子节点再 fixed 也没用。 -->
+<div id="tip"></div>
+
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+const DPR=Math.min(2,window.devicePixelRatio||1);
+
+/* ============ 全局状态 ============
+   S = 后端 push 的 state; UI = 纯前端的界面状态(不进后端) */
+const S={mode:'idle',sensor:'mid360',running:false,external:false,stopping:false,
+         active_map:'',voltage:null,pcd_count:0,wifi:null,detected:null};
+const UI={route:'home',   // home | nav | map | maps | settings
+          mode:'nav',     // 画布用: 'nav'(2D地图) | 'map'(3D点云), 由 route 派生
+          pipMain:false,        // false=地图为主画面, true=相机为主画面
+          panel:'',             // '' | 'goal' | 'wps'
+          layers:Object.assign({costmap:true,plan:true,local:true,scan:true},
+                    JSON.parse(localStorage.getItem('v2layers')||'{}')),
+          sound:localStorage.getItem('v2sound')!=='0',
+          vx:+(localStorage.getItem('v2vx')||0.35),      // 遥控线速度上限 m/s
+          wz:+(localStorage.getItem('v2wz')||1.0),       // 遥控角速度上限 rad/s
+          selMap:localStorage.getItem('v2selMap')||''};
+let navT0=null;
+/* 导航的终态(含被拒绝)。后端发的是 nav2 原词, 在 onJson 里已翻译成这套。 */
+const NAV_END=['succeeded','failed','canceled','rejected','idle'];
+let maps=[], nav={state:'idle'}, robot={ok:false,x:0,y:0,yaw:0,frame:''};
+let ws=null, connected=false;
+/* 刚连上的那一瞬间后端会补发: 当前 state、当前 nav_info、最近100条日志。
+   那些是**历史**, 不是刚发生的事 —— 不设这个门, 每次刷新页面/掉线重连都会把
+   上一次导航的"已到达目标"、日志里的"重定位成功"重新念一遍。见 speak()。 */
+let wsOpenAt=0;
+
+/* ============ WebSocket ============ */
+function send(o){ if(ws&&ws.readyState===1) ws.send(JSON.stringify(o)); }
+function connect(){
+  ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host);
+  ws.binaryType='arraybuffer';
+  ws.onopen=()=>{connected=true;wsOpenAt=Date.now();toast('已连接小车');
+                 send({t:'list_maps',sensor:'mid360'});
+                 send({t:'cam',on:!$('pip').classList.contains('fold')});
+                 // 断线重连后后端的 scene_want 已经清了(没客户端就退回1Hz),
+                 // 实景开着的话要重新告诉它, 否则点云会莫名其妙变回一秒一跳
+                 if(C3.scene)send({t:'scene',on:true});
+                 renderAll();};
+  ws.onclose=()=>{connected=false;renderAll();setTimeout(connect,1500);};
+  ws.onmessage=e=>{ if(typeof e.data==='string') onJson(JSON.parse(e.data)); else onBin(e.data); };
+}
+function onJson(m){
+  if(m.t==='state'){
+    const wasRunning=S.running, oldMode=S.mode;
+    Object.assign(S,m);
+    // 后端实测的地面平面(见 app.py GroundFitter)。法向/高度一变, 已上传的点云
+    // 筛选结果就作废了 —— 高度带是按这个平面算的
+    if(m.ground){
+      const g=C3.gnd;
+      if(!g||g.fit!==m.ground.fit||Math.abs(g.z-m.ground.z)>0.005||
+         Math.abs(g.nx-m.ground.nx)>0.002||Math.abs(g.ny-m.ground.ny)>0.002){
+        C3.gnd=m.ground;cloudDirty=liveDirty=true;draw3d();
+      }else C3.gnd=m.ground;
+    }
+    pushHist();                  // 首页磁贴的趋势条只在这里采样(约2秒一个点)
+    // 任务状态跃迁时播报(语音条目见 SPEAK 表)
+    if(S.running&&!wasRunning) speak('start_'+S.mode);
+    if(!S.running&&wasRunning) speak('stop_'+oldMode);
+    renderAll();
+  }
+  else if(m.t==='map_saved'){
+    // 编的正好是导航此刻在用的那张图 -> 问一句要不要立刻热加载。
+    // 不问就默默生效太吓人; 不给这个入口又得重启整套导航才看得到效果。
+    if(m.active&&confirm(`"${m.name}" 正被导航使用, 现在就热加载生效吗?\n`
+        +'(只换 map_server 的图, 不重启导航)')) send({t:'reload_map',name:m.name});
+  }
+  else if(m.t==='log') pushLog(m.line);
+  else if(m.t==='toast') toast(m.msg,!m.ok&&m.ok!==undefined);
+  else if(m.t==='maps'){
+    maps=m.maps||[];
+    /* 【删掉的图还挂在首页"当前地图"上】selMap 存在 localStorage 里, 图删了它
+       不会自己消失, 首页和地图库就一直显示一个已经不存在的名字, 启动导航还会
+       拿它当参数(后端找不到文件 -> 加载失败)。每次拿到新列表都核对一遍。 */
+    if(UI.selMap&&!maps.some(x=>x.name===UI.selMap)){
+      const gone=UI.selMap;
+      UI.selMap=''; localStorage.removeItem('v2selMap');
+      toast(`地图 "${gone}" 已不存在, 已取消选中`,true);
+    }
+    renderMapDlg(); renderStatus(); renderHome(); }
+  else if(m.t==='map_preview'){ toast('已加载地图 '+m.name); fitMap(); draw(); }
+  else if(m.t==='nav_params'){ applyNavParams(m); }
+  else if(m.t==='pose'){
+    const first=!robot.ok;
+    robot={ok:true,x:m.x,y:m.y,z:m.z||0,yaw:m.yaw,frame:m.frame};
+    // 导航起来后的第一个位姿 = 默认起点(用户没手动设过的话)
+    if(first&&!homePose&&S.mode==='navigation')setHome({x:m.x,y:m.y,yaw:m.yaw});
+    if(follow){view.cx=robot.x;view.cy=robot.y;}
+    // 面板里的"当前位置/当前朝向"必须跟着位姿走。以前只有 navT0 有值时那个
+    // 每秒的定时器才会重画面板, 所以没在导航时这两个数字是死的(用户反馈"不能实时显示")
+    draw(); if(UI.route==='map')draw3d(); renderStatus(); updatePanelLive(); }
+  else if(m.t==='nav'){
+    const was=nav.state, wasWp=nav.wp_index;
+    nav={...nav,...m};
+    /* 【已到达了还显示剩余距离】nav 是 {...nav,...m} 合并上来的, 后端进终态那条
+       消息里通常不带 dist, 于是上一条 running 的 dist 就一直留着不动。
+       终态下"剩余距离"没有意义, 直接清掉。 */
+    if(NAV_END.includes(m.state==='active'?'running':m.state==='aborted'?'failed':m.state))
+      nav.dist=null;
+    /* 后端(app.py set_nav)用的是 nav2 action 的原词: active / aborted, 航点字段叫
+       wp_index(0基); 而界面这边一路写的是 running / failed 和 index(1基) —— 两套词
+       从来没对上, 结果是状态标签、航点高亮、失败播报全都不生效。在入口处翻译一次,
+       下游只认界面这套词。 */
+    if(nav.state==='active')nav.state='running';
+    if(nav.state==='aborted')nav.state='failed';
+    if(nav.wp_index!=null)nav.index=nav.wp_index+1;   // "正在前往第 N 个航点"
+    // 后端不一定每帧都带 elapsed, 自己记开始时刻兜底(之前"已用时"一直是 --)
+    if(nav.state==='running'&&!navT0)navT0=Date.now();
+    if(NAV_END.includes(nav.state))navT0=null;
+    /* 【设了目标点反而看不到图标 / 面板上目标坐标空着】以前这里是
+         if(NAV_END.includes(nav.state)&&goal) goal=null;
+       每收到一条 nav 就判一次, 而后端在**新目标还没被 action server 接受之前**
+       会先补发一条带着上一次终态(succeeded/canceled)的 nav —— 于是刚放下的
+       目标点当场被抹掉, 表现就是"点完地图什么都没出现"。
+       现在改成: 目标点一直留着, 只标记它已经完成; 真正清掉只在
+       取消(cancelGoal)和下一次设定目标时发生。到达后仍能看见自己去了哪。
+       【2026-08-08 再改】"一直留着"又太久了: 到点很久以后那个标记还杵在图上,
+       开多点巡航时和航点混在一起看不清(用户反馈)。改成打完 done 标记后
+       起一个 10 秒的定时器自动收起 —— 既看得到"到了", 也不会一直挂着。 */
+    if(NAV_END.includes(nav.state)&&goal&&goal.done!==nav.state)goalMarkDone(nav.state);
+    if(nav.state==='running'&&goal){goal.done=null;goalHoldCancel();}
+    onNavUpdate(was,wasWp); draw(); renderPanel(); }
+  else if(m.t==='scanpose'){ scanPose=m; }
+  else if(m.t==='clear'){ clearLayers(m.what); }
+}
+/* 二进制帧: 首字节是类型, 见 app.py 顶部的 B_* 常量 */
+let mapImg=null,mapMeta=null,cmImg=null,cmMeta=null;
+let scanPts=null,planPts=null,localPts=null;
+/* 这一帧激光对应时刻的车体位姿(后端按 scan 的时间戳查 TF 发来的)。
+   用它而不是最新的 robot ——两者频率不同, 车转起来会差一帧的角度,
+   表现就是激光整体持续偏转。 */
+let scanPose=null;
+const cloud={pos:new Float32Array(3*300000),n:0};   // 3D点云(建图模式, 一路累积)
+/* 【实景滚动窗口】累积点云回答的是"这块地方扫到没有", 看的是覆盖率;
+   实景要回答的是"我周围现在长什么样", 两者需求相反 —— 累积图里人走一趟会拖出
+   一条长带, 家具搬走了也还留在那儿。所以实景另存最近 SCENE_KEEP 帧, 到点就丢,
+   画在累积点云上面(累积的压暗当背景)。后端在实景模式下把点云提到 5Hz/2500点,
+   所以这个窗口约等于最近 2~3 秒。 */
+const SCENE_KEEP=12;
+const live={frames:[],n:0};
+let liveDirty=false;
+let traj=[];
+function onBin(buf){
+  const t=new Uint8Array(buf,0,1)[0];
+  if(t===1||t===6){                                  // 地图 / 代价地图: meta+png
+    const len=new DataView(buf,1,4).getUint32(0,true);
+    const meta=JSON.parse(new TextDecoder().decode(new Uint8Array(buf,5,len)));
+    const url=URL.createObjectURL(new Blob([new Uint8Array(buf,5+len)],{type:'image/png'}));
+    const img=new Image();
+    img.onload=()=>{URL.revokeObjectURL(url);
+      if(t===1){mapImg=img;mapMeta=meta;if(!robot.ok)fitMap();}else{cmImg=img;cmMeta=meta;}
+      draw();};
+    img.src=url;
+  }
+  else if(t===7){                                    // 编辑用的精确三色图
+    const len=new DataView(buf,1,4).getUint32(0,true);
+    const meta=JSON.parse(new TextDecoder().decode(new Uint8Array(buf,5,len)));
+    const url=URL.createObjectURL(new Blob([new Uint8Array(buf,5+len)],{type:'image/png'}));
+    const img=new Image();
+    img.onload=()=>{URL.revokeObjectURL(url);edOpen(meta,img);};
+    img.src=url;
+  }
+  else if(t===2){scanPts=new Float32Array(buf.slice(1));draw();}
+  else if(t===4){planPts=new Float32Array(buf.slice(1));draw();}
+  else if(t===8){localPts=new Float32Array(buf.slice(1));draw();}
+  else if(t===5){const a=new Float32Array(buf.slice(1));
+    for(let i=0;i<a.length;i+=2)traj.push(a[i],a[i+1]);
+    if(traj.length>40000)traj.splice(0,traj.length-40000);draw();}
+  else if(t===3){                                    // 点云 xyz 三元组 -> 3D
+    const a=new Float32Array(buf.slice(1));
+    for(let i=0;i+2<a.length;i+=3){
+      if(cloud.n*3+3>cloud.pos.length){              // 环形覆盖最旧的 1/4
+        cloud.n=Math.floor(cloud.pos.length/3*0.75);
+        cloud.pos.copyWithin(0,cloud.pos.length-cloud.n*3);
+      }
+      cloud.pos[cloud.n*3]=a[i];cloud.pos[cloud.n*3+1]=a[i+1];cloud.pos[cloud.n*3+2]=a[i+2];
+      cloud.n++;
+    }
+    // 同一帧也进实景滚动窗口(不额外占带宽, 就是同一份数据换个留存策略)
+    live.frames.push(a);
+    while(live.frames.length>SCENE_KEEP)live.frames.shift();
+    live.n=live.frames.reduce((s,f)=>s+(f.length/3|0),0);
+    liveDirty=true;
+    cloudDirty=true;draw3d();
+  }
+  else if(t===9){showCam(buf);}
+}
+function clearLayers(what){
+  planPts=localPts=null;traj=[];cmImg=null;
+  if(what==='mapping'){mapImg=null;mapMeta=null;cloud.n=0;cloudDirty=true;
+    live.frames=[];live.n=0;liveDirty=true;}
+  draw();draw3d();
+}
+
+/* ============ 路由 ============
+   五个页面: 首页 / 导航 / 建图 / 地图库 / 设置。
+   导航和建图共用 #stage(画布+浮层), 靠 UI.mode 决定画 2D 还是 3D。 */
+const TITLES={nav:'导航',map:'建图',maps:'地图库',settings:'设置',edit:'地图编辑'};
+function go(r){
+  // 任务在跑时不许离开对应的页面 —— 离开了操作入口就没了, 容易忘记停止
+  if(busy()&&UI.route!=='home'&&r==='home'&&
+     ((S.mode==='navigation'&&UI.route==='nav')||(S.mode==='mapping'&&UI.route==='map'))){
+    if(!confirm('任务仍在运行, 确定回首页? (任务不会停止, 可从首页再进来)'))return;
+  }
+  // 编辑没保存就走人 = 白画。撤销栈只在浏览器里, 离开这页就没了
+  if(UI.route==='edit'&&r!=='edit'&&ED.dirty&&
+     !confirm('地图改了还没保存, 确定离开? 修改会全部丢失。'))return;
+  if(UI.route==='edit'&&r!=='edit')ED.open=false;
+  UI.route=r;
+  if(r==='nav'||r==='map')UI.mode=r;
+  UI.panel='';
+  $('home').classList.toggle('show',r==='home');
+  $('top').style.display=r==='home'?'none':'flex';
+  $('stage').style.display=(r==='nav'||r==='map')?'block':'none';
+  $('pgMaps').classList.toggle('show',r==='maps');
+  $('pgSet').classList.toggle('show',r==='settings');
+  $('pgEdit').classList.toggle('show',r==='edit');
+  $('title').textContent=TITLES[r]||'';
+  if(r!=='edit')$('edHint').classList.remove('show');
+  if(r==='maps'){send({t:'list_maps',sensor:'mid360'});renderMapsPage();}
+  if(r==='settings')renderSetPage();
+  // 离开建图页就退掉实景的高帧率推送 —— 页面看不见了还占着无线带宽没意义。
+  // 回来时不自动恢复: 实景是要主动开的东西, 悄悄替用户开着才更让人意外。
+  if(r!=='map'&&C3.scene){C3.scene=false;live.frames=[];live.n=0;send({t:'scene',on:false});}
+  if(r==='map')showGesHint(); else $('gesHint').classList.remove('show');
+  renderAll();
+  if(r==='nav'||r==='map')resize();
+  if(r==='edit')edResize();
+}
+document.querySelectorAll('[data-go]').forEach(b=>b.onclick=()=>go(b.dataset.go));
+// 编辑页是从地图库进来的, 返回就回地图库(回首页要再点两下才能接着改下一张)
+$('back').onclick=()=>go(UI.route==='edit'?'maps':'home');
+/* 手势速查卡: 只在没被"知道了"关掉过时露出来。手势变了(加了新的)就把
+   localStorage 的键改个版本号, 让老用户再看一次。 */
+function showGesHint(){
+  if(localStorage.getItem('v3ges2')==='1')return;
+  $('gesHint').classList.add('show');
+}
+$('gesOk').onclick=()=>{localStorage.setItem('v3ges2','1');
+  $('gesHint').classList.remove('show');};
+
+/* ============ 首页 ============ */
+function fmtUp(sec){
+  if(sec==null)return '--';
+  const d=Math.floor(sec/86400),h=Math.floor(sec%86400/3600),m=Math.floor(sec%3600/60);
+  return d?`${d}天${h}小时`:(h?`${h}小时${m}分`:`${m}分钟`);
+}
+/* 时钟走本地秒表, 但基准用小车回传的系统时间(S.now) —— 平板和小车的时钟未必一致,
+   这里显示的应该是小车的时间。 */
+let clockBase=null;
+setInterval(()=>{
+  const t=$('hTime');if(!t||UI.route!=='home')return;
+  if(S.now!=null&&clockBase==null)clockBase={srv:S.now,loc:Date.now()/1000};
+  const now=clockBase?new Date((clockBase.srv+(Date.now()/1000-clockBase.loc))*1000):new Date();
+  const p=n=>String(n).padStart(2,'0');
+  t.textContent=`${p(now.getHours())}:${p(now.getMinutes())}:${p(now.getSeconds())}`;
+  const wk='日一二三四五六'[now.getDay()];
+  $('hDate').textContent=`${now.getMonth()+1}月${now.getDate()}日 周${wk}`;
+  $('hUpV').textContent=fmtUp(S.uptime);
+},1000);
+
+/* ---- 指标趋势 ----
+   采样挂在**收到 state 时**(约2秒一条), 不放在 renderHome 里: renderHome 在别的
+   页面会整个跳过(采不到样), 而 renderAll 又会被别的事件带着跑, 频率对不上。 */
+const HN=40;                    // 40 个样本 ≈ 最近 80 秒
+const hist={bat:[],cpu:[],mem:[],disk:[],temp:[]};
+function pushHist(){
+  const put=(k,v)=>{if(v==null||isNaN(v))return;
+    const a=hist[k];a.push(+v);if(a.length>HN)a.shift();};
+  put('bat',S.voltage);
+  put('cpu',S.cpu_pct);
+  put('mem',S.mem_total?S.mem_avail/S.mem_total*100:null);
+  put('disk',S.disk_total?S.disk_free/S.disk_total*100:null);
+  put('temp',S.cpu_temp);
+}
+/* 迷你趋势条。量程写死(lo,hi)而不是按历史 min/max 自适应 —— 自适应的话
+   "一直 90%" 和 "一直 10%" 画出来一模一样, 看不出高低, 只剩噪声形状。 */
+function spark(a,lo,hi){
+  if(!a||a.length<2)return '';
+  const W=100,H=20,n=a.length;
+  const y=v=>(H-Math.max(0,Math.min(1,(v-lo)/(hi-lo)))*H).toFixed(2);
+  const x=i=>(i/(n-1)*W).toFixed(2);
+  const pts=a.map((v,i)=>x(i)+','+y(v)).join(' ');
+  return `<svg class="spk" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">`
+    +`<polygon class="ar" points="0,${H} ${pts} ${W},${H}"/>`
+    +`<polyline class="ln" points="${pts}"/></svg>`;
+}
+/* 一块磁贴。cls 为 ''/ok/warn/err, 同时决定数值颜色、左侧色条和趋势线颜色。
+   副标题(sub)跟标题同一行靠右, 底部整幅留给趋势曲线。 */
+function tile(ic,label,val,unit,sub,cls,sp){
+  return `<div class="tile ${cls||''}">
+    <div class="th"><svg class="ic"><use href="#${ic}"/></svg><span class="tn">${label}</span>
+      <span class="ts" title="${sub}">${sub}</span></div>
+    <div class="tv">${val}${unit?`<i>${unit}</i>`:''}</div>${sp||''}</div>`;
+}
+function renderHome(){
+  if(UI.route!=='home')return;
+  if(S.now!=null&&clockBase==null)clockBase={srv:S.now,loc:Date.now()/1000};
+  const navOn=S.running&&S.mode==='navigation', mapOn=S.running&&S.mode==='mapping';
+  $('hDot').className='dot '+(connected?'on':'off');
+  $('hSub').textContent=connected
+    ? (S.running?`${TITLES[S.mode==='navigation'?'nav':'map']||S.mode} 运行中`:'已连接 · 空闲')
+    : '连接断开, 正在重连…';
+  $('tagNav').style.display=navOn?'flex':'none';
+  $('tagMap').style.display=mapOn?'flex':'none';
+
+  /* ---- 2×3 磁贴 ----
+     副标题现在待在右上角那条窄缝里(960 宽的平板上只有 ~100px), 所以措辞要短 ——
+     超了会被 ellipsis 截掉, 而平板上没有 hover 看不到 title。 */
+  const t=[];
+  // 电量: 12V/24V 包的阈值不一样, 按读数自己判断(见 BAT)
+  const bat=S.voltage, B=BAT(bat==null?0:bat);
+  /* 电压是底盘串口发上来的, 所以这块磁贴同时就是"底盘在没在线"的指示 ——
+     底下的状态胶囊里不要再放一个"底盘 未启动", 用户反馈重复了。 */
+  t.push(tile('i-charge','电量', bat!=null?bat.toFixed(1):'--', bat!=null?'V':'',
+    bat==null?'底盘未启动':(bat<B.err?'过低, 请立即充电':bat<B.warn?'偏低':'电压正常'),
+    bat==null?'':(bat<B.err?'err':bat<B.warn?'warn':'ok'),
+    spark(hist.bat,B.lo,B.hi)));
+  // CPU
+  const cpu=S.cpu_pct;
+  t.push(tile('i-chip','CPU', cpu!=null?cpu.toFixed(0):'--', cpu!=null?'%':'',
+    '8核 A76+A55',
+    cpu==null?'':(cpu>=90?'err':cpu>=70?'warn':''), spark(hist.cpu,0,100)));
+  // 内存(本机只有4G, 编译/建图时最容易出事, 所以显示的是"可用"而不是"已用")
+  t.push(tile('i-mem','内存', S.mem_avail!=null?S.mem_avail.toFixed(1):'--',
+    'GB 可用', S.mem_total?`共 ${S.mem_total} GB`:'--',
+    S.mem_avail==null?'':(S.mem_avail<0.6?'err':S.mem_avail<1.2?'warn':''),
+    spark(hist.mem,0,100)));
+  // 磁盘: 换算成"还能建多少分钟图"比 GB 直观(建图约 100MB/分钟, 留 2G 安全余量)
+  const mins=S.disk_free!=null?Math.max(0,Math.round((S.disk_free-2)/0.1)):null;
+  t.push(tile('i-hdd','磁盘', S.disk_free!=null?S.disk_free.toFixed(1):'--',
+    'GB 可用', mins!=null?`可建图 ${mins} 分钟`:'--',
+    S.disk_free==null?'':(S.disk_free<2?'err':S.disk_free<5?'warn':''),
+    spark(hist.disk,0,100)));
+  // 温度
+  const tp=S.cpu_temp;
+  t.push(tile('i-temp','温度', tp!=null?tp.toFixed(0):'--', tp!=null?'℃':'',
+    tp!=null&&tp>=85?'已降频':'超过 85℃ 会降频',
+    tp==null?'':(tp>=85?'err':tp>=75?'warn':''), spark(hist.temp,30,95)));
+  // 网络: 两块网卡各一行(板载跑站点/USB跑热点, 见 CLAUDE.md), 没有"一个数"可显示
+  const w=S.wifi||{}, sta=w.sta||{}, ap=w.ap||{};
+  t.push(`<div class="tile net ${sta.up?'':'warn'}">
+    <div class="th"><svg class="ic"><use href="#i-wifi"/></svg><span class="tn">网络</span>
+      <span class="ts">${sta.up?esc(sta.ip||''):'仅热点可达'}</span></div>
+    <div class="nw">
+      <div class="nr"><span class="dot ${sta.up?'on':'off'}"></span>
+        <span class="k">WiFi</span><b>${sta.up?esc(sta.name||'已连接'):'未连接'}</b></div>
+      <div class="nr"><span class="dot ${ap.up?'on':'off'}"></span>
+        <span class="k">热点</span><b>${ap.up?esc(ap.ssid||'已开启')+' · '+(ap.clients||0)+'台':'未开启'}</b></div>
+    </div></div>`);
+  $('hTiles').innerHTML=t.join('');
+
+  /* ---- 状态胶囊: 只放磁贴里没有的东西(底盘状态已经由电量磁贴表达) ---- */
+  const lidar=!!(S.detected&&S.detected.mid360);
+  $('hChips').innerHTML=
+     `<span class="chip"><span class="dot ${lidar?'on':'off'}"></span>雷达 <b>MID360s</b>
+        ${lidar?'在线':'离线'}</span>`
+    +`<span class="chip">点云分段 <b>${S.pcd_count||0}</b> 段`
+    +`${S.pcd_count?' · 存图后可清理':''}</span>`;
+
+  /* ---- 右侧四个入口的副标题 ---- */
+  /* 【"当前地图"到底该显示哪个】导航跑着的时候, 真正加载的是 active_map(启动那一刻
+     定死的), 用户之后再点别的图只是改"下次用哪张" —— 所以运行中必须 active_map 优先,
+     否则会显示一个根本没在用的名字。空闲时才显示选中的那张。 */
+  const curMap=esc(mapNameNow());
+  $('sbNav').textContent=navOn
+    ? `${navText()} · 地图 ${curMap} · 已用 ${elapsedTxt()}`
+    : `当前地图 ${curMap} · 单点/多点自动导航`;
+  $('sbMap').textContent=mapOn
+    ? `建图中 · 已存 ${S.pcd_count||0} 段点云`
+    : (S.mode==='save_map'&&S.running ? '正在转换 2D 地图…'
+       : `MID360s 三维建图${mins!=null?` · 磁盘约够 ${mins} 分钟`:''}`);
+  $('sbMaps').textContent=`地图库 ${maps.length} 张 · `
+    +(UI.selMap?`已选 ${esc(UI.selMap)}`:'未选择');
+  $('sbSet').textContent=`语音 ${UI.sound?'开':'关'} · 热点 ${ap.up?'开':'关'}`
+    +` · 遥控 ${UI.vx.toFixed(2)} m/s`;
+  $('hmNav').textContent=navOn?navText():(S.running?'其它任务':'未启动');
+  $('hmMap').textContent=S.pcd_count||0;
+  $('hmMaps').textContent=maps.length;
+  $('hmSet').textContent=UI.vx.toFixed(2);
+}
+
+/* ============ 顶栏渲染 ============ */
+/* 现在画布上/车上用的是哪张图。导航运行中 = 启动时锁定的 active_map;
+   空闲时 = 用户选中的那张(也就是"下次启动会用的")。两者含义不同, 不能混。 */
+function mapNameNow(){
+  if(S.running&&S.mode==='navigation'&&S.active_map)return S.active_map;
+  return UI.selMap||S.active_map||'未选择';
+}
+const busy=()=>S.running||S.stopping||S.external;
+function renderAll(){renderHome();renderMenu();renderStatus();renderTools();renderLegend();
+  syncVTool();layout();draw();draw3d();}
+function mbtn(label,icon,cls,fn,dis){
+  const b=document.createElement('button');
+  b.className='mbtn'+(cls?' '+cls:'');b.disabled=!!dis;
+  b.innerHTML=`<svg class="ic"><use href="#${icon}"/></svg>${label}`;
+  b.onclick=fn;return b;
+}
+function renderMenu(){
+  const m=$('menu');m.innerHTML='';
+  if(UI.route!=='nav'&&UI.route!=='map')return;
+  const navOn=S.running&&S.mode==='navigation';
+  const mapOn=S.running&&S.mode==='mapping';
+  if(UI.route==='nav'){
+    m.append(
+      mbtn('开始导航','i-play','primary',()=>startTask('navigation'),busy()),
+      mbtn('关闭导航','i-stop','danger',stopTask,!navOn&&!S.external),
+      mbtn('导航参数','i-tune','',dlgNavParams,!navOn),
+      mbtn('换地图','i-map','',dlgPickMap));
+  }else if(UI.route==='map'){
+    m.append(
+      mbtn('开始建图','i-play','primary',()=>startTask('mapping'),busy()),
+      mbtn('关闭建图','i-stop','danger',stopTask,!mapOn&&!S.external),
+      // 保存地图必须**先停建图**: mid360 的 save_map 是独立 launch, 后端不允许
+      // 两个任务并存(会直接返回"已有任务在运行"), 这也是之前点了没反应的原因
+      // 不禁用: 灰按钮不给理由最让人困惑。真不能存时在弹窗里说清楚原因
+      mbtn('保存地图','i-save','',dlgSaveMap));
+  }
+}
+function renderStatus(){
+  const st=$('status');st.innerHTML='';
+  if(UI.route!=='nav'&&UI.route!=='map')return;
+  const add=(html,cls)=>{const s=document.createElement('span');
+    s.className='chip'+(cls?' '+cls:'');s.innerHTML=html;st.append(s);return s;};
+  if(UI.route==='nav'){
+    const c=add(`<svg class="ic"><use href="#i-map"/></svg><b>${esc(mapNameNow())}</b>`);
+    c.title=(S.running&&S.mode==='navigation')
+      ? '导航正在使用的地图(启动时锁定)。换图要停止导航后重新启动'
+      : '选中的地图, 启动导航时会加载它';
+    add(robot.ok?`<svg class="ic"><use href="#i-pin"/></svg>${robot.x.toFixed(2)}, ${robot.y.toFixed(2)}`
+                :`<svg class="ic"><use href="#i-pin"/></svg>--`,'hide-s');
+  }else{
+    add(`<svg class="ic"><use href="#i-cube"/></svg>点云 <b>${(cloud.n/1000).toFixed(0)}k</b>`);
+    add(`分段 <b>${S.pcd_count||0}</b>`,'hide-s');
+    // 地面基准: 告诉用户网格到底是按"实测地面"还是按"标称安装角"摆的。
+    // 显示"标称"时网格可能对不上地面 —— 这是唯一能看出来的地方。
+    // 法向(来自IMU重力)和高度(来自点云直方图)是两个独立的估计, 分开显示。
+    const g=C3.gnd;
+    const ok=g&&g.fit;
+    const gc=add(`<svg class="ic"><use href="#i-level"/></svg>地面 ` +
+      (ok ? `<b>${(g.z*100).toFixed(0)}cm</b> ${(g.pitch*180/Math.PI).toFixed(1)}°`
+          : `<b>标称</b>`),'hide-s');
+    gc.title=ok
+      ? `实测地面\n  倾角 pitch ${(g.pitch*180/Math.PI).toFixed(2)}° / roll `+
+        `${(g.roll*180/Math.PI).toFixed(2)}°  (来源: IMU重力)\n  雷达离地 ${g.z.toFixed(3)}m  `+
+        `(来源: ${g.zsrc==='cloud'?'点云直方图, '+g.inl+' 个地面点':'标称值, 还没找到地面'})`
+      : '还没测出地面(建图没起, 收不到 /livox/imu), 网格暂按 launch 里的标称安装角摆';
+    if(C3.scene)add(`<svg class="ic"><use href="#i-scene"/></svg>实景 <b>${(live.n/1000).toFixed(1)}k</b>`,'hide-s');
+  }
+  const on=!!(S.detected&&S.detected.mid360);
+  add(`<span class="dot ${on?'on':'off'}"></span>MID360s`,'hide-s');
+  // WiFi: 不显示名字, 只用四格信号条(悬停看详情); 热点: 只一个图标, 开绿关灰
+  const w=S.wifi||{}, sta=w.sta||{}, ap=w.ap||{};
+  const lv=sta.up?(sta.signal==null?3:(sta.signal>=70?3:sta.signal>=40?2:1)):0;
+  const c1=add(`<span class="wsig" data-lv="${lv}"><svg viewBox="0 0 24 24">
+      <path class="a3" d="M2.6 9.1a15 15 0 0118.8 0"/>
+      <path class="a2" d="M5.9 12.9a10 10 0 0112.2 0"/>
+      <path class="a1" d="M9.2 16.7a5 5 0 015.6 0"/>
+      <circle class="a0" cx="12" cy="19.8" r="1.15"/>
+      <path class="sl" d="M4 20L20 4"/></svg></span>`);
+  c1.title=sta.up?`${sta.name||'已连接'}  ${sta.ip||''}${sta.signal!=null?'  信号 '+sta.signal+'%':''}`
+                 :'WiFi 未连接';
+  const c2=document.createElement('span');
+  c2.className='apdot'+(ap.up?' on':'');
+  c2.innerHTML='<svg class="ic"><use href="#i-ap"/></svg>';
+  c2.title=ap.up?`热点开启 ${ap.ssid||''} ${ap.ip||''} · ${ap.clients||0}台已连`:'热点关闭';
+  st.append(c2);
+}
+
+/* ============ 图标工具列(长按提示) ============ */
+const TOOLS_NAV=[
+  ['i-target','单点导航',()=>togglePanel('goal')],
+  ['i-route','多点巡航',()=>togglePanel('wps')],
+  ['i-pin','设置初始位姿',()=>setArmed(armed==='init'?'':'init')],
+  ['i-refresh','重新定位',()=>{
+     // /relocalize 是 auto_relocalize 节点提供的服务, 导航没起时它根本不存在,
+     // 后端会回一句"服务不在线"。这里提前拦一下, 省得看起来像"点了没反应"
+     if(!(S.running&&S.mode==='navigation')){toast('重新定位需要先启动导航',true);return;}
+     send({t:'relocalize'});}],
+  ['i-charge','回到起点(长按可重设起点)',()=>goHome()],
+  ['i-stopnav','紧急停止',()=>{send({t:'estop'});speak('estop')}],
+  ['i-swap','切换主画面',()=>{UI.pipMain=!UI.pipMain;layout();draw();}],
+];
+const TOOLS_MAP=[
+  ['i-cube','点云/相机 切换',()=>{UI.pipMain=!UI.pipMain;layout();draw3d();}],
+  /* 实景: 后端把点云从 1Hz/1200点 提到 5Hz/2500点, 前端另画最近十几帧,
+     并强制打开校平+高度带 —— 也就是"地面到地面上方2米的实时场景"。
+     费带宽, 所以是开关而不是常开, 也不做持久化(下次进来默认关)。 */
+  ['i-scene','实景: 实时渲染地面~2m 的真实场景',()=>{
+     C3.scene=!C3.scene;
+     if(C3.scene){C3.level=true;C3.cull=true;
+       localStorage.setItem('v3level','1');localStorage.setItem('v3cull','1');}
+     send({t:'scene',on:C3.scene});
+     if(!C3.scene){live.frames=[];live.n=0;}
+     cloudDirty=liveDirty=true;renderTools();renderStatus();draw3d();},'','scene'],
+  ['i-level','校平(把地面转平, 让网格就是地面)',()=>{
+     C3.level=!C3.level;localStorage.setItem('v3level',C3.level?'1':'0');
+     cloudDirty=liveDirty=true;renderTools();draw3d();},'','level'],
+  ['i-ceil','剔除天花板(只看地面上方 0~2m)',()=>{
+     C3.cull=!C3.cull;localStorage.setItem('v3cull',C3.cull?'1':'0');
+     cloudDirty=liveDirty=true;renderTools();draw3d();},'','cull'],
+  /* 单指手势切换: pad 上单手拿着车/遥控时腾不出两根手指来平移 */
+  ['i-hand','单指手势: 平移 / 旋转(现在是旋转)',()=>{
+     C3.pan=!C3.pan;localStorage.setItem('v3pan',C3.pan?'1':'0');
+     renderTools();},'','pan'],
+  ['i-home','复位视角(画面上双击也可以)',()=>cv3.resetView()],
+];
+/* 视图控制。**缩放和旋转不给按钮** —— 滚轮/双指捏合缩放、双指扭转旋转,
+   手势本来就更顺手, 再摆一排按钮只是占地方。指北针留着当"转歪了一键回正"。 */
+const TOOLS_VIEW=[
+  ['i-compass','正北朝上(双指可扭转地图)',()=>{view.rot=0;syncVTool();draw();},'needle'],
+  ['i-fit','地图居中',()=>fitMap()],
+  ['i-follow','跟随小车',()=>{follow=!follow;syncVTool();
+     if(follow&&robot.ok){view.cx=robot.x;view.cy=robot.y;}draw();},'','follow'],
+];
+function renderTools(){
+  const box=$('tools');box.innerHTML='';
+  const mk=([icon,label,fn,inner,flag])=>{
+    const b=document.createElement('button');
+    b.className='tool'+(label==='紧急停止'?' danger':'');
+    b.innerHTML=inner==='needle'
+      ? `<span id="needle"><svg class="ic"><use href="#${icon}"/></svg></span>`
+      : `<svg class="ic"><use href="#${icon}"/></svg>`;
+    if(flag)b.dataset.flag=flag;
+    b.onclick=fn;bindTip(b,label);
+    if(icon==='i-charge'){   // 长按 = 把当前位置设为起点
+      let t=null;
+      const st=()=>{t=setTimeout(()=>{t=null;
+        if(robot.ok)setHome({x:robot.x,y:robot.y,yaw:robot.yaw});},700);};
+      const cl=()=>{clearTimeout(t);};
+      b.addEventListener('touchstart',st,{passive:true});
+      b.addEventListener('touchend',cl);b.addEventListener('mousedown',st);
+      b.addEventListener('mouseup',cl);b.addEventListener('mouseleave',cl);
+    }
+    box.append(b);
+  };
+  (UI.mode==='nav'?TOOLS_NAV:TOOLS_MAP).forEach(mk);
+  if(UI.mode==='nav'){
+    const sp=document.createElement('div');sp.className='sep';box.append(sp);
+    TOOLS_VIEW.forEach(mk);
+  }
+  syncVTool();
+}
+/* 长按(触屏)或悬停(桌面)显示说明 —— 图标按钮不写字, 全靠这个 */
+function bindTip(el,text){
+  // 文案存 dataset、监听只挂一次: syncVTool 会对同一个按钮反复调本函数来换文案
+  // (单指手势那个按钮), 每次都挂一遍监听的话按一下会弹好几层
+  el.dataset.tip=text;
+  if(el._tipBound)return;
+  el._tipBound=true;
+  let timer=null;
+  const show=()=>{const t=$('tip');t.textContent=el.dataset.tip;t.classList.add('show');
+    const r=el.getBoundingClientRect();
+    // 按钮列在右侧, 提示要弹到左边去, 否则会跑出屏幕
+    t.style.left='';t.style.right=(innerWidth-r.left+8)+'px';
+    t.style.top=(r.top+r.height/2-14)+'px';};
+  const hide=()=>$('tip').classList.remove('show');
+  el.addEventListener('mouseenter',show);el.addEventListener('mouseleave',hide);
+  el.addEventListener('touchstart',()=>{timer=setTimeout(show,380);},{passive:true});
+  el.addEventListener('touchend',()=>{clearTimeout(timer);hide();});
+  el.addEventListener('touchmove',()=>{clearTimeout(timer);});
+}
+
+/* ============ 布局(浮层位置随模式/画中画变化) ============ */
+function layout(){
+  const pip=$('pip'),np=$('navPanel');
+  const pipH=pip.offsetHeight||200;
+  np.style.top=(14+pipH+8)+'px';   // 面板紧跟画面下方, 画面收起后自动上移
+  np.style.display=UI.panel?'block':'none';
+  $('joy').style.display=UI.mode==='nav'||UI.mode==='map'?'flex':'none';
+  // 主画面切换: 画中画里放另一个
+  const camMain=UI.pipMain;
+  $('cv2d').style.display=(UI.mode==='nav'&&!camMain)?'block':'none';
+  $('cv3d').style.display=(UI.mode==='map'&&!camMain)?'block':'none';
+  $('pipImg').style.display=camMain?'none':'';
+  $('pipMini').style.display=camMain?'block':'none';
+  $('pipLabel').textContent=camMain?(UI.mode==='nav'?'地图':'点云'):'实时画面';
+  if(camMain){ // 相机变主画面 -> 铺满 stage(有独立的缩放状态, 不动地图视图)
+    if(!$('camFull'))makeCamFull();
+    $('camFull').style.display='block';applyCamView();
+  }else if($('camFull')) $('camFull').style.display='none';
+  if(camMain)drawMini();
+}
+/* 相机作主画面: 用一个独立的缩放/平移状态, **只作用于这张图**。
+   之前是把整个画布一起缩放, 结果画面和地图纠缠在一起 —— 实际想要的只是
+   "把画面放大点看清楚"。双击(或双指双击)复位。 */
+const camView={z:1,x:0,y:0};
+function makeCamFull(){
+  const box=document.createElement('div');box.id='camFull';
+  box.style.cssText='position:absolute;inset:0;background:#000;overflow:hidden;touch-action:none';
+  const i=document.createElement('img');i.id='camFullImg';
+  i.style.cssText='position:absolute;left:50%;top:50%;max-width:none;transform-origin:center;'+
+    'user-select:none;-webkit-user-drag:none';
+  box.append(i);$('stage').prepend(box);
+  bindCamZoom(box,i);
+  return box;
+}
+function applyCamView(){
+  const i=$('camFullImg');if(!i)return;
+  i.style.transform=`translate(-50%,-50%) translate(${camView.x}px,${camView.y}px) scale(${camView.z})`;
+}
+function bindCamZoom(box,img){
+  // 图片首次加载后按"contain"铺满
+  img.onload=()=>{const r=box.getBoundingClientRect();
+    const k=Math.min(r.width/img.naturalWidth,r.height/img.naturalHeight);
+    img.style.width=(img.naturalWidth*k)+'px';img.style.height=(img.naturalHeight*k)+'px';
+    applyCamView();};
+  let drag=false,lx=0,ly=0,pd=0;
+  box.addEventListener('wheel',e=>{e.preventDefault();
+    camView.z=Math.max(1,Math.min(8,camView.z*(1-Math.sign(e.deltaY)*0.15)));
+    if(camView.z===1){camView.x=camView.y=0;}
+    applyCamView();},{passive:false});
+  box.addEventListener('pointerdown',e=>{drag=true;lx=e.clientX;ly=e.clientY;
+    box.setPointerCapture(e.pointerId);});
+  box.addEventListener('pointermove',e=>{if(!drag||camView.z<=1)return;
+    camView.x+=e.clientX-lx;camView.y+=e.clientY-ly;lx=e.clientX;ly=e.clientY;applyCamView();});
+  box.addEventListener('pointerup',()=>drag=false);
+  box.addEventListener('dblclick',()=>{camView.z=1;camView.x=camView.y=0;applyCamView();});
+  box.addEventListener('touchstart',e=>{if(e.touches.length===2)pd=td(e);},{passive:true});
+  box.addEventListener('touchmove',e=>{
+    if(e.touches.length!==2)return;e.preventDefault();
+    const d=td(e);camView.z=Math.max(1,Math.min(8,camView.z*d/pd));pd=d;
+    if(camView.z===1){camView.x=camView.y=0;}applyCamView();},{passive:false});
+  function td(e){return Math.hypot(e.touches[0].clientX-e.touches[1].clientX,
+                                   e.touches[0].clientY-e.touches[1].clientY);}
+}
+
+/* ============ 2D 地图画布(导航模式) ============ */
+const cv=$('cv2d'),ctx=cv.getContext('2d');
+let W=0,H=0,view={cx:0,cy:0,scale:28,rot:0};
+let follow=false, showGrid=localStorage.getItem('v2grid')!=='0';
+function resize(){
+  for(const c of [cv,$('cv3d')]){
+    const r=$('stage').getBoundingClientRect();
+    c.width=r.width*DPR;c.height=r.height*DPR;
+    c.style.width=r.width+'px';c.style.height=r.height+'px';
+  }
+  W=cv.width/DPR;H=cv.height/DPR;
+  if(gl){gl.viewport(0,0,$('cv3d').width,$('cv3d').height);}
+  layout();draw();draw3d();
+  if(UI.route==='edit')edResize();      // 编辑页有自己的画布, 转屏时也得跟着重算
+}
+/* 世界<->屏幕。view.rot = 地图旋转角(0 为正北朝上)。所有图元都过这两个函数,
+   所以转地图时激光/路径/标记会跟着一起转。 */
+/* 视图中心不放在画面正中, 而是往右偏一点 —— 左边有相机/面板/日志三层浮层,
+   居中的话地图内容老是被挡住。窄屏时不偏(本来就没地方)。 */
+function cxOff(){return W>760?110:0;}
+function w2s(x,y){
+  const dx=x-view.cx, dy=y-view.cy, c=Math.cos(view.rot), sn=Math.sin(view.rot);
+  return [(dx*c-dy*sn)*view.scale+W/2+cxOff(), H/2-(dx*sn+dy*c)*view.scale];
+}
+function s2w(sx,sy){
+  const rx=(sx-W/2-cxOff())/view.scale, ry=(H/2-sy)/view.scale;
+  const c=Math.cos(view.rot), sn=Math.sin(view.rot);
+  return [view.cx+rx*c+ry*sn, view.cy-rx*sn+ry*c];
+}
+function fitMap(){
+  if(!mapMeta)return;
+  follow=false;syncVTool();
+  view.cx=mapMeta.ox+mapMeta.w*mapMeta.res/2;
+  view.cy=mapMeta.oy+mapMeta.h*mapMeta.res/2;
+  // 可用宽度要扣掉左边浮层和右边按钮列
+  view.scale=Math.max(5,Math.min(140,Math.min((W-(W>760?420:60))/(mapMeta.w*mapMeta.res),
+                                              H*.86/(mapMeta.h*mapMeta.res))));
+  draw();
+}
+let drawReq=false;
+function draw(){if(drawReq)return;drawReq=true;requestAnimationFrame(_draw);}
+function _draw(){
+  drawReq=false;
+  if(UI.mode!=='nav'){return;}
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  ctx.fillStyle=getComputedStyle(document.body).getPropertyValue('--bg');
+  ctx.fillRect(0,0,W,H);
+  if(showGrid)drawGrid();
+  updateScale();
+  if(mapImg&&mapMeta){
+    const [px,py]=w2s(mapMeta.ox,mapMeta.oy+mapMeta.h*mapMeta.res);
+    ctx.save();ctx.translate(px,py);ctx.rotate(-view.rot);
+    ctx.imageSmoothingEnabled=false;
+    ctx.drawImage(mapImg,0,0,mapMeta.w*mapMeta.res*view.scale,mapMeta.h*mapMeta.res*view.scale);
+    ctx.restore();
+  }
+  // 代价地图: 后端已把原点转到 map 系并给了两系偏航角(局部图发在 odom_combined),
+  // 必须按 yaw 旋转着画, 否则车一转弯整片错开
+  if(UI.layers.costmap&&cmImg&&cmMeta){
+    const cw=cmMeta.w*cmMeta.res*view.scale, ch=cmMeta.h*cmMeta.res*view.scale;
+    const [px,py]=w2s(cmMeta.ox,cmMeta.oy);
+    ctx.save();ctx.translate(px,py);ctx.rotate(-view.rot-(cmMeta.yaw||0));
+    ctx.imageSmoothingEnabled=false;ctx.drawImage(cmImg,0,-ch,cw,ch);ctx.restore();
+  }
+  // /scan 是 base_footprint 系(后端 _scan_xy 直接给的极坐标转直角, 没转 map),
+  // 必须按车体位姿旋转平移过去 —— 不转的话激光点会绕着地图原点转, 跟障碍对不齐
+  if(UI.layers.scan&&scanPts&&(scanPose||robot.ok))scanDots();
+  if(UI.layers.plan&&planPts)   line(planPts,'#22c55e',2.5);
+  if(UI.layers.local&&localPts) line(localPts,'#f59e0b',2.5);
+  // 到达/失败后目标点不清除, 只换个颜色: 绿=已到达, 红=失败/被拒, 蓝=进行中
+  if(goal)  markDir(goal.x,goal.y,goal.yaw||0,
+      goal.done==='succeeded'?'#22c55e':
+      (goal.done==='failed'||goal.done==='rejected')?'#ef4444':'#2f7ef7');
+  wps.forEach((p,i)=>markDir(p.x,p.y,p.yaw||0,'#8b5cf6',i+1));
+  if(pick)  markDir(pick.x,pick.y,pick.yaw,pick.drag?'#f59e0b':'#94a3b8');
+  if(robot.ok)drawRobot();
+}
+function scanDots(){
+  const P=scanPose||robot;
+  const c=Math.cos(P.yaw),sn=Math.sin(P.yaw);
+  ctx.fillStyle='#ef4444';
+  for(let i=0;i+1<scanPts.length;i+=2){
+    const wx=P.x+scanPts[i]*c-scanPts[i+1]*sn;
+    const wy=P.y+scanPts[i]*sn+scanPts[i+1]*c;
+    const [x,y]=w2s(wx,wy);
+    if(x<-20||y<-20||x>W+20||y>H+20)continue;
+    ctx.fillRect(x-1,y-1,2.2,2.2);}
+}
+function line(a,c,w){if(a.length<4)return;ctx.strokeStyle=c;ctx.lineWidth=w;ctx.beginPath();
+  let p=w2s(a[0],a[1]);ctx.moveTo(p[0],p[1]);
+  for(let i=2;i+1<a.length;i+=2){p=w2s(a[i],a[i+1]);ctx.lineTo(p[0],p[1]);}ctx.stroke();}
+/* 网格: 放得够大才画(否则糊成一片), 5m/1m 两档 */
+function drawGrid(){
+  if(view.scale<8)return;
+  const step=gridStep();
+  const cs=[s2w(0,0),s2w(W,0),s2w(0,H),s2w(W,H)];
+  const xs=cs.map(p=>p[0]), ys=cs.map(p=>p[1]);
+  const minx=Math.floor(Math.min(...xs)/step)*step, maxx=Math.max(...xs);
+  const miny=Math.floor(Math.min(...ys)/step)*step, maxy=Math.max(...ys);
+  if((maxx-minx)/step>400||(maxy-miny)/step>400)return;
+  ctx.strokeStyle=getComputedStyle(document.body).getPropertyValue('--line');
+  ctx.lineWidth=1;ctx.globalAlpha=.6;ctx.beginPath();
+  for(let x=minx;x<=maxx;x+=step){const a=w2s(x,miny),b=w2s(x,maxy);
+    ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);}
+  for(let y=miny;y<=maxy;y+=step){const a=w2s(minx,y),b=w2s(maxx,y);
+    ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);}
+  ctx.stroke();ctx.globalAlpha=1;
+}
+function drawRobot(){
+  const [x,y]=w2s(robot.x,robot.y);
+  ctx.save();ctx.translate(x,y);ctx.rotate(-robot.yaw-view.rot);
+  ctx.fillStyle='#2f7ef7';ctx.beginPath();
+  ctx.moveTo(15,0);ctx.lineTo(-9,9);ctx.lineTo(-5,0);ctx.lineTo(-9,-9);ctx.closePath();ctx.fill();
+  ctx.strokeStyle='#fff';ctx.lineWidth=1.6;ctx.stroke();
+  ctx.restore();
+  // 定位光晕: 让小车在密集的激光点里也一眼可见
+  ctx.strokeStyle='#2f7ef755';ctx.lineWidth=2;
+  ctx.beginPath();ctx.arc(x,y,17,0,7);ctx.stroke();
+}
+/* 画中画里的小地图(相机为主画面时) */
+function drawMini(){
+  const c=$('pipMini');if(!c)return;
+  const r=c.parentElement.getBoundingClientRect();
+  c.width=r.width*DPR;c.height=r.height*DPR;
+  const g=c.getContext('2d');g.setTransform(DPR,0,0,DPR,0,0);
+  g.fillStyle='#0b1220';g.fillRect(0,0,r.width,r.height);
+  if(!mapMeta||!mapImg)return;
+  const s=Math.min(r.width/(mapMeta.w*mapMeta.res),r.height/(mapMeta.h*mapMeta.res))*0.92;
+  const ox=r.width/2-mapMeta.w*mapMeta.res*s/2, oy=r.height/2-mapMeta.h*mapMeta.res*s/2;
+  g.imageSmoothingEnabled=false;
+  g.drawImage(mapImg,ox,oy,mapMeta.w*mapMeta.res*s,mapMeta.h*mapMeta.res*s);
+  if(robot.ok){
+    const rx=ox+(robot.x-mapMeta.ox)*s, ry=oy+(mapMeta.h*mapMeta.res-(robot.y-mapMeta.oy))*s;
+    // 缩略图里也画成箭头, 不然看不出车头朝哪
+    g.save();g.translate(rx,ry);g.rotate(-robot.yaw);
+    g.fillStyle='#2f7ef7';g.beginPath();
+    g.moveTo(9,0);g.lineTo(-6,5.5);g.lineTo(-3.5,0);g.lineTo(-6,-5.5);g.closePath();g.fill();
+    g.strokeStyle='#fff';g.lineWidth=1.2;g.stroke();
+    g.restore();
+  }
+}
+
+/* ============ 3D 点云(建图模式, 原生WebGL) ============
+   不引 three.js: 那个库压缩后也有几百KB, 走小车热点加载很慢, 而这里只要
+   点云+网格两样东西, 手写反而更小更可控。 */
+const cv3=$('cv3d');let gl=null,prog=null,vbo=null,cloudDirty=false,gridVbo=null,gridN=0,carVbo=null;
+const cam3d={yaw:-0.9,pitch:0.55,dist:18,tx:0,ty:0,tz:0};
+/* 【为什么需要"校平"】FAST-LIO 的 camera_init **不是重力对齐的**: IMU_Processing
+   初始化时 rot=单位阵, 世界系直接取开机瞬间的 IMU 姿态 —— 雷达怎么装, 这个系就
+   怎么歪。本车雷达是下倾装的, 所以原始点云里地面是斜的、和网格对不上。
+   校平 = 把地面法向转回 +Z, 再把原点抬到地面(加 lidar_z), 地面就落在 z=0,
+   正好和网格重合; "只看地面上方 0~2m"这个高度带也才有意义。
+
+   【地面法向从哪来】优先用**后端实时拟合**出来的(state.ground, 见 app.py 的
+   GroundFitter), 拟合不出来才退回下面的标称值。
+   为什么不能只靠标称值: 2026-08-07 实测 launch 里写的 lidar_pitch=0.191rad(10.9°)
+   与实际差了一倍(IMU重力法和点云拟合一致给出约 0.10rad), 倾角错一倍, 15m 外
+   地面和网格就差一米多。死数会过期, 拟合不会。 */
+const C3={level:localStorage.getItem('v3level')!=='0',
+          cull:localStorage.getItem('v3cull')!=='0',
+          scene:false,                     // 实景(实时渲染)开关, 不持久化: 费带宽
+          pan:localStorage.getItem('v3pan')==='1',  // 单指手势: false=旋转 true=平移
+          pitch:0.191, roll:0.006, z:0.28, // 标称安装角(与两个 launch 的默认值对应)
+          minH:-0.12, maxH:2.0,            // 显示高度带(相对地面)
+          gnd:null};                       // 后端实测: {nx,ny,nz,z,fit,...}
+/* 标称安装角推出的地面法向(camera_init 系)。
+   base_footprint->livox 的旋转是 Ry(pitch)·Rx(roll)(pitch>0=下倾), 所以地面法向
+   (0,0,1) 落到雷达系是 Rx(-roll)·Ry(-pitch)·ẑ = (-sinθ, sinφcosθ, cosφcosθ)。
+   **x 分量是负的**。2026-08-07 用 IMU 重力法实测 (-0.0998,+0.0168,+0.9949) 证实,
+   与 pcd2pgm.cpp 的 up 向量约定一致。
+   ⚠️ 这里以前写成了 +sinθ, 于是"校平"不是消掉倾角而是把倾角**加倍**了 —— 症状
+   就是网格怎么调都贴不上地面。改这段务必先重推一遍符号。 */
+function groundNormal(){
+  const g=C3.gnd;
+  if(g&&g.fit){
+    const l=Math.hypot(g.nx,g.ny,g.nz)||1;
+    return [g.nx/l,g.ny/l,g.nz/l];
+  }
+  const sp=Math.sin(C3.pitch),cp=Math.cos(C3.pitch);
+  const sr=Math.sin(C3.roll), cr=Math.cos(C3.roll);
+  return [-sp, sr*cp, cr*cp];
+}
+function groundZ(){ return (C3.gnd&&C3.gnd.fit)?C3.gnd.z:C3.z; }
+/* 把地面法向 u 转到 +Z 的**最小旋转**(Rodrigues), 行主序(m[0..2]=第一行)。
+   用"两向量间最小旋转"而不是按 pitch/roll 拼 Ry·Rx: 前者不引入任何绕 Z 的分量,
+   也就是校平不会把地图整个转一个偏航 —— 和 pcd2pgm 的 FromTwoVectors 同一做法。 */
+function levelMat(){
+  const u=groundNormal();
+  const c=u[2];                                  // u·ẑ
+  if(c>0.999999)return [1,0,0, 0,1,0, 0,0,1];
+  if(c<-0.999999)return [1,0,0, 0,-1,0, 0,0,-1]; // 反向: 绕 X 转 180°
+  const v=[u[1],-u[0],0];                        // v = u × ẑ
+  const k=1/(1+c);
+  // R = I + [v]x + [v]x²·k
+  const vx=v[0],vy=v[1];
+  return [1-vy*vy*k,  vx*vy*k,   vy,
+           vx*vy*k,  1-vx*vx*k, -vx,
+          -vy,        vx,        1-(vx*vx+vy*vy)*k];
+}
+/* 送进着色器必须转成**列主序** —— GLSL 的 mat3 按列填充, 直接把行主序数组丢进去
+   等于用了转置矩阵, 也就是反着转。2026-08-07 踩到: 点云"修正后反而朝另一边斜",
+   而 CPU 侧剔除天花板用的是行主序解释, 两边各转各的, 剔除也就跟着不准。 */
+function levelMatGL(m){
+  return new Float32Array([m[0],m[3],m[6], m[1],m[4],m[7], m[2],m[5],m[8]]);
+}
+function initGL(){
+  gl=cv3.getContext('webgl',{antialias:true,alpha:false});
+  // 【不能把 canvas 换掉】以前这里 outerHTML=... 直接把 #cv3d 抽走, 于是:
+  // ① 上面 const cv3 指向一个脱离文档的节点, clientHeight 变 0, 平移手势的
+  //    "米/像素"被 ||1 兜成 19.66, 拖一下就飞出去几公里;
+  // ② 下次 draw3d 再进来 $('cv3d') 已经是 null, 直接抛异常。
+  // 改成盖一层提示, canvas 本身留着。
+  if(!gl){
+    if(!$('nogl')){
+      const d=document.createElement('div');d.id='nogl';
+      d.style.cssText='position:absolute;inset:0;display:grid;place-items:center;'+
+        'color:var(--dim);font-size:14px;pointer-events:none';
+      d.textContent='此浏览器不支持 WebGL, 无法显示3D点云';
+      cv3.parentNode.appendChild(d);
+    }
+    return;
+  }
+  // lev = 校平矩阵(不校平时传单位阵), zoff = 抬到地面。高度既用于着色也用于摆位。
+  const vs=`attribute vec3 p;uniform mat4 mvp;uniform mat3 lev;uniform float zoff;
+    uniform float psz;varying float h;
+    void main(){vec3 q=lev*p; q.z+=zoff; h=q.z;
+      gl_Position=mvp*vec4(q,1.0); gl_PointSize=psz;}`;
+  // dim: 实景模式下把"累积点云"压暗当背景, 最近几帧用 1.0 画在上面, 一眼能分出
+  // 哪些是现在看到的、哪些是之前扫过的
+  const fs=`precision mediump float;varying float h;uniform float mode;uniform float dim;
+    void main(){
+      if(mode>0.5){gl_FragColor=vec4(0.35,0.42,0.55,0.55);return;}
+      if(mode<-0.5){gl_FragColor=vec4(0.18,0.49,0.97,1.0);return;}   // 小车
+      float t=clamp(h/2.2,0.0,1.0);
+      vec3 c=t<0.5? mix(vec3(0.13,0.42,0.86),vec3(0.10,0.78,0.55),t*2.0)
+                  : mix(vec3(0.10,0.78,0.55),vec3(0.98,0.75,0.18),(t-0.5)*2.0);
+      gl_FragColor=vec4(c*dim,1.0);}`;
+  const mk=(t,s)=>{const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);return o;};
+  prog=gl.createProgram();gl.attachShader(prog,mk(gl.VERTEX_SHADER,vs));
+  gl.attachShader(prog,mk(gl.FRAGMENT_SHADER,fs));gl.linkProgram(prog);gl.useProgram(prog);
+  vbo=gl.createBuffer();liveVbo=gl.createBuffer();
+  // 地面网格 30x30m, 每格 1m。它画在 z=0 —— 校平之后地面就在 z=0, 两者重合。
+  const g=[];for(let i=-15;i<=15;i+=1){g.push(i,-15,0,i,15,0,-15,i,0,15,i,0);}
+  gridVbo=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,gridVbo);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(g),gl.STATIC_DRAW);gridN=g.length/3;
+  gl.enable(gl.DEPTH_TEST);
+}
+/* 相机基, 单独抽出来是因为**平移手势要用同一组基向量** —— 手势和绘制各算各的
+   就是上一版拖动"方向不跟着视角走"的根因。 */
+const FOVY_HALF=0.5;                 // 竖直半视场(弧度), 与 mat() 里的 f 对应
+function camBasis(){
+  const cp=Math.cos(cam3d.pitch),sp=Math.sin(cam3d.pitch);
+  const cy=Math.cos(cam3d.yaw),sy=Math.sin(cam3d.yaw);
+  const Z=[cp*cy,cp*sy,sp];                       // 目标->相机(相机的"后"方向)
+  const X=[-sy,cy,0];                             // 相机右; cp>0 时恒为单位向量
+  const Y=[Z[1]*X[2]-Z[2]*X[1],Z[2]*X[0]-Z[0]*X[2],Z[0]*X[1]-Z[1]*X[0]];  // 上
+  return {X,Y,Z};
+}
+function mat(){ // 视图投影: 绕目标点(tx,ty,tz)的轨道相机
+  const a=cv3.width/cv3.height,f=1/Math.tan(FOVY_HALF),n=0.1,fa=200;
+  const P=[f/a,0,0,0, 0,f,0,0, 0,0,(fa+n)/(n-fa),-1, 0,0,2*fa*n/(n-fa),0];
+  const {X,Y,Z}=camBasis();
+  const ex=cam3d.tx+cam3d.dist*Z[0], ey=cam3d.ty+cam3d.dist*Z[1],
+        ez=cam3d.tz+cam3d.dist*Z[2];
+  const V=[X[0],Y[0],Z[0],0, X[1],Y[1],Z[1],0, X[2],Y[2],Z[2],0,
+    -(X[0]*ex+X[1]*ey+X[2]*ez), -(Y[0]*ex+Y[1]*ey+Y[2]*ez), -(Z[0]*ex+Z[1]*ey+Z[2]*ez),1];
+  const M=new Float32Array(16);
+  for(let i=0;i<4;i++)for(let j=0;j<4;j++){let s=0;
+    for(let k=0;k<4;k++)s+=V[i*4+k]*P[k*4+j];M[i*4+j]=s;}
+  return M;
+}
+/* 高度带筛选: 只保留校平后离地高度在 [minH, maxH] 的点(实景模式就是"地面~2m")。
+   在 CPU 侧筛而不是在着色器里 discard —— 点数直接少一半, 上传和绘制都省。
+   ⚠️ 这里用的高度必须和着色器里 h=（lev*p).z+zoff 完全一致, 否则"看到的"和
+   "筛掉的"对不上。levelMat() 是行主序, 所以第三行是 m[6..8]。 */
+let drawN=0, liveN=0, filt=null, liveVbo=null, liveBuf=null;
+function bandFilter(src,n,dst){
+  const m=levelMat(),z0=groundZ();let k=0;
+  for(let i=0;i<n;i++){
+    const x=src[i*3],y=src[i*3+1],z=src[i*3+2];
+    const h=m[6]*x+m[7]*y+m[8]*z+z0;
+    if(h<C3.minH||h>C3.maxH)continue;
+    dst[k*3]=x;dst[k*3+1]=y;dst[k*3+2]=z;k++;
+  }
+  return k;
+}
+function uploadCloud(){
+  if(!C3.cull||!C3.level){   // 没校平就没有"真实高度"可言, 筛了反而是斜着切一刀
+    gl.bufferData(gl.ARRAY_BUFFER,cloud.pos.subarray(0,cloud.n*3),gl.DYNAMIC_DRAW);
+    drawN=cloud.n;cloudDirty=false;return;
+  }
+  if(!filt||filt.length<cloud.n*3)filt=new Float32Array(cloud.n*3);
+  const k=bandFilter(cloud.pos,cloud.n,filt);
+  gl.bufferData(gl.ARRAY_BUFFER,filt.subarray(0,k*3),gl.DYNAMIC_DRAW);
+  drawN=k;cloudDirty=false;
+}
+function uploadLive(){
+  const need=live.n*3;
+  if(!liveBuf||liveBuf.length<need)liveBuf=new Float32Array(Math.max(need,3*8192));
+  let o=0;
+  for(const f of live.frames){liveBuf.set(f,o);o+=f.length;}
+  const n=o/3|0;
+  let k=n;
+  if(C3.cull&&C3.level)k=bandFilter(liveBuf,n,liveBuf);   // 原地筛, k<=n 不会覆盖未读的
+  gl.bufferData(gl.ARRAY_BUFFER,liveBuf.subarray(0,k*3),gl.DYNAMIC_DRAW);
+  liveN=k;liveDirty=false;
+}
+let d3Req=false;
+function draw3d(){if(d3Req||UI.mode!=='map')return;d3Req=true;requestAnimationFrame(_d3);}
+function _d3(){
+  d3Req=false;
+  if(!gl)initGL();
+  if(!gl)return;
+  gl.clearColor(0.05,0.07,0.11,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  const mvp=gl.getUniformLocation(prog,'mvp'),md=gl.getUniformLocation(prog,'mode');
+  const lev=gl.getUniformLocation(prog,'lev'),zof=gl.getUniformLocation(prog,'zoff');
+  const psz=gl.getUniformLocation(prog,'psz'),dim=gl.getUniformLocation(prog,'dim');
+  const loc=gl.getAttribLocation(prog,'p');gl.enableVertexAttribArray(loc);
+  gl.uniformMatrix4fv(mvp,false,mat());
+  const I3=[1,0,0, 0,1,0, 0,0,1];
+  const LM=C3.level?levelMat():I3, ZOFF=C3.level?groundZ():0.0;
+  gl.uniform1f(dim,1.0);
+  // 网格永远画在 z=0 的水平面上(它就是地面参照), 所以不施加校平矩阵。
+  // "网格 = 地面"这件事完全靠 LM/ZOFF 把点云转过来兑现, 不是靠转网格。
+  gl.uniformMatrix3fv(lev,false,levelMatGL(I3));
+  gl.uniform1f(zof,0.0);gl.uniform1f(psz,2.0);gl.uniform1f(md,1.0);
+  gl.bindBuffer(gl.ARRAY_BUFFER,gridVbo);gl.vertexAttribPointer(loc,3,gl.FLOAT,false,0,0);
+  gl.drawArrays(gl.LINES,0,gridN);
+  if(cloud.n){
+    // 实景模式下累积点云退居背景: 压暗 + 缩小, 免得盖住"现在看到的"那几帧
+    gl.uniform1f(md,0.0);gl.uniform1f(psz,C3.scene?1.5:2.0);
+    gl.uniform1f(dim,C3.scene?0.42:1.0);
+    gl.uniformMatrix3fv(lev,false,levelMatGL(LM));
+    gl.uniform1f(zof,ZOFF);
+    gl.bindBuffer(gl.ARRAY_BUFFER,vbo);
+    if(cloudDirty)uploadCloud();
+    gl.vertexAttribPointer(loc,3,gl.FLOAT,false,0,0);
+    gl.drawArrays(gl.POINTS,0,drawN);
+  }
+  if(C3.scene&&live.n){        // 最近几帧 = "我现在周围长什么样"
+    gl.uniform1f(md,0.0);gl.uniform1f(psz,3.4);gl.uniform1f(dim,1.0);
+    gl.uniformMatrix3fv(lev,false,levelMatGL(LM));
+    gl.uniform1f(zof,ZOFF);
+    gl.bindBuffer(gl.ARRAY_BUFFER,liveVbo);
+    if(liveDirty)uploadLive();
+    gl.vertexAttribPointer(loc,3,gl.FLOAT,false,0,0);
+    gl.drawArrays(gl.POINTS,0,liveN);
+  }
+  gl.uniform1f(dim,1.0);
+  // 小车: 建图时 robot_pose 回的是 FAST-LIO 里程计(frame='lio'), 与点云同一个系,
+  // 所以直接拿来用。校平开着时它也要跟着转, 否则会飘在地面上方/下方。
+  if(robot.ok){
+    if(!carVbo)carVbo=gl.createBuffer();
+    const c=Math.cos(robot.yaw),sn=Math.sin(robot.yaw),z=robot.z||0;
+    const pts=[[0.34,0,0],[-0.16,0.20,0],[-0.16,-0.20,0],[0.34,0,0],[0,0,0.5]];
+    const v=[];
+    for(const [a,b,cz] of pts) v.push(robot.x+a*c-b*sn, robot.y+a*sn+b*c, z+cz);
+    gl.bindBuffer(gl.ARRAY_BUFFER,carVbo);
+    gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(v),gl.DYNAMIC_DRAW);
+    gl.uniformMatrix3fv(lev,false,levelMatGL(LM));
+    gl.uniform1f(zof,ZOFF);
+    gl.uniform1f(md,-1.0);gl.uniform1f(psz,9.0);
+    gl.vertexAttribPointer(loc,3,gl.FLOAT,false,0,0);
+    gl.drawArrays(gl.LINE_LOOP,0,4);      // 车体箭头
+    gl.drawArrays(gl.POINTS,0,5);         // 顶点加粗, 远看也能定位
+  }
+}
+/* ============ 3D 交互 ============
+   pad:   单指拖 = 旋转(工具栏"单指平移"开着时改成平移)
+          双指拖 = 平移       双指捏合 = 缩放(两者可同时进行)
+          双击   = 复位视角
+   鼠标:  左键拖 = 旋转   右键/Shift+左键拖 = 平移   滚轮 = 缩放
+
+   【上一版为什么拖不动/拖歪】平移写的是
+       tx -= dx*cos(yaw+90°)*s;  ty -= (dx*sin(yaw+90°) - dy*cos(pitch))*s
+   横向那半是对的, 纵向那半只改了 ty —— 也就是**上下拖动永远沿世界 Y 走, 不跟
+   视角转**。视角一转, 手往上拖画面却斜着跑, 就是这个。
+   现在改成沿相机自己的 X/Y 基向量平移, 并且步长按透视关系算成"目标平面上 1 像素
+   对应多少米", 手指按住哪个点, 那个点就跟着手指走。 */
+(function(){
+  let mode=0,lx=0,ly=0,pd=0,pts=0,lastTap=0;
+  // 目标平面(过 tx,ty,tz 且垂直视线)上 1 个 CSS 像素对应多少米。
+  // 竖直方向可见范围 = 2·dist·tan(半视场), 除以画布 CSS 高度即得。
+  function mPerPx(){
+    // 高度取不到时退到画布后备存储的尺寸, 再不行给个 800 —— **不能兜成 1**,
+    // 那样比例尺会放大几百倍, 轻轻一拖画面就飞没了
+    const h=cv3.clientHeight||(cv3.height/DPR)||800;
+    return 2*cam3d.dist*Math.tan(FOVY_HALF)/h;
+  }
+  function pan(dx,dy){
+    const {X,Y}=camBasis(),s=mPerPx();
+    // 手指向右(dx>0) => 内容跟着向右 => 目标点向左(-X); 手指向下(dy>0) => 目标点向上(+Y)
+    cam3d.tx+=(-X[0]*dx+Y[0]*dy)*s;
+    cam3d.ty+=(-X[1]*dx+Y[1]*dy)*s;
+    cam3d.tz+=(-X[2]*dx+Y[2]*dy)*s;
+  }
+  function orbit(dx,dy){
+    cam3d.yaw-=dx*0.006;
+    // 夹在 ±83°: 再抬就正对天顶, 相机右向量退化(camBasis 的 X 由 yaw 单独定),
+    // 视角会绕着自己打转
+    cam3d.pitch=Math.max(-1.45,Math.min(1.45,cam3d.pitch+dy*0.006));
+  }
+  function zoomAt(f,px,py){
+    // 以屏幕上 (px,py) 为锚点缩放: 先按缩放前后的比例把目标点朝锚点挪, 再改距离。
+    // 不这么做的话捏合永远围着画面正中缩, 想放大角落里的东西就得缩一下再拖一下。
+    const r=cv3.getBoundingClientRect();
+    const ox=px-r.left-r.width/2, oy=py-r.top-r.height/2;
+    const d0=cam3d.dist;
+    cam3d.dist=Math.max(1.0,Math.min(150,cam3d.dist*f));
+    const {X,Y}=camBasis(), s=(d0-cam3d.dist)*mPerPx()/cam3d.dist;
+    cam3d.tx+=(X[0]*ox-Y[0]*oy)*s;
+    cam3d.ty+=(X[1]*ox-Y[1]*oy)*s;
+    cam3d.tz+=(X[2]*ox-Y[2]*oy)*s;
+  }
+  function resetView(){
+    cam3d.yaw=-0.9;cam3d.pitch=0.55;cam3d.dist=18;
+    cam3d.tx=cam3d.ty=cam3d.tz=0;draw3d();
+  }
+  cv3.resetView=resetView;
+
+  // ---- 鼠标 ----
+  cv3.addEventListener('mousedown',e=>{
+    mode=(e.button===2||e.shiftKey)?2:(C3.pan?2:1);lx=e.clientX;ly=e.clientY;});
+  cv3.addEventListener('contextmenu',e=>e.preventDefault());
+  addEventListener('mousemove',e=>{if(!mode)return;
+    const dx=e.clientX-lx,dy=e.clientY-ly;lx=e.clientX;ly=e.clientY;
+    (mode===1?orbit:pan)(dx,dy);draw3d();});
+  addEventListener('mouseup',()=>mode=0);
+  cv3.addEventListener('wheel',e=>{e.preventDefault();
+    zoomAt(1+Math.sign(e.deltaY)*0.12,e.clientX,e.clientY);draw3d();},{passive:false});
+  cv3.addEventListener('dblclick',e=>{e.preventDefault();resetView();});
+
+  // ---- 触摸 ----
+  // touchstart 必须 passive:false: pad 上内核会在第一个 touchmove 之前就决定
+  // 这串手势归谁, 不在 start 里 preventDefault 的话 Safari/部分 Chrome 会把它
+  // 判给页面滚动/双击缩放, 表现就是"手指拖了但画面没反应/只抖一下"。
+  // (#cv3d 的 CSS 已有 touch-action:none, 但那对 iPadOS Safari 不完全生效。)
+  const T=e=>[...e.touches];
+  function baseline(e){
+    const t=T(e);pts=t.length;
+    if(pts===1){lx=t[0].clientX;ly=t[0].clientY;}
+    else if(pts>=2){
+      lx=(t[0].clientX+t[1].clientX)/2;ly=(t[0].clientY+t[1].clientY)/2;
+      pd=Math.hypot(t[0].clientX-t[1].clientX,t[0].clientY-t[1].clientY)||1;
+    }
+  }
+  cv3.addEventListener('touchstart',e=>{
+    if(e.cancelable)e.preventDefault();
+    // 双击(两次单指轻触)复位视角 —— pad 上没有滚轮, 转晕了要有一键回正
+    if(T(e).length===1){
+      const now=Date.now();
+      if(now-lastTap<300){lastTap=0;resetView();return;}
+      lastTap=now;
+    }
+    baseline(e);},{passive:false});
+  cv3.addEventListener('touchmove',e=>{
+    if(e.cancelable)e.preventDefault();
+    const t=T(e);
+    // 【手指数变了就重新取基准, 不要把这次手势丢掉】上一版在 touchend 里
+    // 一律 mode=0, 于是双指里松开一根, 剩下那根就完全失灵, 得整只手抬起来重来。
+    if(t.length!==pts){baseline(e);return;}
+    if(t.length===1){
+      const dx=t[0].clientX-lx,dy=t[0].clientY-ly;
+      lx=t[0].clientX;ly=t[0].clientY;
+      (C3.pan?pan:orbit)(dx,dy);
+    }else if(t.length>=2){
+      const cx=(t[0].clientX+t[1].clientX)/2,cy=(t[0].clientY+t[1].clientY)/2;
+      const d=Math.hypot(t[0].clientX-t[1].clientX,t[0].clientY-t[1].clientY)||1;
+      // 先按上一帧的 dist 平移, 再缩放 —— 反过来的话这一帧的平移会用错的比例尺
+      pan(cx-lx,cy-ly);
+      if(Math.abs(d-pd)>1)zoomAt(pd/d,cx,cy);
+      lx=cx;ly=cy;pd=d;
+    }
+    draw3d();},{passive:false});
+  const end=e=>{const t=T(e);if(t.length)baseline(e);else{pts=0;mode=0;}};
+  cv3.addEventListener('touchend',end);
+  cv3.addEventListener('touchcancel',end);
+})();
+
+/* ============ 视图工具条 / 图例 ============ */
+/* 图例必须和 _draw() 里实际用的颜色一一对应, 改绘制颜色时这里也要改 */
+const LEGEND=[
+  ['','可通行','#ffffff'],['','障碍','#273244'],['','未知','rgba(154,164,178,.45)'],
+  ['','小车','#2f7ef7'],['','目标点','#2f7ef7'],['','巡航点','#8b5cf6'],
+  ['scan','激光','#ef4444'],['plan','全局路径','#22c55e'],
+  ['local','局部路径','#f59e0b'],
+  ['costmap','代价地图','linear-gradient(90deg,#fff0,#ff8c00 60%,#e00)'],
+];
+function renderLegend(){
+  const L=$('legend');if(!L)return;
+  L.style.display=(UI.route==='nav')?'flex':'none';
+  L.innerHTML=LEGEND.map(([k,t,c])=>
+    `<span class="${k?'tg':''}${k&&!UI.layers[k]?' off':''}" data-l="${k}">
+       <i style="background:${c}"></i>${t}</span>`).join('')
+    +`<span id="scale" class="tg${showGrid?'':' off'}" title="点击开关网格">
+        <span class="sq"></span><span id="scaleTxt">一格 1m</span></span>`;
+  updateScale();
+  $('scale').onclick=()=>{showGrid=!showGrid;
+    localStorage.setItem('v2grid',showGrid?'1':'0');renderLegend();draw();};
+  L.querySelectorAll('.tg').forEach(e=>e.onclick=()=>{
+    const k=e.dataset.l;UI.layers[k]=!UI.layers[k];
+    localStorage.setItem('v2layers',JSON.stringify(UI.layers));
+    renderLegend();draw();});
+}
+/* 网格步长和 drawGrid 里保持一致(缩得太小时会自动跳到5m一格) */
+function gridStep(){return view.scale<16?5:1;}
+function updateScale(){
+  const t=$('scaleTxt');if(!t)return;
+  t.textContent=!showGrid?'网格 关':(view.scale<8?'放大后显示网格':`一格 ${gridStep()}m`);
+}
+function syncVTool(){
+  const box=$('tools');if(!box)return;
+  const lv=box.querySelector('[data-flag=level]'); if(lv)lv.classList.toggle('on',C3.level);
+  const cu=box.querySelector('[data-flag=cull]');  if(cu)cu.classList.toggle('on',C3.cull);
+  const sc=box.querySelector('[data-flag=scene]'); if(sc)sc.classList.toggle('on',C3.scene);
+  const pn=box.querySelector('[data-flag=pan]');
+  if(pn){pn.classList.toggle('on',C3.pan);
+    pn.innerHTML=`<svg class="ic"><use href="#${C3.pan?'i-hand':'i-orbit'}"/></svg>`;
+    bindTip(pn,C3.pan?'单指手势: 平移(点一下改回旋转)':'单指手势: 旋转(点一下改成平移)');}
+  const f=box.querySelector('[data-flag=follow]'); if(f)f.classList.toggle('on',follow);
+  const g=box.querySelector('[data-flag=grid]');   if(g)g.classList.toggle('on',showGrid);
+  const n=$('needle'); if(n)n.style.transform=`rotate(${view.rot*180/Math.PI}deg)`;
+}
+
+/* ============ 2D 交互(导航页) ============
+   空手拖动 = 平移地图; 滚轮/捏合 = 缩放。
+   面板打开时(单点导航/多点巡航/设初始位姿): **按下选点、拖出朝向、松开生效**
+   —— 和 RViz 的 2D Nav Goal 一个手感。只点一下不拖也可以, 朝向取当前车头方向。 */
+let clickMode='';let goal=null,wps=[];
+/* 终态标记的"停留计时": 到达/失败后先留一会儿给人看, 到点自动收起 */
+let goalHoldT=null;
+const GOAL_HOLD_MS=10000;
+function goalHoldCancel(){if(goalHoldT){clearTimeout(goalHoldT);goalHoldT=null;}}
+function goalMarkDone(st){
+  if(!goal)return;
+  goal.done=st;goalHoldCancel();
+  goalHoldT=setTimeout(()=>{goalHoldT=null;
+    if(goal&&goal.done){goal=null;draw();renderPanel();}},GOAL_HOLD_MS);
+}
+function goalClear(){goalHoldCancel();goal=null;}
+let pick=null;          // {x,y,yaw,drag} 正在拖朝向的临时目标
+/* armed: 只有点了"设目标"/"加航点"/"设初始位姿"之后的**下一次**按下才放点。
+   之前是"面板开着就一直放点", 结果按下地图想平移也会变成放点, 根本挪不动图。 */
+let armed='';           // '' | 'goal' | 'wp' | 'init'
+function pickActive(){return armed!=='';}
+function setArmed(a){
+  armed=a; clickMode=a==='init'?'init':'';
+  cv.style.cursor=a?'crosshair':'';
+  if(a)toast({goal:'在地图上按住拖出朝向 → 松手下发',
+              wp:'在地图上按住拖出朝向 → 松手添加航点',
+              init:'在地图上按住拖出车头朝向 → 松手'}[a]);
+  renderPanel();
+}
+(function(){
+  let panning=false,lx=0,ly=0,downAt=null;   // panning/g 由下面的双指手势共用
+  const wpt=e=>{const r=cv.getBoundingClientRect();
+    return s2w(e.clientX-r.left,e.clientY-r.top);};
+  cv.addEventListener('pointerdown',e=>{
+    cv.setPointerCapture(e.pointerId);
+    downAt={x:e.clientX,y:e.clientY,t:Date.now()};lx=e.clientX;ly=e.clientY;
+    if(pickActive()){const [x,y]=wpt(e);pick={x,y,yaw:robot.yaw||0,drag:false};draw();}
+    else panning=true;
+  });
+  cv.addEventListener('pointermove',e=>{
+    if(pick){
+      const [x,y]=wpt(e);
+      const dx=x-pick.x,dy=y-pick.y;
+      if(Math.hypot(dx,dy)>0.12){pick.yaw=Math.atan2(dy,dx);pick.drag=true;}
+      draw();return;
+    }
+    if(!panning)return;
+    const rx=(e.clientX-lx)/view.scale, ry=-(e.clientY-ly)/view.scale;
+    const c=Math.cos(view.rot), sn=Math.sin(view.rot);
+    view.cx-=rx*c+ry*sn; view.cy-=-rx*sn+ry*c;   // s2w 的方向导数, 转了也跟手
+    lx=e.clientX;ly=e.clientY;follow=false;syncVTool();draw();
+  });
+  cv.addEventListener('pointerup',e=>{
+    panning=false;
+    if(pick){commitPick();return;}
+    downAt=null;
+  });
+  cv.addEventListener('pointercancel',()=>{panning=false;pick=null;draw();});
+  cv.addEventListener('wheel',e=>{e.preventDefault();
+    view.scale=Math.max(3,Math.min(200,view.scale*(1-Math.sign(e.deltaY)*0.12)));
+    follow=false;syncVTool();draw();},{passive:false});
+
+  /* 双指: 捏合缩放 + 扭转旋转 + 平移。两指一落下就接管, 并取消单指正在做的
+     平移/选点(否则会一边选点一边缩放, 手感很乱)。 */
+  let g=null;
+  const two=e=>{
+    const [a,b]=[e.touches[0],e.touches[1]];
+    return {d:Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY),
+            a:Math.atan2(b.clientY-a.clientY,b.clientX-a.clientX),
+            x:(a.clientX+b.clientX)/2, y:(a.clientY+b.clientY)/2};
+  };
+  cv.addEventListener('touchstart',e=>{
+    if(e.touches.length!==2)return;
+    panning=false;pick=null;
+    g=two(e);draw();
+  },{passive:true});
+  cv.addEventListener('touchmove',e=>{
+    if(e.touches.length!==2||!g)return;
+    e.preventDefault();
+    const n=two(e);
+    if(g.d>0)view.scale=Math.max(3,Math.min(200,view.scale*n.d/g.d));
+    // 屏幕 y 轴朝下, atan2 的角度增减和肉眼看到的转向相反 -> 这里要取负,
+    // 否则手指顺时针拧、地图逆时针转(2026-08-07 用户反馈"老是反着转")
+    view.rot-=n.a-g.a;
+    const rx=(n.x-g.x)/view.scale, ry=-(n.y-g.y)/view.scale;
+    const c=Math.cos(view.rot), sn=Math.sin(view.rot);
+    view.cx-=rx*c+ry*sn; view.cy-=-rx*sn+ry*c;
+    g=n;follow=false;syncVTool();draw();
+  },{passive:false});
+  cv.addEventListener('touchend',e=>{if(e.touches.length<2)g=null;});
+})();
+function commitPick(){
+  const p=pick,a=armed;pick=null;setArmed('');
+  if(!p)return;
+  if(a==='init'){send({t:'initialpose',x:p.x,y:p.y,yaw:p.yaw});draw();return;}
+  if(a==='wp'){wps.push({x:p.x,y:p.y,yaw:p.yaw});renderPanel();draw();return;}
+  if(a==='goal'){
+    // 先无条件把标记放上去 —— 导航没起时也让用户看见自己点在哪, 否则面板上
+    // "目标点"永远显示"未设置", 看起来像点了没反应(2026-08-07 用户反馈)
+    // done 必须一起重置 —— 不然新目标会继承上一次的"已到达"颜色和文字
+    goalHoldCancel();goal={x:p.x,y:p.y,yaw:p.yaw,done:null};
+    nav.dist=null;
+    renderPanel();draw();
+    if(!(S.running&&S.mode==='navigation')){
+      toast('已标记, 但导航还没启动, 目标点没有下发',true);return;}
+    // 秒表从"下发那一刻"起算, 不等后端的 running 状态 —— 后端的状态名/时机
+    // 不一定和这里一致, 之前"已用时"一直显示 -- 就是卡在这
+    navT0=Date.now();
+    send({t:'goal',x:p.x,y:p.y,yaw:p.yaw});
+    speak('goal_sent');renderPanel();draw();
+  }
+}
+/* 带方向的目标标记 */
+function markDir(x,y,yaw,c,n){
+  const [sx,sy]=w2s(x,y);
+  ctx.save();ctx.translate(sx,sy);ctx.rotate(-yaw-view.rot);
+  ctx.strokeStyle=c;ctx.lineWidth=3;ctx.beginPath();
+  ctx.moveTo(0,0);ctx.lineTo(26,0);ctx.stroke();
+  ctx.fillStyle=c;ctx.beginPath();
+  ctx.moveTo(32,0);ctx.lineTo(22,6);ctx.lineTo(22,-6);ctx.closePath();ctx.fill();
+  ctx.restore();
+  ctx.fillStyle=c;ctx.beginPath();ctx.arc(sx,sy,8,0,7);ctx.fill();
+  if(n){ctx.fillStyle='#fff';ctx.font='bold 11px sans-serif';ctx.textAlign='center';
+    ctx.textBaseline='middle';ctx.fillText(n,sx,sy);}
+}
+
+/* ============ 导航面板 ============ */
+function togglePanel(p){
+  UI.panel=UI.panel===p?'':p;
+  // 切到多点巡航就把上一次单点导航留下的"已完成"标记收掉 —— 两套标记叠在
+  // 一起最容易看错。正在跑的目标(done 还没打上)不动它。
+  if(UI.panel==='wps'&&goal&&goal.done){goalClear();draw();}
+  renderPanel();layout();
+}
+function renderPanel(){
+  const np=$('navPanel');
+  if(!UI.panel){np.style.display='none';return;}
+  np.style.display='block';
+  const cls={running:'run',succeeded:'ok',failed:'bad',rejected:'bad',canceled:''}[nav.state]||'';
+  if(UI.panel==='goal'){
+    np.innerHTML=`
+      <div class="ph"><svg class="ic"><use href="#i-target"/></svg>单点导航
+        <span class="x" onclick="togglePanel('goal')"><svg class="ic"><use href="#i-x"/></svg></span></div>
+      <div class="pb">
+        <div class="nst ${cls}" id="pnState"><b>${esc(navText())}</b></div>
+        <div class="mets">
+          <div class="met"><small>剩余距离</small><b id="pnDist">--</b></div>
+          <div class="met"><small>已用时</small><b id="pnTime">--</b></div>
+        </div>
+        <div class="mets">
+          <div class="met"><small>目标点</small><b class="sm" id="pnGoal">--</b></div>
+          <div class="met"><small>目标朝向</small><b class="sm" id="pnGoalYaw">--</b></div>
+          <div class="met"><small>当前位置</small><b class="sm" id="pnCur">--</b></div>
+          <div class="met"><small>当前朝向</small><b class="sm" id="pnCurYaw">--</b></div>
+        </div>
+        <div class="row">
+          <button class="${armed==='goal'?'primary':''}" onclick="setArmed(armed==='goal'?'':'goal')">
+            ${armed==='goal'?'点地图放置…':'设定目标'}</button>
+          <button class="danger" onclick="cancelGoal()">取消</button></div>
+        <div class="row"><button onclick="goHome()">回到起点</button></div>
+      </div>`;
+    updatePanelLive();
+  }else{
+    const running=nav.state==='running';
+    np.innerHTML=`
+      <div class="ph"><svg class="ic"><use href="#i-route"/></svg>多点巡航
+        <span class="x" onclick="togglePanel('wps')"><svg class="ic"><use href="#i-x"/></svg></span></div>
+      <div class="pb">
+        <div class="nst ${cls}" id="pnState"><b>${esc(navText())}</b>
+          <span class="pill">${wps.length} 个点${nav.index?` · 第 ${nav.index}`:''}${nav.loop?' · 循环':''}</span></div>
+        <div class="mets">
+          <div class="met"><small>剩余距离</small><b id="pnDist">--</b></div>
+          <div class="met"><small>已用时</small><b id="pnTime">--</b></div>
+        </div>
+        <!-- 多点巡航同样要能看到自己现在在哪、朝哪 -->
+        <div class="mets">
+          <div class="met"><small>当前位置</small><b class="sm" id="pnCur">--</b></div>
+          <div class="met"><small>当前朝向</small><b class="sm" id="pnCurYaw">--</b></div>
+        </div>
+        <div class="wp-list" id="wpList"></div>
+        <div class="row">
+          <button class="${armed==='wp'?'primary':''}" onclick="setArmed(armed==='wp'?'':'wp')">
+            ${armed==='wp'?'点地图放置…':'+ 加航点'}</button>
+          <button onclick="wps=[];renderPanel();draw()" ${wps.length?'':'disabled'}>清空</button></div>
+        <div class="row">
+          <button class="primary" onclick="startCruise(false)" ${running||!wps.length?'disabled':''}>巡航</button>
+          <button class="primary" onclick="startCruise(true)" ${running||!wps.length?'disabled':''}>循环</button>
+          <button class="danger" onclick="cancelGoal()" ${running?'':'disabled'}>停止</button></div>
+        <div class="row"><button onclick="saveRoute()" ${wps.length?'':'disabled'}>保存路线</button></div>
+      </div>`;
+    const L=$('wpList');
+    wps.forEach((p,i)=>{
+      const d=document.createElement('div');
+      d.className='wp'+(nav.index===i+1?' cur':'');
+      // 航点也把朝向显示出来 —— 巡航到点后车会转到这个角度, 看不到就没法核对
+      d.innerHTML=`<span class="n">${i+1}</span>
+        <span class="co">${p.x.toFixed(2)}, ${p.y.toFixed(2)} · ${((p.yaw||0)*57.3).toFixed(0)}°</span>
+        <span class="d"><svg class="ic"><use href="#i-trash"/></svg></span>`;
+      d.querySelector('.d').onclick=()=>{wps.splice(i,1);renderPanel();draw();};
+      L.append(d);});
+    updatePanelLive();
+  }
+}
+/* 只刷会变的那几个数字, 不重建整个面板 —— 位姿是 5Hz 来的, 每次都 innerHTML
+   会让航点列表闪烁、正在点的按钮丢焦点。 */
+function updatePanelLive(){
+  const set=(id,v)=>{const e=$(id);if(e)e.textContent=v;};
+  set('pnDist', nav.dist!=null?nav.dist.toFixed(2)+' m':'--');
+  set('pnTime', elapsedTxt());
+  set('pnCur',    robot.ok?robot.x.toFixed(2)+', '+robot.y.toFixed(2):'--');
+  set('pnCurYaw', robot.ok?(robot.yaw*57.3).toFixed(0)+'°':'--');
+  set('pnGoal',    goal?goal.x.toFixed(2)+', '+goal.y.toFixed(2):'未设置');
+  set('pnGoalYaw', goal?((goal.yaw||0)*57.3).toFixed(0)+'°':'--');
+  const st=$('pnState');
+  if(st&&UI.panel==='goal'){
+    // 状态行右侧那颗胶囊: 有目标就显示它的坐标, 到达了加个"已到达"
+    const done={succeeded:'已到达',failed:'失败',rejected:'被拒'}[goal&&goal.done]||'';
+    st.innerHTML=`<b>${esc(navText())}</b>`+
+      (goal?`<span class="pill">${goal.x.toFixed(2)}, ${goal.y.toFixed(2)}`+
+            `${done?' · '+done:''}</span>`:'');
+  }
+}
+function elapsedTxt(){
+  const s=nav.elapsed!=null?nav.elapsed:(navT0?(Date.now()-navT0)/1000:null);
+  if(s==null)return '--';
+  const m=Math.floor(s/60);
+  return m?`${m}分${String(Math.floor(s%60)).padStart(2,'0')}秒`:`${Math.round(s)} 秒`;
+}
+function navText(){
+  const m={idle:'空闲',running:'导航中',succeeded:'已到达',failed:'失败',
+           canceled:'已取消',rejected:'被拒绝'};
+  return m[nav.state]||nav.state||'空闲';
+}
+/* 播报只在**状态跃迁**上触发。后端每收到一条反馈就重发一遍完整 nav_info,
+   新客户端连上时也会补发一条 —— 按当前状态播的话会重复念。 */
+function onNavUpdate(was,wasWp){
+  renderPanel();
+  if(nav.state!==was){
+    if(nav.state==='succeeded')speak(nav.kind==='follow'?'cruise_done':'arrived');
+    else if(nav.state==='failed')speak('nav_failed');
+    else if(nav.state==='canceled')speak('nav_canceled');
+    else if(nav.state==='rejected')speak('nav_rejected');
+  }
+  // 多点巡航途中每到一个航点报一次进度: wp_index 从 k 变 k+1 就是第 k+1 个到了
+  if(nav.kind==='follow'&&nav.state==='running'&&
+     typeof nav.wp_index==='number'&&nav.wp_index!==wasWp&&nav.wp_index>0)
+    speak('wp_'+nav.wp_index);
+}
+/* 起点: 导航启动后收到的第一个位姿。长按按钮可把当前位置设成新起点。 */
+let homePose=JSON.parse(localStorage.getItem('v2home')||'null');
+function setHome(p){homePose=p;localStorage.setItem('v2home',JSON.stringify(p));
+  toast(`起点已设为 ${p.x.toFixed(2)}, ${p.y.toFixed(2)}`);draw();}
+function goHome(){
+  if(!(S.running&&S.mode==='navigation')){toast('回到起点需要先启动导航',true);return;}
+  if(!homePose){toast('还没有起点 —— 长按此键把当前位置设为起点',true);return;}
+  goalHoldCancel();goal={...homePose,done:null};navT0=Date.now();nav.dist=null;
+  send({t:'goal',x:homePose.x,y:homePose.y,yaw:homePose.yaw||0});
+  speak('go_home');draw();renderPanel();
+}
+function cancelGoal(){send({t:'cancel_goal'});goalClear();navT0=null;nav.dist=null;
+  draw();renderPanel();}
+function startCruise(loop){
+  if(!wps.length){toast('先在地图上点几个巡航点',true);return;}
+  // 巡航一开, 上一次单点导航的目标点就作废了 —— 留着它只会和航点标记混在一起
+  goalClear();nav.dist=null;
+  navT0=Date.now();
+  send({t:'follow',points:wps,loop:!!loop});speak('cruise_start');
+  draw();renderPanel();
+}
+function saveRoute(){
+  send({t:'save_route',map:UI.selMap||S.active_map||'WHEELTEC3D',points:wps});
+  toast('巡航路线已保存');
+}
+
+/* ============ 弹窗 ============ */
+function openDlg(html,onMount){
+  $('dlg').innerHTML=html;$('mask').classList.add('show');
+  $('dlg').querySelectorAll('.x').forEach(x=>x.onclick=closeDlg);
+  if(onMount)onMount();
+}
+function closeDlg(){$('mask').classList.remove('show');}
+$('mask').onclick=e=>{if(e.target===$('mask'))closeDlg();};
+
+function dlgNavParams(){
+  openDlg(`<h3><svg class="ic"><use href="#i-tune"/></svg>导航参数调节
+    <span class="x"><svg class="ic"><use href="#i-x"/></svg></span></h3>
+    <div class="body">
+      <div class="fld"><label>最大前进速度 <b id="lvx">--</b></label>
+        <input type="range" id="rvx" min="0.1" max="0.7" step="0.05"></div>
+      <div class="fld"><label>最大后退速度 <b id="lvn">--</b></label>
+        <input type="range" id="rvn" min="0.1" max="0.7" step="0.05"></div>
+      <div class="fld"><label>最大旋转速度 <b id="lwz">--</b></label>
+        <input type="range" id="rwz" min="0.3" max="1.5" step="0.1"></div>
+      <hr style="border:none;border-top:1px solid var(--line);margin:16px 0">
+      <div class="fld"><label>避障膨胀半径 <b id="lir">--</b></label>
+        <input type="range" id="rir" min="0.15" max="0.6" step="0.05"></div>
+      <div class="fld"><label>代价衰减系数 <b id="lcs">--</b></label>
+        <input type="range" id="rcs" min="1" max="8" step="0.5"></div>
+      <p style="font-size:11px;color:var(--dim);margin:6px 0 0" id="npNote">
+        正在读取车上的当前值…</p>
+    </div>
+    <div class="foot"><button class="x">关闭</button>
+      <button class="primary" id="applyNav">应用</button></div>`,()=>{
+    // 先摆上配置文件里的默认值当占位, 拿到真实值后再覆盖(见 applyNavParams)
+    const v={rvx:0.5,rvn:0.5,rwz:1.2,rir:0.35,rcs:3.0};
+    for(const k in v){$(k).value=v[k];$(k).oninput=syncNavLabels;}
+    syncNavLabels();
+    send({t:'get_nav_params'});          // 问后端要当前真实值
+    $('applyNav').onclick=()=>{
+      if(!(S.running&&S.mode==='navigation')){
+        toast('导航没在运行, 参数下发了也没有节点接收', true); return; }
+      send({t:'nav_speed',vx_max:+$('rvx').value,vx_min:-$('rvn').value,
+            wz_max:+$('rwz').value});
+      send({t:'obstacle_params',inflation_radius:+$('rir').value,
+            cost_scaling_factor:+$('rcs').value});
+      closeDlg();};                       // 成不成由后端的 toast 说, 这里不预告成功
+  });
+}
+function syncNavLabels(){
+  const f=(id,d,u)=>{const e=$(id);if(e)e.textContent=(+$('r'+id.slice(1)).value).toFixed(d)+u;};
+  f('lvx',2,' m/s'); f('lvn',2,' m/s'); f('lwz',1,' rad/s');
+  f('lir',2,' m');   f('lcs',1,'');
+}
+/* 把后端读回来的真实参数填进滑条。读不到(导航没起)就保留默认值并说明。 */
+function applyNavParams(m){
+  const p=m.params||{};
+  if(!$('rvx'))return;                    // 弹窗已经关了
+  const put=(id,key,tf)=>{
+    if(p[key]==null)return;
+    const el=$(id), val=tf?tf(p[key]):p[key];
+    // 车上的值可能超出滑条量程(比如配置文件里 wz_max=1.2 而滑条最小 0.3),
+    // 超了就把量程撑开, 不然滑条会把它悄悄夹到边界, 一点"应用"反而改了参数
+    if(val<+el.min)el.min=(Math.floor(val*10)/10).toFixed(2);
+    if(val>+el.max)el.max=(Math.ceil(val*10)/10).toFixed(2);
+    el.value=val;
+  };
+  put('rvx','FollowPath.vx_max');
+  put('rvn','FollowPath.vx_min',v=>Math.abs(v));
+  put('rwz','FollowPath.wz_max');
+  put('rir','FollowPath.ObstaclesCritic.inflation_radius');
+  put('rcs','FollowPath.ObstaclesCritic.cost_scaling_factor');
+  syncNavLabels();
+  const n=$('npNote');
+  if(n)n.innerHTML=m.live
+    ? '滑条已同步为车上的当前值。仅对本次导航生效, 重启导航恢复配置文件默认值。'
+      +'膨胀半径三处(MPPI/局部图/全局图)同步修改 —— Humble 版 MPPI 要求完全一致。'
+    : '<span style="color:var(--err)">读不到当前值(导航没在运行), '
+      +'下面显示的是配置文件默认值。</span>';
+}
+
+/* 导航前临时换图: 一个轻量弹窗, 不用跳到整页地图库去。
+   只做"选哪张", 删除/编辑那些管理操作仍然在首页的地图页里。 */
+function dlgPickMap(){
+  openDlg(`<h3><svg class="ic"><use href="#i-map"/></svg>选择地图
+      <span style="margin-left:auto;cursor:pointer" id="mrefresh" title="刷新">
+        <svg class="ic"><use href="#i-refresh"/></svg></span>
+      <span class="x"><svg class="ic"><use href="#i-x"/></svg></span></h3>
+    <div class="body"><div id="mapList"></div>
+      <p id="mapEmpty" style="color:var(--dim);font-size:12px;text-align:center;
+         padding:20px 0;display:none">还没有地图</p>
+      <p style="font-size:11px;color:var(--dim);margin:10px 0 0">
+        ${S.running&&S.mode==='navigation'
+          ?'导航运行中 —— 点一行会确认后<b>立刻热加载</b>该地图并自动重新定位'
+          :'选中后启动导航即加载这张; 现在点一行可先在画布上预览'}</p>
+    </div>
+    <div class="foot"><button class="x">关闭</button></div>`,()=>{
+    $('mrefresh').onclick=()=>{send({t:'list_maps',sensor:'mid360'});toast('已刷新');};
+    send({t:'list_maps',sensor:'mid360'});
+    renderMapDlg();
+  });
+}
+
+/* 地图库(整页)。选中的地图 = 下次启动导航要加载的那张。 */
+function renderMapsPage(){
+  $('pgMaps').innerHTML=`<div class="card">
+      <h4><svg class="ic"><use href="#i-lib"/></svg>地图库
+        <span style="margin-left:auto;cursor:pointer" id="mrefresh" title="刷新">
+          <svg class="ic"><use href="#i-refresh"/></svg></span></h4>
+      <div class="in"><div id="mapList"></div>
+        <p id="mapEmpty" style="color:var(--dim);font-size:12px;text-align:center;padding:24px 0;display:none">
+          还没有地图 —— 先去「建图」建一张, 停止建图后点「保存地图」</p></div>
+    </div>
+    <div class="card"><div class="in" style="color:var(--dim);font-size:12px">
+      点一行选中它, 下次启动导航就加载这张。铅笔=编辑, 垃圾桶=删除。<br>
+      列表按保存时间倒序, 刚存的排最前并会高亮几秒。
+    </div></div>`;
+  $('mrefresh').onclick=()=>{send({t:'list_maps',sensor:'mid360'});toast('已刷新');};
+  renderMapDlg();
+}
+let freshMap='';
+function renderMapDlg(){
+  const L=$('mapList');if(!L)return;
+  L.innerHTML='';
+  $('mapEmpty').style.display=maps.length?'none':'';
+  // 最新保存的排最前, 便于确认"刚存的那张确实进来了"
+  const list=[...maps].sort((a,b)=>(b.mtime||0)-(a.mtime||0));
+  for(const m of list){
+    const row=document.createElement('div');
+    row.className='maprow'+(UI.selMap===m.name?' sel':'')+(freshMap===m.name?' fresh':'');
+    row.innerHTML=`<div class="mi"><b>${esc(m.name)}</b>
+        <small>${m.size_kb}KB · ${fmtTime(m.mtime)}</small></div>`;
+    if(UI.route==='maps'){        // 管理操作只在整页地图库里给, 换图弹窗里不放
+      const ed=document.createElement('span');ed.className='act';
+      ed.innerHTML='<svg class="ic"><use href="#i-edit"/></svg>';
+      ed.onclick=ev=>{ev.stopPropagation();edRequest(m.name);};
+      const de=document.createElement('span');de.className='act';
+      de.innerHTML='<svg class="ic"><use href="#i-trash"/></svg>';
+      de.onclick=ev=>{ev.stopPropagation();
+        if(confirm('删除地图 '+m.name+' ?')){send({t:'delete_map',name:m.name});
+          setTimeout(()=>send({t:'list_maps',sensor:'mid360'}),300);}};
+      row.append(ed,de);
+    }
+    row.onclick=()=>{UI.selMap=m.name;localStorage.setItem('v2selMap',m.name);
+      renderMapDlg();renderStatus();renderHome();
+      /* 【导航跑着的时候要真的换图】以前这里无论如何都只发 preview_map, 而后端
+         在导航运行中是拒绝预览的(画布上那张才是真正在用的), 于是选了半天画面
+         纹丝不动 —— 用户的说法是"换地图完全没实现"。
+         现在走 map_server/load_map 热加载: 只换 map_server 的图, 不重启 nav2,
+         AMCL 的似然场订阅 /map 会跟着更新。 */
+      if(S.running&&S.mode==='navigation'){
+        if(!edCap('map_reload')){
+          toast('后端还是旧版, 换图仍需停止导航后重启 —— 或先重启 wheeltec-webapp',true);
+          return;}
+        if(m.name===mapNameNow()){toast('导航用的就是这张图');return;}
+        if(confirm(`导航正在运行, 立刻换成 "${m.name}" ?\n`
+            +'地图会热加载, 随后自动重新定位(车会原地判断自己在哪)。'))
+          send({t:'reload_map',name:m.name,reloc:true});
+        return;
+      }
+      // 没在导航: 推一张静态图当底图, 先看清楚再决定用不用它启动导航
+      send({t:'preview_map',name:m.name});};   // 成功/失败由后端回 toast, 这里不抢话
+    L.append(row);
+  }
+}
+
+/* ============ 地图编辑器 ============
+   目的: 建图录进去的东西搬走了、或者地面被误判成障碍, 直接在图上改掉,
+   不用重新建图(重建一次要走一圈, 还未必更好)。
+
+   【三个值不能含糊】PGM 只有三种状态, 后端 edit_png_to_pgm 按灰度分类回写:
+   >200 自由(254) / <80 占据(0) / 其余未知(205)。所以画的时候必须**正好**落在
+   255/0/128 这三个值上 —— 这就是为什么下面全部用整数 fillRect / 直接写
+   ImageData, 一处都不用 canvas 的 stroke: 描边是抗锯齿的, 边缘会出中间灰度,
+   存回去就变成一圈"未知", 图上看着像描了一道毛边。
+
+   【为什么自己维护 cells 而不是每次读画布】ImageData 是唯一的真相来源太慢
+   (每次落笔都要 getImageData)。这里 cells(每格1字节) + img(RGBA) 双份同步,
+   落笔只改脏矩形, putImageData 也只提交脏矩形。 */
+const MATC=[128,255,0];          // 0=未知(灰) 1=自由(白) 2=障碍(黑)
+const MATN=['未知','可通行','障碍'];
+const ED={open:false,name:'',pending:'',w:0,h:0,res:0.05,ox:0,oy:0,
+  cells:null,img:null,off:null,octx:null,ctx:null,vw:1,vh:1,
+  view:{tx:0,ty:0,s:1},
+  tool:'brush',mat:2,size:5,pan:false,grid:true,
+  undo:[],redo:[],dirty:false,
+  snap:null,sbox:null,fbox:{x0:1e9,y0:1e9,x1:-1,y1:-1},
+  drag:null,g:null,pen:false,hover:null};
+
+function edRequest(name){
+  ED.pending=name;
+  toast('正在载入 '+name+' …');
+  send({t:'load_map_edit',name});
+}
+/* 收到 B_MAP_EDIT(t=7) 的精确三色图后进这里 */
+function edOpen(meta,img){
+  ED.w=meta.w;ED.h=meta.h;ED.res=meta.res||0.05;
+  ED.ox=meta.ox||0;ED.oy=meta.oy||0;
+  ED.name=meta.name||ED.pending||'';
+  const off=document.createElement('canvas');
+  off.width=ED.w;off.height=ED.h;
+  const octx=off.getContext('2d',{willReadFrequently:true});
+  octx.imageSmoothingEnabled=false;octx.drawImage(img,0,0);
+  ED.off=off;ED.octx=octx;
+  ED.img=octx.getImageData(0,0,ED.w,ED.h);
+  const d=ED.img.data,n=ED.w*ED.h;
+  ED.cells=new Uint8Array(n);
+  for(let i=0;i<n;i++){
+    const g=d[i<<2],v=g>200?1:(g<80?2:0);
+    ED.cells[i]=v;
+    const c=MATC[v],o=i<<2;
+    d[o]=d[o+1]=d[o+2]=c;d[o+3]=255;      // 归一化: PNG 解码可能带出别的值
+  }
+  octx.putImageData(ED.img,0,0);
+  ED.undo=[];ED.redo=[];ED.dirty=false;ED.snap=null;ED.sbox=null;ED.drag=null;ED.g=null;
+  ED.fbox={x0:1e9,y0:1e9,x1:-1,y1:-1};
+  ED.open=true;
+  go('edit');
+  edRenderTools();edResize();edFit();
+  if(localStorage.getItem('edges1')!=='1')$('edHint').classList.add('show');
+}
+function edReload(){
+  if(ED.dirty&&!confirm('放弃当前所有修改, 重新载入原图?'))return;
+  edRequest(ED.name);
+}
+
+/* ---- 视图 ---- */
+function edResize(){
+  const cv=$('edCv');if(!cv)return;
+  const r=cv.getBoundingClientRect();
+  /* 分母绝不能兜成 1: 3D 视图那次就是 clientHeight||1 把 1 像素当成 19.66m,
+     轻轻一拖飞出去几公里。这里按 rect -> clientWidth -> 窗口 逐级兜底。 */
+  ED.vw=Math.max(2,Math.round(r.width||cv.clientWidth||innerWidth));
+  ED.vh=Math.max(2,Math.round(r.height||cv.clientHeight||(innerHeight-54)));
+  cv.width=ED.vw*DPR;cv.height=ED.vh*DPR;
+  ED.ctx=cv.getContext('2d');
+  edDraw();
+}
+function edMinScale(){return Math.min(ED.vw/ED.w,ED.vh/ED.h)*0.4;}
+function edFit(){
+  if(!ED.w)return;
+  const s=Math.min(ED.vw/ED.w,ED.vh/ED.h)*0.92;
+  ED.view={s,tx:(ED.vw-ED.w*s)/2,ty:(ED.vh-ED.h*s)/2};
+  edDraw();edSyncTools();
+}
+/* 以 (cx,cy) 为锚点缩放: 手指/光标按住的那一格不动。只算数, 画由调用方负责。 */
+function edZoom(f,cx,cy){
+  const s=Math.max(edMinScale(),Math.min(80,ED.view.s*f)),k=s/ED.view.s;
+  ED.view.tx=cx-(cx-ED.view.tx)*k;
+  ED.view.ty=cy-(cy-ED.view.ty)*k;
+  ED.view.s=s;
+}
+function edZoomUI(f,cx,cy){edZoom(f,cx,cy);edDraw();edSyncTools();}
+
+function edDraw(){
+  const c=ED.ctx;if(!c||!ED.off)return;
+  const {tx,ty,s}=ED.view,W=ED.vw,H=ED.vh;
+  c.setTransform(DPR,0,0,DPR,0,0);
+  c.clearRect(0,0,W,H);
+  c.imageSmoothingEnabled=false;          // 放大时要看得见"格", 不要糊成一片
+  c.drawImage(ED.off,tx,ty,ED.w*s,ED.h*s);
+  c.strokeStyle='#7f8ca066';c.lineWidth=1;
+  c.strokeRect(tx-.5,ty-.5,ED.w*s+1,ED.h*s+1);
+  const L=Math.max(tx,0),R=Math.min(tx+ED.w*s,W),T=Math.max(ty,0),B=Math.min(ty+ED.h*s,H);
+  if(ED.grid&&s>=9){                      // 一格不到 9px 就画成一团黑, 不如不画
+    const x0=Math.max(0,Math.floor(-tx/s)),x1=Math.min(ED.w,Math.ceil((W-tx)/s));
+    const y0=Math.max(0,Math.floor(-ty/s)),y1=Math.min(ED.h,Math.ceil((H-ty)/s));
+    c.beginPath();c.strokeStyle='#7f8ca047';
+    for(let x=x0;x<=x1;x++){const p=Math.round(tx+x*s)+.5;c.moveTo(p,T);c.lineTo(p,B);}
+    for(let y=y0;y<=y1;y++){const p=Math.round(ty+y*s)+.5;c.moveTo(L,p);c.lineTo(R,p);}
+    c.stroke();
+  }
+  const m=Math.max(1,Math.round(1/ED.res));   // 1 米 = 多少格
+  if(ED.grid&&s*m>=22){                       // 米线: 描绘时判断真实尺寸全靠它
+    const x0=Math.max(0,Math.floor(-tx/s/m)*m),y0=Math.max(0,Math.floor(-ty/s/m)*m);
+    c.beginPath();c.strokeStyle='#7f8ca066';
+    for(let x=x0;x<=ED.w;x+=m){const p=Math.round(tx+x*s)+.5;
+      if(p>=-1&&p<=W+1){c.moveTo(p,T);c.lineTo(p,B);}}
+    for(let y=y0;y<=ED.h;y+=m){const p=Math.round(ty+y*s)+.5;
+      if(p>=-1&&p<=H+1){c.moveTo(L,p);c.lineTo(R,p);}}
+    c.stroke();
+  }
+  const d=ED.drag;
+  if(d&&!d.pan&&(ED.tool==='line'||ED.tool==='rect')){   // 未落笔的预览
+    c.save();c.strokeStyle=ED.mat===2?'#ec4b4b':(ED.mat===1?'#17b978':'#f5a524');
+    c.lineWidth=2;c.setLineDash([6,4]);
+    if(ED.tool==='rect'){
+      const a=Math.min(d.x0,d.x),b=Math.min(d.y0,d.y);
+      c.strokeRect(tx+a*s,ty+b*s,(Math.abs(d.x-d.x0)+1)*s,(Math.abs(d.y-d.y0)+1)*s);
+    }else{
+      c.beginPath();c.moveTo(tx+(d.x0+.5)*s,ty+(d.y0+.5)*s);
+      c.lineTo(tx+(d.x+.5)*s,ty+(d.y+.5)*s);c.stroke();
+    }
+    c.restore();
+  }
+  if(ED.hover&&!ED.pan&&ED.tool!=='fill'&&s>=3){         // 笔刷落点圈
+    const [hx,hy]=ED.hover,r=ED.size*s/2;
+    c.save();c.strokeStyle='#4d92ffcc';c.lineWidth=1.5;
+    c.beginPath();c.arc(tx+(hx+.5)*s,ty+(hy+.5)*s,Math.max(3,r),0,7);c.stroke();c.restore();
+  }
+}
+
+/* ---- 落笔(全部整数写入, 不经过任何抗锯齿路径) ---- */
+function edMark(x,y){
+  const f=ED.fbox;
+  if(x<f.x0)f.x0=x;if(x>f.x1)f.x1=x;if(y<f.y0)f.y0=y;if(y>f.y1)f.y1=y;
+  const b=ED.sbox;
+  if(b){if(x<b.x0)b.x0=x;if(x>b.x1)b.x1=x;if(y<b.y0)b.y0=y;if(y>b.y1)b.y1=y;}
+}
+function edSet(x,y,v){
+  if(x<0||y<0||x>=ED.w||y>=ED.h)return;
+  const i=y*ED.w+x;if(ED.cells[i]===v)return;
+  ED.cells[i]=v;
+  const d=ED.img.data,o=i<<2,g=MATC[v];
+  d[o]=d[o+1]=d[o+2]=g;d[o+3]=255;
+  edMark(x,y);
+}
+function edFlush(){                       // 只把脏矩形提交到离屏画布
+  const b=ED.fbox;if(b.x1<b.x0)return;
+  ED.octx.putImageData(ED.img,0,0,b.x0,b.y0,b.x1-b.x0+1,b.y1-b.y0+1);
+  ED.fbox={x0:1e9,y0:1e9,x1:-1,y1:-1};
+}
+function edStamp(cx,cy,v){
+  const r=(ED.size-1)>>1;
+  if(r<=0){edSet(cx,cy,v);return;}
+  for(let dy=-r;dy<=r;dy++){
+    const dx=Math.floor(Math.sqrt(r*r-dy*dy+0.25));
+    for(let x=cx-dx;x<=cx+dx;x++)edSet(x,cy+dy,v);
+  }
+}
+/* 两次触摸事件之间要补满 —— 手划快了 pointermove 是稀疏的, 不补就画成一串点 */
+function edSeg(x0,y0,x1,y1,v){
+  const n=Math.max(Math.abs(x1-x0),Math.abs(y1-y0));
+  if(!n){edStamp(x0,y0,v);return;}
+  for(let i=0;i<=n;i++)
+    edStamp(Math.round(x0+(x1-x0)*i/n),Math.round(y0+(y1-y0)*i/n),v);
+}
+function edRectFill(x0,y0,x1,y1,v){
+  const a=Math.min(x0,x1),b=Math.max(x0,x1),p=Math.min(y0,y1),q=Math.max(y0,y1);
+  for(let y=p;y<=q;y++)for(let x=a;x<=b;x++)edSet(x,y,v);
+}
+/* 油漆桶: 扫描线洪泛。整间屋子填成可通行, 或者把一块噪点区整片抹掉。 */
+function edFill(sx,sy,v){
+  if(sx<0||sy<0||sx>=ED.w||sy>=ED.h)return;
+  const from=ED.cells[sy*ED.w+sx];
+  if(from===v)return;
+  const st=[sx,sy];
+  while(st.length){
+    const y=st.pop(),x=st.pop(),row=y*ED.w;
+    if(ED.cells[row+x]!==from)continue;
+    let a=x;while(a>0&&ED.cells[row+a-1]===from)a--;
+    let b=x;while(b<ED.w-1&&ED.cells[row+b+1]===from)b++;
+    for(let k=a;k<=b;k++){
+      edSet(k,y,v);
+      if(y>0&&ED.cells[row-ED.w+k]===from)st.push(k,y-1);
+      if(y<ED.h-1&&ED.cells[row+ED.w+k]===from)st.push(k,y+1);
+    }
+  }
+}
+
+/* ---- 撤销栈: 每笔只存改动包围盒的前后两份, 不存整张图 ---- */
+function edBegin(){ED.snap=ED.cells.slice();ED.sbox={x0:1e9,y0:1e9,x1:-1,y1:-1};}
+function edCommit(){
+  if(!ED.snap)return;
+  const b=ED.sbox;ED.sbox=null;
+  if(b.x1<b.x0){ED.snap=null;return;}          // 一格没改, 不入栈
+  const x=b.x0,y=b.y0,w=b.x1-x+1,h=b.y1-y+1;
+  const before=new Uint8Array(w*h),after=new Uint8Array(w*h);
+  for(let j=0;j<h;j++){
+    const s0=(y+j)*ED.w+x,d0=j*w;
+    for(let i=0;i<w;i++){before[d0+i]=ED.snap[s0+i];after[d0+i]=ED.cells[s0+i];}
+  }
+  ED.undo.push({x,y,w,h,before,after});
+  if(ED.undo.length>80)ED.undo.shift();
+  ED.redo.length=0;ED.snap=null;ED.dirty=true;
+  edSyncTools();
+}
+function edRevert(){                            // 双指落下 -> 刚才那一点是误触
+  if(!ED.snap)return;
+  const b=ED.sbox;
+  if(b&&b.x1>=b.x0){
+    for(let y=b.y0;y<=b.y1;y++)for(let x=b.x0;x<=b.x1;x++)edSet(x,y,ED.snap[y*ED.w+x]);
+    edFlush();
+  }
+  ED.snap=null;ED.sbox=null;
+}
+function edPatch(p,key){
+  const buf=p[key];
+  for(let j=0;j<p.h;j++)for(let i=0;i<p.w;i++)edSet(p.x+i,p.y+j,buf[j*p.w+i]);
+  edFlush();ED.dirty=true;edDraw();edSyncTools();
+}
+function edUndo(){
+  const p=ED.undo.pop();
+  if(!p){toast('没有可撤销的了',true);return;}
+  ED.redo.push(p);edPatch(p,'before');
+}
+function edRedo(){
+  const p=ED.redo.pop();
+  if(!p){toast('没有可重做的了',true);return;}
+  ED.undo.push(p);edPatch(p,'after');
+}
+
+/* ---- 保存 ---- */
+/* 后端有没有这个能力。static 页是按 mtime 热重载的、app.py 不是, 所以完全可能
+   出现"新前端 + 旧后端"。这时候不能在对话框里承诺备份 —— 旧后端是直接覆盖的。 */
+function edCap(c){return Array.isArray(S.caps)&&S.caps.indexOf(c)>=0;}
+function edSave(asNew){
+  if(!ED.open||!ED.name){toast('没有打开的地图',true);return;}
+  let target=ED.name;
+  if(asNew){
+    if(!edCap('map_edit_saveas')){
+      toast('后端还是旧版, 不支持另存为 —— 请重启 wheeltec-webapp 服务',true);return;}
+    const v=prompt('另存为新地图(中英文/数字/下划线/减号):',ED.name+'_edit');
+    if(v===null)return;
+    target=v.trim();
+    if(!/^[\w\-一-鿿]{1,64}$/.test(target)){toast('地图名不合法',true);return;}
+  }else if(!confirm(`覆盖保存到 "${ED.name}" ?\n`+(edCap('map_edit_backup')
+      ? '旧图会自动备份到 map/_backup/。'
+      : '⚠️ 后端是旧版, 【不会备份】, 覆盖后原图找不回来。\n'
+        +'建议先重启 wheeltec-webapp 服务再保存。')))return;
+  const b64=ED.off.toDataURL('image/png').split(',')[1];
+  // 后端 websocket 的 max_size 是 1MB, 超了连接会被直接断开(比报错还难查)
+  if(b64.length>900*1024){
+    toast('图太大传不过去('+(b64.length/1024|0)+'KB), 请分块编辑或降低分辨率',true);return;}
+  send({t:'save_map_edit',name:target,src:ED.name,png_b64:b64});
+  ED.dirty=false;ED.name=target;edSyncTools();
+}
+
+/* ---- 工具列 ---- */
+const ED_TOOLS=[
+  ['i-brush','画笔 — 自由描绘',()=>edSetTool('brush'),'brush'],
+  ['i-line','直线 — 按住拖到终点松开(画墙用)',()=>edSetTool('line'),'line'],
+  ['i-rect','矩形 — 拖出一片整体涂改',()=>edSetTool('rect'),'rect'],
+  ['i-fill','油漆桶 — 填满一整块连通区域',()=>edSetTool('fill'),'fill'],
+  null,
+  ['i-undo','撤销',()=>edUndo(),'undo'],
+  ['i-redo','重做',()=>edRedo(),'redo'],
+  null,
+  ['i-hand','单指手势: 画 / 平移',()=>{ED.pan=!ED.pan;edSyncTools();edDraw();},'pan'],
+  ['i-grid','栅格线 + 米线',()=>{ED.grid=!ED.grid;edDraw();edSyncTools();},'grid'],
+  ['i-fit','适应窗口',()=>edFit()],
+  ['i-plus','放大',()=>edZoomUI(1.5,ED.vw/2,ED.vh/2)],
+  ['i-minus','缩小',()=>edZoomUI(1/1.5,ED.vw/2,ED.vh/2)],
+];
+function edSetTool(t){ED.tool=t;edSyncTools();edDraw();}
+function edRenderTools(){
+  const box=$('edTools');if(!box)return;
+  box.innerHTML='';
+  for(const it of ED_TOOLS){
+    if(!it){const s=document.createElement('div');s.className='sep';box.append(s);continue;}
+    const [ic,tip,fn,flag]=it;
+    const b=document.createElement('button');
+    b.className='tool';
+    b.innerHTML=`<svg class="ic"><use href="#${ic}"/></svg>`;
+    if(flag)b.dataset.flag=flag;
+    b.onclick=fn;bindTip(b,tip);
+    box.append(b);
+  }
+  $('edSize').oninput=e=>{ED.size=+e.target.value;edSyncTools();edDraw();};
+  document.querySelectorAll('#edBar .mat').forEach(el=>{
+    el.onclick=()=>{ED.mat=+el.dataset.m;edSyncTools();edDraw();};
+  });
+  $('edDoSave').onclick=()=>edSave(false);
+  $('edDoSaveAs').onclick=()=>edSave(true);
+  $('edDoReload').onclick=()=>edReload();
+  edSyncTools();
+}
+/* 桌面上顺手支持 Ctrl+Z / Ctrl+Shift+Z(或 Ctrl+Y) —— 平板用右侧按钮 */
+addEventListener('keydown',e=>{
+  if(UI.route!=='edit'||!(e.ctrlKey||e.metaKey))return;
+  const k=e.key.toLowerCase();
+  if(k==='z'){e.preventDefault();e.shiftKey?edRedo():edUndo();}
+  else if(k==='y'){e.preventDefault();edRedo();}
+  else if(k==='s'){e.preventDefault();edSave(false);}
+});
+function edSyncTools(){
+  const box=$('edTools');if(!box)return;
+  const on=(f,v)=>{const b=box.querySelector(`[data-flag=${f}]`);if(b)b.classList.toggle('on',!!v);};
+  on('brush',ED.tool==='brush');on('line',ED.tool==='line');
+  on('rect',ED.tool==='rect');on('fill',ED.tool==='fill');
+  on('pan',ED.pan);on('grid',ED.grid);
+  const dim=(f,v)=>{const b=box.querySelector(`[data-flag=${f}]`);
+    if(b)b.style.opacity=v?1:.35;};
+  dim('undo',ED.undo.length);dim('redo',ED.redo.length);
+  const ph=box.querySelector('[data-flag=pan]');
+  if(ph){ph.innerHTML=`<svg class="ic"><use href="#${ED.pan?'i-hand':'i-brush'}"/></svg>`;
+    bindTip(ph,ED.pan?'单指=平移(点一下改回画)':'单指=画(点一下改成平移)');}
+  document.querySelectorAll('#edBar .mat').forEach(el=>
+    el.classList.toggle('on',+el.dataset.m===ED.mat));
+  $('edSize').value=ED.size;
+  $('edSizeV').textContent=ED.size+'格·'+(ED.size*ED.res*100).toFixed(0)+'cm';
+  $('edNameT').textContent=ED.name||'';
+  $('edNameS').textContent=`${ED.w}×${ED.h} · ${ED.res}m/格`
+    +(ED.dirty?' · 未保存':'')+` · ${MATN[ED.mat]}`;
+  $('edName').classList.toggle('dirty',ED.dirty);
+  edStatus();
+}
+function edStatus(){
+  const z=$('edZoom');if(!z)return;
+  z.textContent=ED.view.s.toFixed(1)+' px/格';
+  const h=ED.hover;
+  $('edPos').textContent=(h&&h[0]>=0&&h[0]<ED.w&&h[1]>=0&&h[1]<ED.h)
+    ? `(${(ED.ox+h[0]*ED.res).toFixed(2)}, ${(ED.oy+(ED.h-1-h[1])*ED.res).toFixed(2)})m` : '';
+}
+$('edHintOk').onclick=()=>{localStorage.setItem('edges1','1');
+  $('edHint').classList.remove('show');};
+
+/* ---- 手势 ----
+   单指=画(或平移), 双指=平移+捏合缩放, 双击=适应窗口。不做旋转: 图一转,
+   "这一格在哪"就得在脑子里换算, 描绘反而更难对准。
+   pointer 事件管单指/鼠标/触控笔, touch 事件专管双指 —— 和导航页那套一致。 */
+(function(){
+  const cv=$('edCv');if(!cv)return;
+  const pos=e=>{const r=cv.getBoundingClientRect();
+    return [e.clientX-r.left,e.clientY-r.top];};
+  const cell=(sx,sy)=>[Math.floor((sx-ED.view.tx)/ED.view.s),
+                       Math.floor((sy-ED.view.ty)/ED.view.s)];
+  cv.addEventListener('pointerdown',e=>{
+    if(!ED.open||ED.g)return;                      // 双指手势进行中, 单指一律不理
+    if(e.pointerType==='touch'&&ED.pen)return;     // 触控笔在用 -> 忽略手掌
+    if(e.pointerType==='pen')ED.pen=true;
+    try{cv.setPointerCapture(e.pointerId);}catch(_){}   // 指针已抬起时会抛, 不影响画
+    const [sx,sy]=pos(e);
+    // 触控笔永远是画; 手指/鼠标看"单指模式"; 鼠标中键/右键永远是平移
+    if(e.pointerType!=='pen'&&(ED.pan||e.button===1||e.button===2)){
+      ED.drag={pan:true,sx,sy};return;}
+    const [cx,cy]=cell(sx,sy);
+    ED.drag={pan:false,x0:cx,y0:cy,x:cx,y:cy};
+    if(ED.tool==='brush'){edBegin();edStamp(cx,cy,ED.mat);edFlush();}
+    else if(ED.tool==='fill'){
+      edBegin();edFill(cx,cy,ED.mat);edFlush();edCommit();ED.drag=null;}
+    edDraw();
+  });
+  cv.addEventListener('pointermove',e=>{
+    if(!ED.open)return;
+    const [sx,sy]=pos(e);
+    ED.hover=cell(sx,sy);
+    if(ED.g||!ED.drag){edStatus();if(!ED.g&&ED.view.s>=3)edDraw();return;}
+    if(ED.drag.pan){
+      ED.view.tx+=sx-ED.drag.sx;ED.view.ty+=sy-ED.drag.sy;
+      ED.drag.sx=sx;ED.drag.sy=sy;edDraw();return;}
+    const [cx,cy]=ED.hover;
+    if(ED.tool==='brush'){edSeg(ED.drag.x,ED.drag.y,cx,cy,ED.mat);edFlush();}
+    ED.drag.x=cx;ED.drag.y=cy;
+    edDraw();edStatus();
+  });
+  const up=e=>{
+    if(e&&e.pointerType==='pen')ED.pen=false;
+    const d=ED.drag;if(!d)return;
+    ED.drag=null;
+    if(!d.pan){
+      if(ED.tool==='line'){edBegin();edSeg(d.x0,d.y0,d.x,d.y,ED.mat);edFlush();edCommit();}
+      else if(ED.tool==='rect'){edBegin();edRectFill(d.x0,d.y0,d.x,d.y,ED.mat);
+        edFlush();edCommit();}
+      else if(ED.tool==='brush')edCommit();
+    }
+    edDraw();
+  };
+  cv.addEventListener('pointerup',up);
+  cv.addEventListener('pointercancel',()=>{
+    if(ED.drag&&!ED.drag.pan){edRevert();}
+    ED.drag=null;ED.pen=false;edDraw();});
+  cv.addEventListener('contextmenu',e=>e.preventDefault());
+  cv.addEventListener('wheel',e=>{e.preventDefault();
+    const [sx,sy]=pos(e);edZoomUI(e.deltaY<0?1.18:1/1.18,sx,sy);},{passive:false});
+  cv.addEventListener('dblclick',e=>{e.preventDefault();edFit();});
+
+  const two=e=>{const a=e.touches[0],b=e.touches[1],r=cv.getBoundingClientRect();
+    return {d:Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY),
+            x:(a.clientX+b.clientX)/2-r.left,y:(a.clientY+b.clientY)/2-r.top};};
+  /* passive:false 是必须的: pad 上内核会在第一个 touchmove 之前就决定这串手势
+     归谁, 不在 touchstart 里 preventDefault 就被判给页面滚动了。 */
+  cv.addEventListener('touchstart',e=>{
+    if(e.touches.length<2)return;
+    e.preventDefault();
+    if(ED.drag&&!ED.drag.pan)edRevert();     // 第二根手指落下 = 刚画的那点是误触
+    ED.drag=null;ED.g=two(e);edDraw();
+  },{passive:false});
+  cv.addEventListener('touchmove',e=>{
+    if(e.touches.length!==2)return;
+    e.preventDefault();
+    // 手指数变了就重新取基准, 而不是把整串手势丢掉(双指松成单指再落回来还能接着用)
+    if(!ED.g){ED.g=two(e);return;}
+    const n=two(e);
+    if(ED.g.d>0)edZoom(n.d/ED.g.d,n.x,n.y);   // 以两指中点为锚点
+    ED.view.tx+=n.x-ED.g.x;ED.view.ty+=n.y-ED.g.y;
+    ED.g=n;edDraw();edStatus();
+  },{passive:false});
+  const tend=e=>{
+    if(e.touches.length===2){ED.g=two(e);return;}   // 三指松成两指 -> 重新取基准
+    if(e.touches.length<2)ED.g=null;
+  };
+  cv.addEventListener('touchend',tend);
+  cv.addEventListener('touchcancel',tend);
+})();
+
+/* 存图的两个前提, 缺哪个就把哪个说清楚 —— 之前按钮直接灰掉, 看不出为什么 */
+function blockReason(){
+  if(S.running||S.stopping||S.external)
+    return `当前有任务在运行(${TITLES[S.mode==='navigation'?'nav':'map']||S.mode})。`
+         + 'MID360 的存图是独立的一步, 后端不允许两个任务并存 —— 请先「关闭导航/建图」再来。';
+  if(!S.pcd_count)
+    return '没有可用的点云分段。建图要先跑起来、遥控走一圈, 再**停止建图**'
+         + '(停止那一刻才落盘), 然后才能存图。';
+  return '';
+}
+function dlgSaveMap(){
+  openDlg(`<h3><svg class="ic"><use href="#i-save"/></svg>保存地图
+      <span class="x"><svg class="ic"><use href="#i-x"/></svg></span></h3>
+    <div class="body">
+      <div class="fld"><label>地图名称</label>
+        <input type="text" id="mapName" value="WHEELTEC3D" placeholder="中英文/数字/下划线"></div>
+      <p style="font-size:12px;color:var(--dim)">
+        当前 PCD 分段 <b>${S.pcd_count||0}</b> 个。转换约需十几秒, 完成后自动加载预览。
+        同名会覆盖 —— 想留旧图请换个名字。</p>
+      ${blockReason()?`<p style="font-size:12px;color:var(--err)">${blockReason()}</p>`:''}
+    </div>
+    <div class="foot"><button class="x">取消</button>
+      <button class="primary" id="doSave">开始转换</button></div>`,()=>{
+    $('doSave').disabled=!!blockReason();
+    $('doSave').onclick=()=>{
+      const b=blockReason(); if(b){toast(b,true);return;}
+      const n=$('mapName').value.trim()||'WHEELTEC3D';
+      freshMap=n;
+      send({t:'start',sensor:'mid360',mode:'save_map',map_name:n});
+      speak('save_map');closeDlg();
+      // 存图结束后端会推 maps, 这里再补一次主动拉取(双保险: 不依赖单一路径)
+      setTimeout(()=>send({t:'list_maps',sensor:'mid360'}),20000);
+    };
+  });
+}
+/* 设置(整页) */
+function renderSetPage(){
+  const w=(S.wifi||{}).ap||{};
+  $('pgSet').innerHTML=`
+    <div class="card"><h4><svg class="ic"><use href="#i-gear"/></svg>语音与提示</h4>
+      <div class="in">
+        <div class="sw"><div class="t">语音播报<small>任务启停、到达、失败、低电量等</small></div>
+          <div class="tgl ${UI.sound?'on':''}" id="tSound"></div></div>
+      </div></div>
+    <div class="card"><h4><svg class="ic"><use href="#i-ap"/></svg>WiFi 热点</h4>
+      <div class="in">
+        <div class="sw"><div class="t">热点开关<small id="apInfo">--</small></div>
+          <div class="tgl" id="tAp"></div></div>
+        <p style="font-size:11px;color:var(--dim);margin:6px 0 0">
+          热点做在独立的 USB 网卡上, 开关它不影响走 WiFi/有线的连接。
+          首次开启约需 1~2 分钟。</p>
+      </div></div>
+    <div class="card"><h4><svg class="ic"><use href="#i-nav"/></svg>遥控速度</h4>
+      <div class="in">
+        <div class="fld"><label>线速度(前后推) <b id="lsvx">--</b></label>
+          <input type="range" id="rsvx" min="0.05" max="0.7" step="0.05"></div>
+        <div class="fld"><label>角速度(左右推) <b id="lswz">--</b></label>
+          <input type="range" id="rswz" min="0.2" max="1.5" step="0.1"></div>
+        <p style="font-size:11px;color:var(--dim);margin:0">
+          只影响摇杆。自动导航的速度在「导航 → 导航参数」里, 两者互不相干。</p>
+      </div></div>
+    <div class="card"><h4><svg class="ic"><use href="#i-lib"/></svg>关于</h4>
+      <div class="in" style="font-size:12px;color:var(--dim)">
+        MID360s + FAST-LIO2 建图导航 · 新版控制台 (/v2)<br>
+        老版界面仍在 <a href="/" style="color:var(--accent)">/</a>, 出问题可随时退回。
+      </div></div>`;
+  $('apInfo').textContent=w.up?`${w.ssid||''} ${w.ip||''} · ${w.clients||0}台已连`:'未开启';
+  $('tAp').classList.toggle('on',!!w.up);
+  $('tSound').onclick=()=>{UI.sound=!UI.sound;localStorage.setItem('v2sound',UI.sound?'1':'0');
+    $('tSound').classList.toggle('on',UI.sound);if(UI.sound)speak('sound_on');};
+  $('tAp').onclick=()=>{const on=!$('tAp').classList.contains('on');
+    $('tAp').classList.toggle('on',on);send({t:'ap_power',on});
+    toast(on?'正在开启热点(约需1~2分钟)':'正在关闭热点');};
+  $('rsvx').value=UI.vx; $('rswz').value=UI.wz;
+  const sy=()=>{$('lsvx').textContent=(+$('rsvx').value).toFixed(2)+' m/s';
+                $('lswz').textContent=(+$('rswz').value).toFixed(1)+' rad/s';};
+  $('rsvx').oninput=()=>{UI.vx=+$('rsvx').value;localStorage.setItem('v2vx',UI.vx);sy();};
+  $('rswz').oninput=()=>{UI.wz=+$('rswz').value;localStorage.setItem('v2wz',UI.wz);sy();};
+  sy();
+}
+
+
+/* ============ 任务启停 ============ */
+function startTask(mode){
+  if(busy()){toast('已有任务在运行, 先停止',true);return;}
+  const args={t:'start',sensor:'mid360',mode};
+  if(mode==='navigation'&&UI.selMap)args.map_name=UI.selMap;
+  send(args);
+}
+function stopTask(){ send({t:'stop'}); }
+
+/* ============ 摇杆 ============
+   **必须按固定周期重发 cmd_vel**: 后端有 0.6s 断流看门狗(WiFi掉线时自动刹车),
+   而手按住不动是不产生 pointermove 的 —— 只在 move 里发的话, 稳住摇杆两秒
+   就会被判定成"信号中断, 已自动刹车"。老界面用的也是 100ms 定时器。 */
+(function(){
+  const j=$('joy'),k=$('joyKnob');
+  let act=false,cx=0,cy=0,R=56,vec=[0,0],timer=null;
+  const apply=(dx,dy)=>{
+    const d=Math.hypot(dx,dy);if(d>R){dx*=R/d;dy*=R/d;}
+    k.style.transform=`translate(${dx}px,${dy}px)`;
+    vec=[dx/R,-dy/R];
+  };
+  const start=e=>{
+    if(!S.running&&!S.external){
+      toast('底盘没在运行, 遥控无效 —— 先启动导航或建图',true);return;}
+    act=true;j.classList.add('act');
+    const r=j.getBoundingClientRect();
+    cx=r.left+r.width/2;cy=r.top+r.height/2;R=r.width/2-34;
+    move(e);
+    clearInterval(timer);
+    timer=setInterval(()=>{
+      if(!act)return;
+      send({t:'cmd_vel',vx:vec[1]*UI.vx,wz:-vec[0]*UI.wz});
+    },100);
+  };
+  const move=e=>{if(!act)return;const p=e.touches?e.touches[0]:e;
+    apply(p.clientX-cx,p.clientY-cy);};
+  const end=()=>{if(!act)return;act=false;j.classList.remove('act');
+    clearInterval(timer);timer=null;vec=[0,0];
+    k.style.transform='';send({t:'cmd_stop'});};
+  j.addEventListener('touchstart',e=>{e.preventDefault();start(e);},{passive:false});
+  j.addEventListener('touchmove',e=>{e.preventDefault();move(e);},{passive:false});
+  j.addEventListener('touchend',end);j.addEventListener('touchcancel',end);
+  j.addEventListener('mousedown',start);
+  addEventListener('mousemove',move);addEventListener('mouseup',end);
+  addEventListener('blur',end);         // 切走页面也要刹车
+})();
+
+/* ============ 相机 ============ */
+let camUrl=null,camN=0,camT=Date.now();
+function showCam(buf){
+  const blob=new Blob([new Uint8Array(buf,1)],{type:'image/jpeg'});
+  const url=URL.createObjectURL(blob);
+  const set=el=>{if(el)el.src=url;};
+  set($('pipImg'));if(UI.pipMain)set($('camFullImg'));
+  if(camUrl)URL.revokeObjectURL(camUrl);camUrl=url;
+  $('pipHint').style.display='none';
+  if(++camN>=10){const now=Date.now();
+    $('pipFps').textContent=(camN*1000/(now-camT)).toFixed(0)+' fps';camN=0;camT=now;}
+}
+
+/* ============ 语音播报 ============
+   音频由 tools/gen_voice.py 用 edge-tts **离线预生成**在 static/voice/<key>.mp3,
+   浏览器只播 <audio> —— 红米平板那类系统浏览器的 WebView 没有 TTS 引擎,
+   speechSynthesis 是静默不出声的, 所以不能反过来"以 TTS 为主、音频为辅"。
+   speechSynthesis 只作为音频拿不到时的兜底。
+
+   **key 就是文件名**, 没有别名表。新增一条: 在下表加一行 + 在 gen_voice.py 的
+   PHRASES 加同名一行, 重跑脚本 + colcon build。下表的文本要和音频念的一致 ——
+   它既是给读代码的人看的, 也是兜底 TTS 真正会念的那句。 */
+const SPEAK={
+  // 任务起停: S.mode 的四种取值 × 起/停, 由 state 跃迁自动触发, 八条都得有,
+  // 少一条那次跃迁就是哑的(以前 save_map/lidar_test 的停止就没有)
+  start_navigation:'导航已启动', stop_navigation:'导航已关闭',
+  start_mapping:'建图已启动',   stop_mapping:'建图已结束',
+  start_save_map:'开始保存地图',
+  start_lidar_test:'雷达测试已启动', stop_lidar_test:'雷达测试已结束',
+  /* 存图**没有** stop_save_map: 转图进程退出不等于转图成功(pcd2pgm 失败时照样退出),
+     报"地图已保存"就成了谎报。改用日志里 pcd2pgm 真的写完盘那句话触发 map_saved,
+     见 pushLog。stop_save_map.mp3 已生成但留着不用。 */
+  // 导航过程
+  goal_sent:'目标已下发', go_home:'正在返回起点',
+  arrived:'已到达目标',   nav_failed:'导航失败',
+  nav_canceled:'导航已取消', nav_rejected:'目标被拒绝',
+  cruise_start:'开始巡航', cruise_done:'巡航完成',
+  // 状态提示
+  save_map:'开始保存地图', map_saved:'地图已保存', estop:'急停',
+  relocalized:'重新定位成功', reloc_lost:'定位丢失, 正在重新定位',
+  low_battery:'电量偏低, 请及时充电', sound_on:'语音播报已开启',
+  obstacle:'前方有障碍',      // 预留给超声波急停(ROS侧还没接, 见 CLAUDE.md 5.7 末尾)
+};
+/* 航点进度是动态的: wp_1..wp_30 已预生成, 超出用 wp_generic 兜底 */
+function speakInfo(key){
+  if(SPEAK[key])return {file:key,txt:SPEAK[key]};
+  const m=/^wp_(\d+)$/.exec(key);
+  if(m)return {file:+m[1]<=30?key:'wp_generic', txt:'到达第'+m[1]+'个航点'};
+  return null;
+}
+/* 移动端要求音频的首次播放发生在用户手势里, 之后**同一个元素**才能被脚本播放。
+   所以整页共用一个 <audio>, 并在首次点击时静音预热解锁 —— 每次 new Audio()
+   是解锁不了的, 那正是老版界面踩过的坑。 */
+const Voice={
+  _el:null, _primed:false, _last:0,
+  el(){ if(!this._el){this._el=new Audio();this._el.preload='auto';} return this._el; },
+  prime(){
+    if(this._primed)return; this._primed=true;
+    const a=this.el();
+    try{ a.src='/voice/voice_on.mp3'; a.volume=0;
+         const p=a.play(); if(p)p.then(()=>{a.pause();a.currentTime=0;}).catch(()=>{});
+    }catch(e){}
+  },
+};
+['pointerdown','touchstart','click'].forEach(ev=>
+  window.addEventListener(ev,()=>Voice.prime(),{once:true,capture:true}));
+function speak(key){
+  if(!UI.sound)return;
+  if(Date.now()-wsOpenAt<1500)return;     // 刚连上补发的是历史状态, 不播报
+  const info=speakInfo(key); if(!info)return;
+  const now=Date.now(); if(now-Voice._last<900)return; Voice._last=now;
+  const a=Voice.el();
+  try{
+    a.pause(); a.src='/voice/'+info.file+'.mp3';
+    a.volume=1;               // 不额外衰减, 响度跟随系统音量(prime 时置过 0)
+    a.currentTime=0;
+    const p=a.play();
+    if(p)p.catch(()=>{ if(window.speechSynthesis){
+      const u=new SpeechSynthesisUtterance(info.txt);u.lang='zh-CN';
+      speechSynthesis.speak(u);} });
+  }catch(e){}
+}
+/* 电量偏低播报(每5分钟最多一次)。阈值按实际读数区分 12V / 24V 电池包 ——
+   本车 S100_diff 是 24V 包(空载 22~23V), 写死 10.5 的话永远播不出来。 */
+const BAT=v=>v>18?{err:21.0,warn:22.4,lo:20.0,hi:26.0}:{err:10.5,warn:11.2,lo:10.0,hi:13.0};
+let lastBat=0;
+setInterval(()=>{
+  if(S.voltage!=null&&S.voltage<BAT(S.voltage).err&&Date.now()-lastBat>3e5){
+    lastBat=Date.now();speak('low_battery');}
+},10000);
+
+/* ============ 杂项 ============ */
+let logN=0;
+/* 有几条状态只在节点日志里出现, 后端没有对应的 WS 消息 —— 从日志文本认。
+   auto_relocalize 的原话见 wheeltec_fastlio/src/auto_relocalize.cpp:
+     "重定位成功: x=.. y=.. yaw=.. score=.."          (成功一次刷一条)
+     "..判定定位丢失(小车可能被移动), 触发全局重定位"  (看门狗触发)
+   注意别顺手写成 /重定位/ —— 每30秒那条"定位健康度…触发重定位"也含这两个字。 */
+let _lastReloc=0;
+function logVoice(line){
+  if(!UI.sound)return;
+  if(/重定位成功/.test(line)){                       // 日志里会连刷好几条, 5秒内只念一次
+    if(Date.now()-_lastReloc>5000){_lastReloc=Date.now();speak('relocalized');} return;
+  }
+  if(/判定定位丢失/.test(line))speak('reloc_lost');
+  else if(/地图已保存/.test(line))speak('map_saved');
+}
+function pushLog(line){
+  logVoice(line);
+  const b=$('logBody');const d=document.createElement('div');
+  if(/ERROR|错误|失败/.test(line))d.className='e';
+  else if(/WARN|警告/.test(line))d.className='w';
+  d.textContent=line;b.append(d);
+  while(b.childElementCount>200)b.firstChild.remove();
+  b.scrollTop=b.scrollHeight;
+  $('logCnt').textContent='· '+(++logN);
+}
+let toastT=null;
+function toast(msg,err){
+  const t=$('toast');t.textContent=msg;t.className='show'+(err?' err':'');
+  clearTimeout(toastT);toastT=setTimeout(()=>t.className='',2600);
+}
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function fmtTime(ts){
+  if(!ts)return '';
+  const d=new Date(ts*1000),p=n=>String(n).padStart(2,'0');
+  return `${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+// 秒表要一直走(哪怕位姿断了), 所以留一个每秒的轻量刷新; 面板结构不重建
+setInterval(()=>{if(UI.panel)updatePanelLive();},1000);
+/* 收起画面时顺便告诉后端别推了 —— 640x480@30 的 JPEG 流白占带宽和 CPU */
+$('pipFold').onclick=()=>{
+  const p=$('pip'),fold=!p.classList.contains('fold');
+  p.classList.toggle('fold',fold);
+  $('pipFold').textContent=fold?'+':'—';
+  send({t:'cam',on:!fold});
+  if(fold&&UI.pipMain){UI.pipMain=false;}     // 收起时不该还占着主画面
+  layout();
+};
+$('logMin').onclick=()=>{const b=$('logBox');b.classList.toggle('min');
+  b.classList.remove('big');$('logMin').textContent=b.classList.contains('min')?'+':'—';};
+$('logBig').onclick=()=>{const b=$('logBox');b.classList.remove('min');
+  b.classList.toggle('big');$('logBig').textContent=b.classList.contains('big')?'⌄':'⌃';
+  $('logBody').scrollTop=$('logBody').scrollHeight;};
+/* 【整页拖动的兜底】只靠 CSS(position:fixed + overscroll-behavior + touch-action)
+   在部分浏览器上堵不住 —— 内核仍会把未被消费的 touchmove 当成页面平移, 表现就是
+   "全屏了还能整页拖动"(2026-08-07 用户反馈)。这里在捕获阶段统一拦截: 只有落在
+   明确可滚动的容器里(标了 touch-action:pan-*)才放行, 其余一律 preventDefault。
+   注意必须 passive:false, 否则 preventDefault 无效。 */
+/* #home 也要在列: 手机上首页是上下堆的(遥测在上、四个入口在下), 整页 overflow:auto,
+   不列进来的话下面的入口卡就滑不到了。宽屏上首页正好一屏、没有滚动余量,
+   下面那个"按实际余量判断"的逻辑会照样把手势拦掉, 不会因此又能拖。 */
+const SCROLLABLE='#logBody,#navPanel,#tools,#edTools,#legend,#hLeft,#home,.page,.dlg .body';
+/* 【关键】"是滚动容器" != "此刻还有滚动余量"。地图页/设置页内容不满一屏时,
+   scrollHeight==clientHeight, 浏览器就把这次手势收回去平移整个页面 —— 而我上一版
+   只要 closest() 匹配到 .page 就放行, 正好把它漏过去了(用户连续反馈两次仍可拖动)。
+   现在改成按**实际余量**判断: 没有余量就一律拦掉。 */
+document.addEventListener('touchmove',e=>{
+  const el=e.target&&e.target.closest?e.target.closest(SCROLLABLE):null;
+  if(el){
+    const canY=el.scrollHeight-el.clientHeight>1;
+    const canX=el.scrollWidth-el.clientWidth>1;
+    if(canY||canX)return;          // 真的还能滚, 放行
+  }
+  if(e.cancelable)e.preventDefault();
+},{passive:false,capture:true});
+/* 双击缩放/长按选中也一并禁掉, 它们同样会让画面"跳一下" */
+document.addEventListener('gesturestart',e=>e.preventDefault());
+document.addEventListener('dblclick',e=>{
+  if(!e.target.closest('#camFull'))e.preventDefault();   // 相机主画面的双击复位要留
+});
+addEventListener('resize',resize);
+go('home');resize();connect();renderAll();
+</script>
+</body>
+</html>

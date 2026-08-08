@@ -1,0 +1,11 @@
+# Goal: start docking toward a specific dock
+string dock_id
+---
+# Result: docking outcome
+bool success
+string message
+---
+# Feedback: progress during docking
+float32 distance_error
+float32 yaw_error
+string state

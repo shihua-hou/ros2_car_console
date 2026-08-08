@@ -39,8 +39,15 @@ void Quaternion_Solution(float gx, float gy, float gz, float ax, float ay, float
   float halfex, halfey, halfez;
   float qa, qb, qc;
   
+  // 只在冻结状态跳变时打一次: 每帧都打会把 launch.log 刷爆(实测47分钟5万余行)
+  static uint8_t last_imu_freeze = 0;
+  if(imu_freeze != last_imu_freeze){
+    last_imu_freeze = imu_freeze;
+    printf("imu data %s\n", imu_freeze ? "freeze" : "resume");
+    fflush(stdout);
+  }
+
   if(imu_freeze){
-  printf("imu data freeze\n");
   return;
   }
   

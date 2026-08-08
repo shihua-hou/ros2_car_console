@@ -200,6 +200,13 @@ canvas#view{position:absolute;inset:0;width:100%;height:100%;display:block}
 .card.collapsed .chev{transform:rotate(-90deg)}
 .card.collapsed .card-body{display:none}
 .card .card-body{margin-top:11px}
+/* 相机实时画面: 卡片折叠起来时前端会通知后端停止编码, 所以不用担心白耗CPU */
+#camWrap{position:relative;width:100%;aspect-ratio:4/3;border-radius:9px;
+  overflow:hidden;background:var(--panel2);display:flex;align-items:center;
+  justify-content:center}
+#camImg{width:100%;height:100%;object-fit:cover;display:none}
+#camImg.on{display:block}
+#camNone{position:absolute;font-size:12px;color:var(--dim2)}
 .tip{font-size:11.5px;color:var(--dim);line-height:1.5;margin-top:10px;
   padding-top:10px;border-top:.5px solid var(--line)}
 .tip code{font-size:10.5px;background:var(--panel2);padding:1.5px 5px;border-radius:5px;
@@ -237,14 +244,10 @@ button.b.tool.active{background:var(--acc);color:#fff;box-shadow:0 2px 10px var(
 /* 传感器下拉: 一个胶囊, 显示当前传感器名 + 在线小圆点, 点开原生下拉切换 */
 .sensor-pick{flex:none;display:inline-flex;align-items:center;gap:6px;
   background:var(--panel2);border-radius:var(--r-pill);padding:0 9px 0 11px;
-  height:29px;cursor:pointer;position:relative}
+  height:29px;cursor:default;user-select:none;position:relative}
 .sensor-pick .dot2{width:6px;height:6px;border-radius:50%;background:var(--dim2);flex:none}
 .sensor-pick.online .dot2{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
-.sensor-pick select{-webkit-appearance:none;appearance:none;border:none;outline:none;
-  background:transparent;color:var(--fg);font:590 12.5px/1 inherit;font-family:inherit;
-  cursor:pointer;padding:0;letter-spacing:-.1px}
-.sensor-pick .chev-i{width:.9em;height:.9em;opacity:.5;pointer-events:none;margin-left:-3px}
-.sensor-pick.busy{opacity:.5;pointer-events:none}
+.sensor-pick #sensorName{color:var(--fg);font:590 12.5px/1 inherit;letter-spacing:-.1px}
 .seg-btn{flex:1;padding:7px 4px;border:none;background:transparent;color:var(--fg);
   font-size:12.5px;font-weight:510;cursor:pointer;border-radius:8px;font-family:inherit;
   letter-spacing:-.1px;transition:background .2s,color .2s,box-shadow .2s}
@@ -502,16 +505,14 @@ button.b.wait{animation:pulse 1s infinite;pointer-events:none}
     <div id="taskInfo">
       <span id="mapChip" style="display:none"></span>
       <span id="poseChip" style="display:none"><svg class="ic"><use href="#i-pin"/></svg> --</span>
-      <!-- 传感器: 只显示当前这一个的名字, 点开下拉才切换(平时靠自动探测选好) -->
-      <label class="sensor-pick" id="sensorPick">
+      <!-- 传感器: 本车只有 MID360s(+Astra相机), N10Plus/Odin1 已 COLCON_IGNORE 归档。
+           2026-08-06 起这里**只是一个状态显示**, 不再是下拉框(只有一个选项的下拉
+           会让人以为还能选)。后端/前端按 sensor 分支的逻辑保留, curSensor 恒为
+           'mid360'; 以后真要加回多传感器, 把这个 span 换回 select 即可。 -->
+      <span class="sensor-pick" id="sensorPick" title="本车传感器">
         <span class="dot2" id="sensorDot"></span>
-        <select id="sensorSel">
-          <option value="mid360">MID360s</option>
-          <option value="n10plus">N10Plus</option>
-          <option value="odin1">Odin1</option>
-        </select>
-        <svg class="ic chev-i"><use href="#i-chev"/></svg>
-      </label>
+        <span id="sensorName">MID360s</span>
+      </span>
     </div>
   </div>
   <div id="main">
@@ -623,6 +624,15 @@ button.b.wait{animation:pulse 1s infinite;pointer-events:none}
     </div>
     <div id="rightPanel" class="side-panel">
       <div class="panel-inner">
+        <div class="card" id="camCard">
+          <h3 class="fold" data-key="cam">
+            <span>实时画面 <small style="font-weight:400" id="camHint">(Astra)</small></span>
+            <i class="chev">⌄</i>
+          </h3>
+          <div class="card-body">
+            <div id="camWrap"><img id="camImg" alt="相机画面"><div id="camNone">等待画面…</div></div>
+          </div>
+        </div>
         <div class="card">
           <h3 class="fold" data-key="teleop">
             <span>遥控速度限制 <small style="font-weight:400">(仅摇杆)</small></span>
@@ -658,7 +668,7 @@ button.b.wait{animation:pulse 1s infinite;pointer-events:none}
           </h3>
           <div class="card-body">
             <div id="logBox"></div>
-            <div class="tip">MID360s: 建图→停止(存PCD)→保存地图→导航 · N10Plus/Odin1: 建图中直接点保存地图→停止→导航；建图与导航互斥</div>
+            <div class="tip">流程: 建图→停止(存PCD)→保存地图→导航；建图与导航互斥。导航自带 Astra 相机避障(低矮障碍), 画面见右上"实时画面"卡片</div>
           </div>
         </div>
         <div class="card">
@@ -744,12 +754,13 @@ const NAV={state:'idle',kind:null,wp_index:0,wp_total:0,dist:null,time:0,recov:0
 const SENSOR_LABEL={mid360:'MID360s',n10plus:'N10Plus',odin1:'Odin1'};
 // 各传感器可用的任务模式; bLidar(雷达测试)目前只有MID360有对应launch
 const SENSOR_HAS_LIDAR_TEST={mid360:true,n10plus:false,odin1:false};
-let curSensor=localStorage.getItem('sensor')||'mid360';
-if(!(curSensor in SENSOR_LABEL))curSensor='mid360';
+let curSensor='mid360';   // 归档 N10Plus/Odin1 后不再切换(见上面 sensorPick 注释)
+localStorage.setItem('sensor','mid360');
 function connect(){
   ws=new WebSocket('ws://'+location.host+'/ws');
   ws.binaryType='arraybuffer';
-  ws.onopen=()=>{connected=true;dot.classList.add('on');toast('已连接小车');requestMapList();};
+  ws.onopen=()=>{connected=true;dot.classList.add('on');toast('已连接小车');requestMapList();
+    if(camIsOpen())setCamWant(true);};   // 断线重连后要重新申请画面(后端按连接状态清标志)
   ws.onclose=()=>{connected=false;dot.classList.remove('on');modeBadge.textContent='离线';
     setTimeout(connect,2000);};
   ws.onerror=()=>ws.close();
@@ -916,30 +927,14 @@ function renderWifi(){
   btn.disabled=!w.ap.exists;
 }
 function renderSensorSeg(){
-  const busy=isBusy();
-  $('sensorSel').value=curSensor;
-  // 探测到当前传感器在线就亮绿点; 每个选项名后缀"· 在线"标记检测状态
+  // 纯状态显示: 绿点=探测到在线, 名字后缀"· 在线"。不可点、不置灰(忙不忙与它无关)。
   const online=!!(S.detected&&S.detected[curSensor]);
   $('sensorPick').classList.toggle('online',online);
-  $('sensorPick').classList.toggle('busy',busy);
-  $('sensorSel').disabled=busy;
-  for(const o of $('sensorSel').options){
-    const on=!!(S.detected&&S.detected[o.value]);
-    o.textContent=SENSOR_LABEL[o.value]+(on?' · 在线':'');
-  }
+  $('sensorName').textContent=SENSOR_LABEL[curSensor]+(online?' · 在线':' · 未检测到');
   $('bLidar').style.display=SENSOR_HAS_LIDAR_TEST[curSensor]?'':'none';
   $('bSave').querySelector('span').textContent=curSensor==='mid360'?'保存地图':'保存地图(建图中)';
 }
-$('sensorSel').onchange=e=>{
-  if(isBusy()){toast('有任务在运行时不能切换传感器，请先停止',true);
-    e.target.value=curSensor;return;}
-  userPickedSensor=true;
-  curSensor=e.target.value;
-  localStorage.setItem('sensor',curSensor);
-  routeLoadedFor=null;   // 换传感器 → 强制重新拉新桶里当前图的巡航路线
-  renderSensorSeg();
-  renderMapList();requestMapList();
-};
+// (传感器已固定为 MID360s, 原来的 sensorSel.onchange 切换逻辑随下拉框一并移除)
 const FRAME_NAME={map:'map',odom:'里程计',lio:'建图'};
 // 坐标胶囊只在导航/建图(有实时位姿)时显示; 空闲时藏起来, 不留旧坐标
 function updatePoseChipVis(){
@@ -1219,6 +1214,37 @@ function zColor(z){ // 高度着色 蓝->青->绿->橙
   const t=Math.max(0,Math.min(1,(z+0.3)/2.1));
   const h=210-t*170;return `hsl(${h},75%,${40+t*8}%)`;
 }
+/* ---- 相机实时画面 ----
+   后端只在卡片展开时才推 JPEG(见 app.py 的 cam_want)。每帧换一次 objectURL,
+   旧的必须 revoke, 否则 5Hz 跑一小时就攒下上万个 blob 把手机浏览器撑爆。 */
+let camUrl=null, camIdleTimer=null;
+function showCamFrame(buf){
+  const blob=new Blob([new Uint8Array(buf,1)],{type:'image/jpeg'});
+  const url=URL.createObjectURL(blob), img=$('camImg');
+  img.onload=()=>{ if(camUrl)URL.revokeObjectURL(camUrl); camUrl=url; };
+  img.src=url; img.classList.add('on'); $('camNone').style.display='none';
+  clearTimeout(camIdleTimer);
+  camIdleTimer=setTimeout(()=>{   // 2秒没新帧 = 相机没开/导航没跑
+    img.classList.remove('on');
+    $('camNone').style.display='';
+    $('camNone').textContent='无画面 (相机未启动?)';
+  },2000);
+}
+function setCamWant(on){
+  send({t:'cam',on:!!on});
+  if(!on){
+    clearTimeout(camIdleTimer);
+    $('camImg').classList.remove('on');
+    $('camNone').style.display='';
+    $('camNone').textContent='已暂停';
+  }else{
+    $('camNone').textContent='等待画面…';
+  }
+}
+function camIsOpen(){
+  const c=document.getElementById('camCard');
+  return !!c && !c.classList.contains('collapsed');
+}
 function onBinary(buf){
   const u8=new Uint8Array(buf), type=u8[0];
   if(type===1){
@@ -1253,6 +1279,7 @@ function onBinary(buf){
     }
     draw();
   }
+  else if(type===9){showCamFrame(buf);}
   else if(type===7){
     const len=new DataView(buf,1,4).getUint32(0,true);
     const meta=JSON.parse(new TextDecoder().decode(new Uint8Array(buf,5,len)));
@@ -1330,11 +1357,17 @@ function _draw(){
       mapMeta.w*mapMeta.res*view.scale,mapMeta.h*mapMeta.res*view.scale);
   }
   // 代价地图(避障膨胀区热力图, 叠在静态地图之上)
+  // 局部代价地图发布在 odom_combined 系, 后端已把原点变换到 map 系并附带两系之间的
+  // 偏航角 meta.yaw。这里必须按 yaw 旋转着画 —— 只按平移画的话, 车一转弯整片就错开
+  // (旧版就是这个bug, 表现为"局部代价地图跟实际对不上")。
   if(layerVis.costmap&&costmapImg&&costmapMeta){
+    const cm=costmapMeta, cw=cm.w*cm.res*view.scale, ch=cm.h*cm.res*view.scale;
+    ctx.save();
+    ctx.translate(w2sx(cm.ox),w2sy(cm.oy));   // 支点 = 栅格原点(左下角)
+    if(cm.yaw)ctx.rotate(-cm.yaw);            // 屏幕y轴朝下, 世界逆时针 = 屏幕顺时针
     ctx.imageSmoothingEnabled=false;
-    ctx.drawImage(costmapImg,w2sx(costmapMeta.ox),
-      w2sy(costmapMeta.oy+costmapMeta.h*costmapMeta.res),
-      costmapMeta.w*costmapMeta.res*view.scale,costmapMeta.h*costmapMeta.res*view.scale);
+    ctx.drawImage(costmapImg,0,-ch,cw,ch);    // 图像左上角在原点正上方 ch 处
+    ctx.restore();
   }
   // 建图点云
   ctx.imageSmoothingEnabled=true;
@@ -1790,6 +1823,8 @@ document.querySelectorAll('.card h3.fold').forEach(h=>{
     if(e.target.closest('.no-fold'))return;
     card.classList.toggle('collapsed');
     localStorage.setItem(key, card.classList.contains('collapsed')?'1':'0');
+    // 相机卡片: 收起=告诉后端别再编码画面(省小车CPU和无线带宽)
+    if(h.dataset.key==='cam')setCamWant(!card.classList.contains('collapsed'));
   });
 });
 

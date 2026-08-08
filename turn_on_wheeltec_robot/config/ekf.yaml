@@ -61,7 +61,12 @@ ekf_filter_node:
         # -------------------------------
         # 传感器输入：IMU
         # -------------------------------
-        imu0:  /imu/data_raw  #  /imu/data_raw    #/imu/data_filtered
+        # 必须用 data_filtered: imu_processor 在那一路扣掉了陀螺零偏。
+        # 2026-08-07 实测本车板载陀螺 z 轴零偏 -1.571deg/s(每次上电还不一样),
+        # 而 imu0_config 里 vyaw=true 会把它一路积分 -> 偏航每分钟漂 94 度,
+        # 表现为激光点云不停旋转、AMCL 拉不住、定位持续漂移。
+        # 订 data_raw 等于把补偿完全绕过去(补偿做了但没人用, 排查时很坑)。
+        imu0:  /imu/data_filtered
         imu0_config: [false, false, false,
                       false, false, true,
                       false, false, false,

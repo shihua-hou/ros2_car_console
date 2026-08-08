@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""AprilTag 实时测量验证脚本（自动启动 apriltag_node）。
+
+直接运行即可，无需手动 ros2 launch。
+Ctrl+C 退出时自动关闭 apriltag_node。
+
+用法:
+    python3 test_apriltag                                    # 默认参数
+    python3 test_apriltag --tag-id 5 --size 0.21             # 自定义 Tag
+    python3 test_apriltag --known-distance 1.0               # 与已知距离对比
+    python3 test_apriltag --image-topic /camera/color/image_raw
+"""
+
+import argparse
+import math
+import os
+import signal
+import statistics
+import subprocess
+import sys
+import time
+from collections import deque
+
+import rclpy
+from rclpy.node import Node
+from apriltag_msgs.msg import AprilTagDetectionArray
+import tf2_ros
+
+
+# ── 输出格式化 ────────────────────────────────────────────────────────
+
+def _describe_yaw(deg: float) -> str:
+    """用中文描述机器人相对 Tag 的朝向偏差。"""
+    ad = abs(deg)
+    if ad < 5:
+        return '正对'
+    if ad < 15:
+        return '轻微偏左' if deg > 0 else '轻微偏右'
+    if ad < 45:
+        return '偏左' if deg > 0 else '偏右'
+    if ad < 135:
+        return '左侧方' if deg > 0 else '右侧方'
+    return '后方'
+
+def _describe_lat(lat: float) -> str:
+    """用中文描述 Tag 在机器人的左右位置。"""
+    ad = abs(lat)
+    if ad < 0.03:
+        return '居中'
+    if ad < 0.10:
+        return '偏左' if lat > 0 else '偏右'
+    return f'{"左" if lat > 0 else "右"}侧 {ad:.2f}m'
+
+
+class TestApriltag(Node):
+    """AprilTag 实时测量，中文可读输出。"""
+
+    def __init__(self, tag_id=0, tag_family='36h11', tag_size=0.16,
+                 camera_frame='camera_color_optical_frame',
+                 base_frame='base_link', measure_frame='',
+                 sample_batch=50, known_distance=0.0):
+        super().__init__('test_apriltag')
+
+        self.declare_parameter('tag_id', tag_id)
+        self.declare_parameter('tag_family', tag_family)
+        self.declare_parameter('tag_size', tag_size)
+        self.declare_parameter('camera_frame', camera_frame)
+        self.declare_parameter('base_frame', base_frame)
+        self.declare_parameter('measure_frame', measure_frame)
+        self.declare_parameter('sample_batch', sample_batch)
+        self.declare_parameter('known_distance', known_distance)
+
+        self._tag_id = self._p('tag_id')
+        self._camera_frame = self._p('camera_frame')
+        self._base_frame = self._p('base_frame')
+        self._measure_frame = self._p('measure_frame')
+        self._sample_batch = self._p('sample_batch')
+        self._known_distance = self._p('known_distance')
+        self._det_topic = '/detections'
+
+        tag_family = self._p('tag_family')
+        self._tag_frame = f'tag{tag_family}:{self._tag_id}'
+        src = self._measure_frame or self._base_frame
+
+        # TF2
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+
+        # 订阅 /detections
+        self._det_sub = self.create_subscription(
+            AprilTagDetectionArray, self._det_topic, self._on_detections, 10)
+
+        # 统计缓冲
+        self._buf_dist = deque(maxlen=self._sample_batch)
+        self._buf_lat  = deque(maxlen=self._sample_batch)
+        self._buf_yaw  = deque(maxlen=self._sample_batch)
+        self._count = 0
+        self._tf_fails = 0
+        self._last_msg_ns = 0
+
+        self._summary_timer = self.create_timer(2.0, self._print_realtime)
+        self._warn_timer = self.create_timer(4.0, self._warn_if_stale)
+
+        print()
+        print('╔══════════════════════════════════════════════════╗')
+        print('║       AprilTag 实时测量 — 中文可读模式          ║')
+        print('╠══════════════════════════════════════════════════╣')
+        print(f'║  Tag:      {self._tag_frame:<30s} ║')
+        print(f'║  坐标系:   {src:<30s} ║')
+        print(f'║  相机帧:   {self._camera_frame:<30s} ║')
+        if self._known_distance > 0:
+            print(f'║  已知距离: {self._known_distance:.3f} m{" "*25} ║')
+        print('╚══════════════════════════════════════════════════╝')
+        print()
+        print('  把 Tag 放到相机前即可。按 Ctrl+C 退出。')
+        print()
+
+    def _p(self, name):
+        return self.get_parameter(name).value
+
+    def _on_detections(self, msg: AprilTagDetectionArray):
+        self._last_msg_ns = self.get_clock().now().nanoseconds
+        for det in msg.detections:
+            if det.id == self._tag_id:
+                self._count += 1
+                self._lookup_and_log()
+                return
+
+    def _warn_if_stale(self):
+        if self._last_msg_ns == 0 and self._count == 0:
+            print('  ⚠ 尚未收到检测数据 — 请确认:')
+            print('    1. 相机是否在发布图像?   ros2 topic hz /image_raw')
+            print('    2. Tag 是否在相机视野内?')
+            print(f'    3. 相机坐标系是否为 "{self._camera_frame}"?')
+            print('       (用 --camera-frame 指定实际帧名)')
+            print()
+
+    def _lookup_and_log(self):
+        src_frame = self._measure_frame or self._base_frame
+
+        try:
+            t = self._tf_buffer.lookup_transform(
+                src_frame, self._tag_frame,
+                rclpy.time.Time(seconds=0),
+                rclpy.duration.Duration(seconds=0.1))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            self._tf_fails += 1
+            return
+
+        # TF 查询 src_frame→tag 的结果已经是 src_frame 坐标系的表示。
+        # base_link 遵循 REP-103: x=前, y=左, z=上。
+        # 直接取 x 为距离, y 为横向即可，不需要再做光学坐标系转换。
+        dist = t.transform.translation.x
+        lat  = t.transform.translation.y
+
+        # 方位角 = 机器人需要转多少弧度才能正对 Tag
+        # atan2(lat, dist)，正=Tag在左边，需要左转(CCW)
+        yaw = math.atan2(lat, dist) if dist > 0.001 else 0.0
+
+        self._buf_dist.append(dist)
+        self._buf_lat.append(lat)
+        self._buf_yaw.append(yaw)
+
+        # 只在新数据到达时打印（10 行一次，避免刷屏）
+        if self._count <= 3 or self._count % 10 == 0:
+            self._print_one(dist, lat, yaw)
+
+        if self._count % self._sample_batch == 0:
+            self._print_summary()
+
+    # ── 单次测量 ──────────────────────────────────────────────────
+
+    def _print_one(self, dist, lat, yaw):
+        yaw_deg = math.degrees(yaw)
+        direction = _describe_yaw(yaw_deg)
+        pos = _describe_lat(lat)
+
+        # 正常距离
+        if dist > 0.15:
+            color = ''
+            reset = ''
+        else:
+            # 红色警告 — 太近了
+            color = '\033[91m'
+            reset = '\033[0m'
+
+        print(f'  [{self._count:4d}]  '
+              f'{color}距离={dist:.3f}m{reset}  |  '
+              f'Tag在{pos}  |  '
+              f'朝向={direction} ({yaw_deg:+.0f}°)  |  '
+              f'{"⚠ 太近!" if dist < 0.15 else "    "}')
+
+    # ── 实时摘要（每 2 秒）────────────────────────────────────────
+
+    def _print_realtime(self):
+        if len(self._buf_dist) < 3:
+            return
+        d_mean = statistics.mean(self._buf_dist)
+        d_std  = statistics.stdev(self._buf_dist)
+        l_mean = statistics.mean(self._buf_lat)
+        y_mean = math.degrees(statistics.mean(self._buf_yaw))
+
+        parts = [f'距离={d_mean:.3f}±{d_std:.3f}m']
+        parts.append(f'横向={l_mean:+.3f}m')
+        parts.append(f'朝向偏差={y_mean:+.1f}°')
+        if self._known_distance > 0:
+            err = d_mean - self._known_distance
+            parts.append(f'(与已知值差 {err:+.3f}m)')
+        if self._tf_fails:
+            parts.append(f'TF失败×{self._tf_fails}')
+
+        # 浅色输出，区别于单次测量
+        print(f'\033[90m  > {"  |  ".join(parts)}\033[0m')
+
+    # ── 累计汇总 ──────────────────────────────────────────────────
+
+    def _print_summary(self):
+        n = len(self._buf_dist)
+        if n < 5:
+            return
+
+        d_mean = statistics.mean(self._buf_dist)
+        d_std  = statistics.stdev(self._buf_dist)
+        l_mean = statistics.mean(self._buf_lat)
+        l_std  = statistics.stdev(self._buf_lat) if n >= 3 else 0.0
+        y_mean = math.degrees(statistics.mean(self._buf_yaw))
+        y_std  = math.degrees(statistics.stdev(self._buf_yaw)) if n >= 3 else 0.0
+
+        # 质量评估
+        if d_std < 0.005:
+            quality = '优 ✓'
+        elif d_std < 0.015:
+            quality = '良'
+        else:
+            quality = '差 ⚠ (抖动大)'
+
+        print()
+        print('  ═══════════════════════════════════════════')
+        print(f'  累计 {self._count} 次检测汇总')
+        print(f'  ───────────────────────────────────────────')
+        print(f'  距离:  {d_mean:.4f} ± {d_std:.4f} m    数据质量: {quality}')
+        print(f'  横向:  {l_mean:.4f} ± {l_std:.4f} m    ({_describe_lat(l_mean)})')
+        print(f'  朝向:  {y_mean:.2f} ± {y_std:.2f} °     ({_describe_yaw(y_mean)})')
+        if self._known_distance > 0:
+            err = d_mean - self._known_distance
+            pct = err / self._known_distance * 100
+            ok = '✓' if abs(pct) < 3 else '⚠ 偏差偏大，检查标定'
+            print(f'  ───────────────────────────────────────────')
+            print(f'  对比:  已知 {self._known_distance:.3f}m → 偏差 {err:+.4f}m ({pct:+.1f}%) {ok}')
+        if self._tf_fails:
+            print(f'  TF 查询失败: {self._tf_fails} 次')
+        print('  ═══════════════════════════════════════════')
+        print()
+
+
+# ── apriltag_node 子进程管理 ──────────────────────────────────────────
+
+def _launch_apriltag_node(tag_family: str, tag_size: float, tag_id: int,
+                          image_topic: str) -> subprocess.Popen:
+    """启动 apriltag_node 子进程。"""
+    tag_frame = f'tag{tag_family}:{tag_id}'
+    cmd = [
+        'ros2', 'run', 'apriltag_ros', 'apriltag_node',
+        '--ros-args',
+        '-p', f'family:={tag_family}',
+        '-p', f'size:={tag_size}',
+        '-p', f'tag_ids:=[{tag_id}]',
+        '-p', f'tag_frames:=[{tag_frame}]',
+        '-p', 'publish_tf:=true',
+        '-p', 'z_up:=false',
+        '-r', f'image_rect:={image_topic}',
+    ]
+    print(f'  启动 apriltag_node (Tag ID={tag_id}, {tag_size}m) ... ', end='', flush=True)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=os.setsid,
+    )
+    time.sleep(2.0)
+    if proc.poll() is not None:
+        print('失败！请检查 apriltag_ros 是否已安装。')
+        sys.exit(1)
+    print('完成')
+    return proc
+
+
+def _kill_apriltag_node(proc: subprocess.Popen):
+    """关闭 apriltag_node。"""
+    if proc is None or proc.poll() is not None:
+        return
+    print('  正在关闭 apriltag_node ... ', end='', flush=True)
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        proc.wait(timeout=3)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.wait(timeout=2)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            pass
+    print('完成')
+
+
+# ── main ──────────────────────────────────────────────────────────────
+
+def main(args=None):
+    argv = sys.argv[1:] if args is None else args
+    try:
+        ros_idx = argv.index('--ros-args')
+        argv = argv[:ros_idx]
+    except ValueError:
+        pass
+
+    parser = argparse.ArgumentParser(
+        description='AprilTag 实时测量（自动启动 apriltag_node，中文可读输出）',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  python3 test_apriltag                                    # 默认参数
+  python3 test_apriltag --tag-id 5 --size 0.21             # 自定义 Tag
+  python3 test_apriltag --known-distance 1.0               # 与已知距离对比
+  python3 test_apriltag --camera-frame camera_depth_optical_frame
+        """)
+    parser.add_argument('--tag-id', type=int, default=0, help='Tag ID (默认 0)')
+    parser.add_argument('--tag-family', default='36h11', help='Tag 家族 (默认 36h11)')
+    parser.add_argument('--size', type=float, default=0.16, help='Tag 边长，米 (默认 0.16)')
+    parser.add_argument('--image-topic', default='/image_raw', help='相机图像话题')
+    parser.add_argument('--camera-frame', default='camera_color_optical_frame',
+                        help='相机光学坐标系帧名')
+    parser.add_argument('--base-frame', default='base_link', help='机器人基座坐标系')
+    parser.add_argument('--measure-frame', default='',
+                        help='直接从此坐标系查 Tag（跳过相机坐标转换）')
+    parser.add_argument('--sample-batch', type=int, default=50,
+                        help='每 N 帧输出一次汇总 (默认 50)')
+    parser.add_argument('--known-distance', type=float, default=0.0,
+                        help='已知真实距离 (m)，用于精度对比')
+    cli = parser.parse_args(argv)
+
+    # 启动 apriltag_node
+    apriltag_proc = _launch_apriltag_node(
+        cli.tag_family, cli.size, cli.tag_id, cli.image_topic)
+
+    # 启动测量节点
+    rclpy.init(args=sys.argv if args is None else args)
+    node = TestApriltag(
+        tag_id=cli.tag_id, tag_family=cli.tag_family, tag_size=cli.size,
+        camera_frame=cli.camera_frame, base_frame=cli.base_frame,
+        measure_frame=cli.measure_frame,
+        sample_batch=cli.sample_batch,
+        known_distance=cli.known_distance)
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+        _kill_apriltag_node(apriltag_proc)
+        print('  已退出。')
+
+
+if __name__ == '__main__':
+    main()

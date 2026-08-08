@@ -48,13 +48,18 @@ from rclpy.qos import (QoSProfile, ReliabilityPolicy, DurabilityPolicy,
                        HistoryPolicy)
 from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
-from sensor_msgs.msg import LaserScan, PointCloud2
+from sensor_msgs.msg import Image as ImageMsg, Imu, LaserScan, PointCloud2
 from std_msgs.msg import Float32
 from std_srvs.srv import Trigger
+try:
+    from nav2_msgs.srv import LoadMap        # 编辑完热加载进运行中的导航用
+except ImportError:                          # nav2 没装/没编时不至于整个 webapp 起不来
+    LoadMap = None
 from action_msgs.srv import CancelGoal
 from action_msgs.msg import GoalStatus
 from nav2_msgs.action import NavigateToPose, FollowWaypoints
-from rcl_interfaces.srv import SetParameters
+from nav2_msgs.msg import SpeedLimit
+from rcl_interfaces.srv import GetParameters, SetParameters
 from rclpy.parameter import Parameter
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -69,6 +74,15 @@ STATIC_DIR = os.path.join(os.path.dirname(__file__), 'static')
 # 二进制消息类型 (server->client, 首字节)
 B_MAP, B_SCAN, B_CLOUD, B_PLAN, B_TRAJ, B_COSTMAP, B_MAP_EDIT = 1, 2, 3, 4, 5, 6, 7
 B_LOCAL_PLAN = 8            # 局部规划路径 (/local_plan, 控制器/MPPI 输出)
+B_CAM = 9                   # Astra 彩色相机画面 (JPEG, 前端要了才推)
+
+# 网页实时画面: 推流帧率/宽度/JPEG质量 (见 _cam_cb 里的权衡说明)
+CAM_FPS, CAM_W, CAM_Q = 12, 512, 70
+
+# 【实景模式】点云推送帧率与每帧点数。5Hz x 2500点 x 12字节 ≈ 150KB/s,
+# 和相机流(约300KB/s)加起来还在 2.4G 热点扛得住的范围。嫌卡降 SCENE_HZ,
+# 嫌稀降 SCENE_HZ 提 SCENE_PTS —— 带宽是两者的乘积。
+SCENE_HZ, SCENE_PTS = 5.0, 2500
 
 # 速度硬上限 (无论前端滑条设多少)
 VX_CAP, WZ_CAP = 0.7, 1.5
@@ -302,7 +316,7 @@ def _ap_client_count():
 def wifi_status():
     """两块网卡各自的状态: 板载卡(STA, 连家里WiFi)和USB卡(AP, 热点)。
     两者互相独立, 可以同时在线, 也可以任一为空。"""
-    sta = {'name': '', 'ip': '', 'iface': '', 'up': False}
+    sta = {'name': '', 'ip': '', 'iface': '', 'up': False, 'signal': None}
     ap = {'name': AP_PROFILE, 'ip': '', 'iface': AP_IFACE, 'up': False,
           'ssid': AP_SSID, 'clients': 0, 'exists': False}
     try:
@@ -328,6 +342,20 @@ def wifi_status():
         ap['exists'] = AP_PROFILE in r.stdout.split('\n')
     except Exception:
         pass
+    # 站点模式的信号强度(0-100), 供网页用格数图标显示。
+    # 走 `nmcli -f IN-USE,SIGNAL dev wifi` 只取带 * 的那一行 —— 注意这条命令在
+    # 某些驱动上会触发一次扫描而变慢, 所以放在 2 秒一次的状态轮询里, 且带 timeout。
+    if sta['up']:
+        try:
+            r = subprocess.run(['nmcli', '-t', '-f', 'IN-USE,SIGNAL', 'dev', 'wifi'],
+                               capture_output=True, text=True, timeout=4)
+            for ln in r.stdout.split('\n'):
+                f = ln.split(':')
+                if len(f) >= 2 and f[0].strip() == '*':
+                    sta['signal'] = int(f[1])
+                    break
+        except Exception:
+            pass
     return {'sta': sta, 'ap': ap}
 
 
@@ -410,7 +438,9 @@ def pgm_to_edit_png(pgm_path, yaml_path):
     Image.fromarray(rgba, 'RGBA').save(buf, 'PNG', compress_level=1)
     meta = {'res': float(info['resolution']),
             'ox': float(info['origin'][0]), 'oy': float(info['origin'][1]),
-            'w': w, 'h': h}
+            'w': w, 'h': h,
+            # 编辑页要显示"正在编哪张"、保存时也要回传, 名字得跟着图一起走
+            'name': os.path.splitext(os.path.basename(pgm_path))[0]}
     return json.dumps(meta).encode(), buf.getvalue()
 
 
@@ -440,11 +470,40 @@ def edit_png_to_pgm(png_bytes, dest_paths, orig_yaml_path):
                     f"negate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.196\n")
 
 
+MAP_BACKUP_KEEP = 5          # 每张图最多留几份历史, 32GB 小盘经不起无限攒
+
+
+def backup_map(name):
+    """覆盖前把 install 目录里的旧图存一份到 map/_backup/。
+
+    编辑是不可逆的 —— 撤销栈只活在浏览器里, 页面一关就没了, 手滑抹掉一堵墙
+    没有别的退路。备份放子目录而不是同级改名: list_2d_maps() 是按同级目录里
+    "<x>.yaml + <x>.pgm 配对"列图的, 备份放同级会混进地图库列表。
+    返回备份文件名(没有可备份的返回 None)。"""
+    pgm = os.path.join(MAP_DIR_INSTALL, name + '.pgm')
+    yml = os.path.join(MAP_DIR_INSTALL, name + '.yaml')
+    if not (os.path.exists(pgm) and os.path.exists(yml)):
+        return None                       # 新名字, 没有旧图要备份
+    bdir = os.path.join(MAP_DIR_INSTALL, '_backup')
+    os.makedirs(bdir, exist_ok=True)
+    tag = f'{name}-{time.strftime("%m%d-%H%M%S")}'
+    shutil.copy2(pgm, os.path.join(bdir, tag + '.pgm'))
+    shutil.copy2(yml, os.path.join(bdir, tag + '.yaml'))
+    old = sorted(glob.glob(os.path.join(bdir, name + '-*.pgm')))
+    for p in old[:-MAP_BACKUP_KEEP]:      # 只留最近几份
+        for q in (p, p[:-4] + '.yaml'):
+            try:
+                os.remove(q)
+            except OSError:
+                pass
+    return tag + '.pgm'
+
+
 def pack_map(meta_json, png, btype=B_MAP):
     return bytes([btype]) + struct.pack('<I', len(meta_json)) + meta_json + png
 
 
-def costmap_to_png(msg: OccupancyGrid):
+def costmap_to_png(msg: OccupancyGrid, tf_map=None):
     """局部代价地图(避障膨胀区) -> 半透明热力图叠加层。
     costmap_2d_publisher的换算: 0=空闲, 1-98=膨胀衰减梯度, 99=内切碰撞, 100=致命障碍,
     -1=未知。空闲/未知全透明(不遮挡底图), 成本越高越不透明越偏红——
@@ -460,10 +519,22 @@ def costmap_to_png(msg: OccupancyGrid):
     rgba = np.flipud(rgba)
     buf = io.BytesIO()
     Image.fromarray(rgba, 'RGBA').save(buf, 'PNG', compress_level=4)
-    meta = {'res': msg.info.resolution,
-            'ox': msg.info.origin.position.x,
-            'oy': msg.info.origin.position.y,
-            'w': w, 'h': h}
+    # 局部代价地图发布在 **odom_combined** 系(param_S100_diff.yaml 里
+    # local_costmap.global_frame 已改成它, 为了避免AMCL修正位姿后旧障碍标记
+    # 落到车身底下)。而网页画布是 map 系, 所以这里必须把栅格原点变换过去,
+    # 并把两系之间的偏航角一起传给前端 —— odom 和 map 之间不只有平移还有转角,
+    # 只平移不转的话地图一转弯就整片错开(这就是"局部代价地图对不上"的原因)。
+    ox, oy = msg.info.origin.position.x, msg.info.origin.position.y
+    yaw = 0.0
+    if tf_map is not None:
+        t = tf_map.transform.translation
+        q = tf_map.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        c, sn = math.cos(yaw), math.sin(yaw)
+        ox, oy = t.x + c * ox - sn * oy, t.y + sn * ox + c * oy
+    meta = {'res': msg.info.resolution, 'ox': ox, 'oy': oy,
+            'yaw': yaw, 'w': w, 'h': h}
     return json.dumps(meta).encode(), buf.getvalue()
 
 
@@ -471,8 +542,12 @@ def pack_floats(btype, arr):
     return bytes([btype]) + np.asarray(arr, dtype='<f4').tobytes()
 
 
-def cloud_xyz(msg: PointCloud2, max_pts=1200):
-    """手动解析 PointCloud2 的 x,y,z (无 sensor_msgs_py 依赖), 均匀抽稀。"""
+def cloud_xyz(msg: PointCloud2, max_pts=1200, clip=True):
+    """手动解析 PointCloud2 的 x,y,z (无 sensor_msgs_py 依赖), 均匀抽稀。
+
+    clip=False 时不做 z 值裁剪 —— 地面拟合需要原始分布, 而 camera_init 是斜的,
+    按 z 裁会把地面自己裁掉一部分(见 ground_plane 的说明)。
+    """
     off = {f.name: f.offset for f in msg.fields}
     if not {'x', 'y', 'z'} <= off.keys():
         return None
@@ -485,8 +560,184 @@ def cloud_xyz(msg: PointCloud2, max_pts=1200):
     out = np.empty((len(raw), 3), dtype=np.float32)
     for i, k in enumerate(('x', 'y', 'z')):
         out[:, i] = raw[:, off[k]:off[k] + 4].copy().view('<f4').ravel()
-    good = np.isfinite(out).all(axis=1) & (out[:, 2] > -1.5) & (out[:, 2] < 3.0)
+    good = np.isfinite(out).all(axis=1)
+    if clip:
+        good &= (out[:, 2] > -1.5) & (out[:, 2] < 3.0)
     return out[good]
+
+
+# 雷达安装角的**标称值**, 与 wheeltec_fastlio 两个 launch 的 lidar_pitch/roll/z 对应。
+# 只当作地面拟合的初值和兜底 —— 真正用于显示的是 GroundFitter 实测出来的平面。
+# (2026-08-07 实测: launch 里写的 0.191rad 与实际差了一倍, 靠死数是靠不住的。)
+NOMINAL_PITCH, NOMINAL_ROLL, NOMINAL_Z = 0.191, 0.006, 0.28
+
+
+def nominal_up(pitch=NOMINAL_PITCH, roll=NOMINAL_ROLL):
+    """按安装角推出的地面法向在 camera_init 系里的方向。
+
+    FAST-LIO 的 camera_init **不是重力对齐的**(IMU_Processing 初始化时 rot=I),
+    世界系直接取开机瞬间的 IMU 姿态, 雷达怎么装这个系就怎么歪。
+    base_footprint->livox 的旋转是 Ry(pitch)·Rx(roll)(pitch>0=下倾), 所以
+    地面法向 (0,0,1) 落到雷达系是 Rx(-roll)·Ry(-pitch)·ẑ = (-sinθ, sinφcosθ, cosφcosθ)。
+    **x 分量是负的** —— 2026-08-07 用 IMU 重力法实测 (-0.0998, +0.0168, +0.9949) 证实,
+    与 pcd2pgm.cpp 的约定一致。webapp 之前这里取了反号, 结果把倾角**加倍**了。
+    """
+    sp, cp = math.sin(pitch), math.cos(pitch)
+    sr, cr = math.sin(roll), math.cos(roll)
+    return np.array([-sp, sr * cp, cr * cp], dtype=np.float64)
+
+
+class GroundFitter:
+    """实时估计"地面在 camera_init 里是哪个平面", 供网页把 3D 视图校平。
+
+    【为什么不能用 launch 里的 lidar_pitch/roll 了事】那是死数, 而且实测会过期:
+    2026-08-07 launch 写的是 0.191rad(10.94°), 而 IMU 重力法和点云拟合一致给出
+    约 0.097rad(5.6°) —— 差了一倍。倾角错 5°, 网格和地面在 4m 外就差 35cm,
+    "网格就是地面"这句话直接不成立。
+
+    【两个量分开估, 各用各最靠谱的手段】
+
+    1) **法向**: 取 /livox/imu 的加速度(静止时=重力反方向, 即"上"), 用 /Odometry
+       的姿态转到 camera_init。FAST-LIO 的 body 系就是 IMU 系, 所以直接乘就行。
+       实测 0.1 秒就稳定到 0.013°, 35 秒内漂移 0.000°, 人为加 ±0.05g 的运动噪声
+       也只动 0.01°。**镜面地面上一个地面点都收不到时它照样准**, 这是关键。
+       运动加速度是零均值的, 长时间 EMA 自然滤掉; 幅值明显偏离 1g 的样本直接丢。
+
+    2) **高度**: 沿上面那个法向投影, 在雷达下方 [-1.5, -0.05]m 做直方图, 取
+       **最低的那个强峰**当地面(不是最高峰 —— 地面是最低的那块大平面, 取最低强峰
+       才不会被贴地的矮台面顶掉)。实测 2 秒(10帧)就收敛到 0.2697m, 88 秒后
+       0.2685m, 全程抖动 ±1mm。
+
+    ⚠️ **不要退回"直接对点云做 RANSAC 平面拟合"**: /cloud_registered 是
+    filter_size_surf=0.5 体素降采样过的, 每帧只有 600 点左右, 而且这块场地地面
+    是镜面的(见 CLAUDE.md 5.6)。2026-08-07 试过, 用标称法向当种子时地面在直方图里
+    整个糊开(峰锐度 1.85x), 迭代拟合被墙面带跑, 一次都没收敛。换成 IMU 法向之后
+    同一批数据的峰锐度是 4.57x。
+
+    估不出来就一直退回标称值, 界面上会显示"标称"提醒。
+    """
+
+    ACC_TC = 4.0          # 重力方向 EMA 时间常数(秒)
+    MAX_PTS = 60000       # 高度估计用的点缓冲上限(约 100 帧, 够用且不涨内存)
+    MIN_BIN = 120         # 直方图峰至少这么多点才认
+
+    def __init__(self):
+        self.n = nominal_up()          # 地面法向(camera_init 系, 指向上)
+        self.z = NOMINAL_Z             # 雷达光心离地高度
+        self.n_src = 'nom'             # 'imu' | 'nom'
+        self.z_src = 'nom'             # 'cloud' | 'nom'
+        self.inliers = 0
+        self._acc = None               # 重力方向的 EMA(camera_init 系, 未归一)
+        self._mag = None               # |acc| 的 EMA, 用来卡运动加速度
+        self._acc_t = 0.0
+        self._buf = []                 # [(N,3)] 相对雷达位置的点
+        self._buf_n = 0
+        self._last_fit = 0.0
+        self._steady = 0               # 法向连续多少次没动
+        self._samples = 0
+
+    # ---------- 法向: IMU 重力 ----------
+    def feed_imu(self, acc, R=None):
+        """acc: (ax,ay,az) body 系; R: body->camera_init 的 3x3(取自 /Odometry)。"""
+        a = np.asarray(acc, dtype=np.float64)
+        m = float(np.linalg.norm(a))
+        if not np.isfinite(m) or m < 1e-6:
+            return
+        # 幅值明显不是 1g 的样本 = 车在颠/在急加速, 丢掉。首个样本无条件收下当基准。
+        if self._mag is None:
+            self._mag = m
+        elif abs(m - self._mag) > 0.25 * self._mag:
+            return
+        now = time.monotonic()
+        dt = min(1.0, max(0.0, now - self._acc_t)) if self._acc_t else 1.0
+        self._acc_t = now
+        k = 1.0 - math.exp(-dt / self.ACC_TC)
+        self._mag += (m - self._mag) * k
+        v = a / m
+        if R is not None:
+            v = R @ v                  # body -> camera_init
+        self._acc = v if self._acc is None else self._acc + (v - self._acc) * k
+        u = self._acc / (np.linalg.norm(self._acc) or 1.0)
+        # 和标称差 40° 以上多半是话题接错/车翻了, 宁可不用
+        if float(u @ nominal_up()) > math.cos(math.radians(40)):
+            # 收敛判据: 连续若干次方向几乎不动。实测 0.1 秒就到 0.013°, 这里给足余量。
+            if self.n_src == 'imu' and float(np.dot(u, self.n)) > math.cos(
+                    math.radians(0.02)):
+                self._steady += 1
+            else:
+                self._steady = 0
+            self.n, self.n_src = u, 'imu'
+        self._samples += 1
+
+    @property
+    def normal_settled(self):
+        """法向已经稳住了 —— 调用方可以把 IMU 采样降下来。
+
+        地面法向在一次建图会话里是**常量**(camera_init 固定, 车在平地上跑),
+        没必要一直按 20Hz 喂。实测 0.1 秒就稳定, 之后 35 秒漂移 0.000°。
+        稳住之后降到 1Hz, 既能跟上"车被抬起来放到斜坡上"这种慢变化, 又几乎不花 CPU。
+        """
+        return self._steady >= 40 and self._samples >= 60
+
+    # ---------- 高度: 沿法向的直方图最低强峰 ----------
+    def feed_cloud(self, pts, sensor=None):
+        """pts: (N,3) camera_init 系; sensor: 雷达当前位置(取自 /Odometry)。
+
+        高度必须相对**雷达当前位置**量, 不能相对 camera_init 原点 —— 车开出去
+        十几米后原点早就不在脚下了。
+        """
+        if pts is None or len(pts) < 50:
+            return False
+        q = np.asarray(pts, dtype=np.float64)
+        if sensor is not None:
+            q = q - np.asarray(sensor, dtype=np.float64)
+        self._buf.append(q)
+        self._buf_n += len(q)
+        while self._buf_n > self.MAX_PTS and len(self._buf) > 1:
+            self._buf_n -= len(self._buf.pop(0))
+        now = time.monotonic()
+        if now - self._last_fit < 2.0:
+            return False
+        self._last_fit = now
+        return self._estimate_z(np.vstack(self._buf))
+
+    def _estimate_z(self, Q):
+        h = Q @ self.n
+        m = (h >= -1.5) & (h < -0.05)          # 只在雷达下方找, 桌面/天花板不参与
+        if int(m.sum()) < self.MIN_BIN:
+            return False
+        hist, ed = np.histogram(h[m], bins=58, range=(-1.5, -0.05))
+        peak = int(hist.max())
+        if peak < self.MIN_BIN:
+            return False
+        # 地面 = **最低**的强峰。取最高峰的话, 贴地的矮台面/床沿点更密就会顶掉地面。
+        idx = int(np.flatnonzero(hist >= 0.7 * peak)[0])
+        c = (ed[idx] + ed[idx + 1]) * 0.5
+        sel = np.abs(h - c) < 0.06
+        k = int(sel.sum())
+        if k < self.MIN_BIN:
+            return False
+        z = -float(h[sel].mean())
+        # 首次直接采用, 之后 EMA —— 高度是会话常量, 慢一点无所谓, 稳定更重要
+        a = 1.0 if self.z_src != 'cloud' else 0.25
+        self.z = self.z * (1 - a) + z * a
+        self.z_src, self.inliers = 'cloud', k
+        return True
+
+    def reset(self):
+        """新的建图会话 = 新的 camera_init, 之前估的平面完全作废。"""
+        self.__init__()
+
+    def as_dict(self):
+        n = self.n
+        return {'nx': round(float(n[0]), 5), 'ny': round(float(n[1]), 5),
+                'nz': round(float(n[2]), 5), 'z': round(float(self.z), 4),
+                # fit=True 表示法向已经是实测的(网格才真的贴地); 高度另有 zsrc
+                'fit': self.n_src == 'imu', 'nsrc': self.n_src, 'zsrc': self.z_src,
+                'inl': self.inliers,
+                # 换算成人看得懂的安装角, 只用于界面显示
+                'pitch': round(float(-math.atan2(n[0], n[2])), 4),
+                'roll': round(float(math.atan2(n[1], n[2])), 4)}
 
 
 class LaunchManager:
@@ -674,6 +925,18 @@ class Bridge(Node):
         self._param_clients = {}
         self.cloud_out = None       # 已抽稀的点云 (numpy), 待广播
         self._last_cloud_t = 0.0
+        # 【实景模式】前端打开"实景"开关时置 True: 点云推送提速到 SCENE_HZ、
+        # 每帧点数加到 SCENE_PTS, 让 3D 视图看起来是实时的而不是一秒一跳。
+        # 关掉就退回 1Hz/1200 点(只够看建图覆盖), 省无线带宽。
+        self.scene_want = False
+        self.ground = GroundFitter()
+        self._last_imu_t = 0.0
+        # Astra 彩色画面: 只有前端把"实时画面"卡片打开(cam_want=True)才编码,
+        # 否则连 JPEG 都不压——320x240@15 的原始帧走 DDS 已经进来了, 白压是浪费CPU
+        self.cam_want = False
+        self.cam_jpeg = None
+        self.cam_seq = 0
+        self._last_cam_t = 0.0
 
         map_qos = QoSProfile(depth=1,
                              reliability=ReliabilityPolicy.RELIABLE,
@@ -697,12 +960,23 @@ class Bridge(Node):
         self.create_subscription(Float32, 'PowerVoltage', self._cb('voltage'), 5)
         self.create_subscription(PointCloud2, '/cloud_registered',
                                  self.cloud_cb, sensor_qos)
+        # 雷达内置 IMU: 只用来定"哪边是上"(见 GroundFitter)。200Hz 全收会白烧 CPU,
+        # 回调里按 20Hz 抽。建图没起时这个话题根本不存在, 订阅着也没开销。
+        self.create_subscription(Imu, '/livox/imu', self.imu_cb, sensor_qos)
+        self.create_subscription(ImageMsg, '/camera/color/image_raw',
+                                 self.image_cb, sensor_qos)
 
         self.pub_vel = self.create_publisher(Twist, '/cmd_vel', 2)
+        # 【MPPI 速度上限的 workaround】见 handle_msg 里 nav_speed 的长注释:
+        # 光改参数不生效, 还得往这个话题发一条"无限速", 逼 MPPI 把 base_constraints
+        # 抄进真正生效的 constraints。QoS 要和 controller_server 的订阅一致(默认 10)。
+        self.pub_speed_limit = self.create_publisher(SpeedLimit, '/speed_limit', 10)
         self.pub_goal = self.create_publisher(PoseStamped, '/goal_pose', 2)
         self.pub_init = self.create_publisher(PoseWithCovarianceStamped,
                                               '/initialpose', 2)
         self.cli_reloc = self.create_client(Trigger, '/relocalize')
+        self.cli_loadmap = (self.create_client(LoadMap, '/map_server/load_map')
+                            if LoadMap else None)
         self.cli_cancel = self.create_client(
             CancelGoal, '/navigate_to_pose/_action/cancel_goal')
         self.ac_nav = ActionClient(self, NavigateToPose, '/navigate_to_pose')
@@ -732,15 +1006,107 @@ class Bridge(Node):
                 SetParameters, f'{node_fqn}/set_parameters')
         return self._param_clients[node_fqn]
 
+    def get_param_client(self, node_fqn):
+        """同上, 但是读参数用的 GetParameters 客户端。"""
+        key = node_fqn + '/get'
+        if key not in self._param_clients:
+            self._param_clients[key] = self.create_client(
+                GetParameters, f'{node_fqn}/get_parameters')
+        return self._param_clients[key]
+
+    def _odom_pose(self):
+        """(位置, body->camera_init 旋转矩阵); 没有**新鲜**里程计就 (None, None)。
+
+        必须卡新鲜度: /Odometry 是 FAST-LIO 发的, 导航模式下根本没有这个话题,
+        而 latest['odom'] 会一直留着上一次建图会话的最后一帧 —— 拿那个陈旧姿态去
+        转 IMU 重力, 算出来的"上"是错的。
+        取不到时按单位阵处理, 恰好也是对的: 建图刚起、还没有第一帧里程计时,
+        camera_init 就等于 body 系。
+        """
+        if time.monotonic() - getattr(self, 'odom_mono', 0) > 2.0:
+            return None, None
+        with self.lock:
+            od = self.latest.get('odom')
+        if od is None:
+            return None, None
+        p = od.pose.pose.position
+        q = od.pose.pose.orientation
+        x, y, z, w = q.x, q.y, q.z, q.w
+        R = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                      [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                      [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+        return np.array([p.x, p.y, p.z]), R
+
+    def imu_cb(self, msg):
+        # /livox/imu 是 200Hz。刚起来时按 20Hz 喂, 法向稳住之后降到 1Hz ——
+        # 地面法向是会话常量, 稳住了就没必要一直算(见 normal_settled)。
+        now = time.monotonic()
+        period = 1.0 if self.ground.normal_settled else 0.05
+        if now - self._last_imu_t < period:
+            return
+        self._last_imu_t = now
+        try:
+            _, R = self._odom_pose()
+            a = msg.linear_acceleration
+            self.ground.feed_imu((a.x, a.y, a.z), R)
+        except Exception:
+            pass                                 # 估不出来就退回标称值, 不能影响推流
+
     def cloud_cb(self, msg):
         now = time.monotonic()
-        if now - self._last_cloud_t < 1.0:   # 1Hz 足够看建图效果
+        hz = SCENE_HZ if self.scene_want else 1.0    # 1Hz 只够看建图覆盖
+        if now - self._last_cloud_t < 1.0 / hz:
             return
         self._last_cloud_t = now
-        pts = cloud_xyz(msg)
+        # 地面高度估计吃的是**未裁剪**的点: camera_init 是斜的, 按原始 z 裁会把地面
+        # 自己削掉一角, 估出来的高度就偏了
+        raw = cloud_xyz(msg, max_pts=4000, clip=False)
+        if raw is not None and len(raw):
+            try:
+                pos, _ = self._odom_pose()
+                self.ground.feed_cloud(raw, pos)
+            except Exception:
+                pass
+        pts = cloud_xyz(msg, max_pts=SCENE_PTS if self.scene_want else 1200)
         if pts is not None and len(pts):
             with self.lock:
                 self.cloud_out = pts
+
+    def image_cb(self, msg):
+        """Astra 彩色帧 -> JPEG。用 PIL 而不是 cv2: 进程里已经有 PIL(画地图用),
+        再拉 cv2 光 import 就多占 100MB+ 内存, 本机只有 4GB。"""
+        if not self.cam_want:
+            return
+        # 【分辨率与流畅度的权衡】相机采集 640x480@30。
+        # 直接按原分辨率满帧推, 走 2.4G 热点带宽吃不消(约 1.2MB/s);
+        # 原来这里写死 5Hz, 结果无论下游怎么改都只有 4~5fps(2026-08-07 用户反馈)。
+        # 折中: 缩到 512x384 + 质量70 + 12Hz ≈ 300KB/s —— 比原来的 320x240 更清晰,
+        # 帧率是原来的近 3 倍。嫌卡就降 CAM_FPS, 嫌糊就调 CAM_W。
+        now = time.monotonic()
+        if now - self._last_cam_t < 1.0 / CAM_FPS:
+            return
+        self._last_cam_t = now
+        try:
+            raw = bytes(msg.data)
+            if msg.encoding in ('rgb8', 'bgr8'):
+                im = Image.frombytes('RGB', (msg.width, msg.height), raw)
+                if msg.encoding == 'bgr8':
+                    b, g, r = im.split()
+                    im = Image.merge('RGB', (r, g, b))
+            elif msg.encoding in ('mono8', '8UC1'):
+                im = Image.frombytes('L', (msg.width, msg.height), raw)
+            else:
+                return
+            if im.width > CAM_W:      # 等比缩放, BILINEAR 比 LANCZOS 省不少 CPU
+                im = im.resize((CAM_W, round(im.height * CAM_W / im.width)),
+                               Image.BILINEAR)
+            buf = io.BytesIO()
+            im.save(buf, format='JPEG', quality=CAM_Q)
+            with self.lock:
+                self.cam_jpeg = buf.getvalue()
+                self.cam_seq += 1
+        except Exception:
+            pass
 
     # ---- 控制 ----
     def send_vel(self, vx, wz):
@@ -772,6 +1138,21 @@ class Bridge(Node):
         m.pose.covariance = cov
         self.pub_init.publish(m)
 
+    def pose_at(self, stamp):
+        """取指定时刻的车体位姿(map<-base_footprint)。查不到就退回最近可用的一帧。
+
+        用于把同一时刻的 /scan 摆到地图上 —— 用最新位姿会有一帧的角度误差,
+        车旋转时表现为激光整体偏转。"""
+        for parent in ('map', 'odom_combined'):
+            for t in (stamp, rclpy.time.Time()):
+                try:
+                    tf = self.tf_buf.lookup_transform(parent, 'base_footprint', t)
+                    tr, q = tf.transform.translation, tf.transform.rotation
+                    return {'x': tr.x, 'y': tr.y, 'yaw': quat_to_yaw(q)}
+                except Exception:
+                    continue
+        return None
+
     def robot_pose(self):
         """建图时(FAST-LIO /Odometry 在流)必须用它——与点云/轨迹同在 camera_init 系;
         导航时优先 map->base_footprint, AMCL未定位则退回 EKF 里程计。"""
@@ -780,7 +1161,7 @@ class Bridge(Node):
             fresh = time.monotonic() - getattr(self, 'odom_mono', 0) < 2.0
         if odom is not None and fresh:
             p = odom.pose.pose
-            return {'x': p.position.x, 'y': p.position.y,
+            return {'x': p.position.x, 'y': p.position.y, 'z': p.position.z,
                     'yaw': quat_to_yaw(p.orientation), 'frame': 'lio'}
         for parent, frame in (('map', 'map'), ('odom_combined', 'odom')):
             try:
@@ -809,6 +1190,7 @@ class WebConsole:
         self.last_scan_stamp = None
         self.last_plan_stamp = None
         self.last_local_plan_stamp = None
+        self.cam_seq_sent = -1       # 已推给前端的相机帧序号
         self.reloc_mode = 'auto'     # 'auto'=自动重定位模式 / 'odom'=里程计模式
         self.cmd_active = False
         self.cmd_last_t = 0.0
@@ -830,6 +1212,28 @@ class WebConsole:
         self.current_odin1_map_name = 'odin1_map'  # odin1本次建图/导航用的地图名
         self._index_path = os.path.join(STATIC_DIR, 'index.html')
         self._index_cache = None      # (mtime, bytes)
+        # 新版双模式界面(2026-08-06 起开发中), 挂在 /v2。
+        # 单独一个文件而不是原地改: 改造涉及整页重构(双模式框架、导航模式浮层、
+        # 建图模式的3D点云), 中途必然有不可用的状态, 而这台车的控制台要一直能用。
+        # 验收通过后再把 / 指过去。两个页面说的是同一套 WS 协议, 后端不用分叉。
+        self._v2_path = os.path.join(STATIC_DIR, 'v2.html')
+        self._v2_cache = None
+
+    def _cached_file(self, path, cache_attr):
+        """按 mtime 热重载静态页面(见 index_html 的说明)。"""
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return None
+        cache = getattr(self, cache_attr)
+        if cache is None or cache[0] != mtime:
+            with open(path, 'rb') as f:
+                setattr(self, cache_attr, (mtime, f.read()))
+        return getattr(self, cache_attr)[1]
+
+    @property
+    def v2_html(self):
+        return self._cached_file(self._v2_path, '_v2_cache')
 
     @property
     def index_html(self):
@@ -932,6 +1336,22 @@ class WebConsole:
                 '/sys/class/thermal/thermal_zone0/temp').read()) / 1000, 1)
         except Exception:
             pass
+        try:
+            st['uptime'] = int(float(open('/proc/uptime').read().split()[0]))
+        except Exception:
+            pass
+        # CPU 占用: /proc/stat 是**累计值**, 必须和上一次采样做差, 直接读是没有意义的
+        try:
+            f = [int(x) for x in open('/proc/stat').readline().split()[1:8]]
+            total, idle = sum(f), f[3] + f[4]
+            prev = getattr(self, '_cpu_prev', None)
+            self._cpu_prev = (total, idle)
+            if prev and total > prev[0]:
+                st['cpu_pct'] = round(
+                    100.0 * (1 - (idle - prev[1]) / (total - prev[0])), 1)
+        except Exception:
+            pass
+        st['now'] = time.time()      # 小车的系统时间(不是浏览器的)
         return st
 
     def state_dict(self):
@@ -946,11 +1366,17 @@ class WebConsole:
                           or DEFAULT_MAP_NAME.get(self.mgr.sensor, ''))
         return dict(t='state', mode=mode, sensor=self.mgr.sensor,
                     active_map=active_map,
+                    # 前端据此判断后端是不是新版: 静态页按 mtime 热重载, 而 app.py
+                    # 不会 —— 只 colcon build 没重启服务时, 新前端会配着旧后端跑,
+                    # "保存前自动备份/另存为/热加载"三样都还没有。有这个标志就不会
+                    # 在对话框里承诺一个后端做不到的事。
+                    caps=['map_edit_backup', 'map_edit_saveas', 'map_reload'],
                     running=self.mgr.alive(), stopping=self.mgr.stopping,
                     external=self.ext_running and not self.mgr.alive(),
                     voltage=round(v.data, 1) if v else None,
                     pcd_count=len(glob.glob(os.path.join(PCD_DIR, 'scans*.pcd'))),
                     has_map=self.map_cache is not None,
+                    ground=self.node.ground.as_dict(),
                     wifi=self.wifi,
                     detected=self.detected,
                     **self.sys_stats())
@@ -981,6 +1407,22 @@ class WebConsole:
                 self.push_state()
             await asyncio.sleep(2.0)
 
+    async def task_cam(self):
+        """相机单独一路推流。
+
+        原来它挤在 task_fast 里, 而那个循环是 0.2s 一轮 —— 相机再怎么调分辨率和
+        帧率, 网页上也只有 5fps, 看起来就是"模糊又卡顿"(2026-08-07 用户反馈)。
+        拆出来按 15Hz 推; 前端没要画面时(cam_want=False)只是空转, 开销可忽略。
+        """
+        while True:
+            if self.clients and self.node.cam_want:
+                with self.node.lock:
+                    cseq, jpg = self.node.cam_seq, self.node.cam_jpeg
+                if jpg is not None and cseq != self.cam_seq_sent:
+                    self.cam_seq_sent = cseq
+                    self._send_all(bytes([B_CAM]) + jpg)
+            await asyncio.sleep(1 / (CAM_FPS * 1.5))
+
     async def task_fast(self):
         """5Hz: 位姿; 4Hz: 扫描; 地图/路径按变化推送; 点云/轨迹随建图推送。"""
         tick = 0
@@ -1003,19 +1445,25 @@ class WebConsole:
                 if scan is not None and tick % 2 == 0 and \
                         scan.header.stamp != self.last_scan_stamp:
                     self.last_scan_stamp = scan.header.stamp
+                    # /scan 的点是 base_footprint 系的, 前端要把它摆到地图上就得
+                    # 乘一个车体位姿。**不能用"最新位姿"** —— 位姿5Hz、扫描4Hz,
+                    # 两者各推各的, 车一转起来就会用错一帧的角度去摆这一帧的点,
+                    # 看起来就是激光整体持续偏转(2026-08-07 用户反馈"一直向右转")。
+                    # 这里按**这帧扫描自己的时间戳**查 TF, 和点一起发下去。
+                    sp = self.node.pose_at(scan.header.stamp)
+                    if sp:
+                        self.send_json(t='scanpose', **sp)
                     self._send_all(pack_floats(B_SCAN, self._scan_xy(scan)))
                 if plan is not None and \
                         plan.header.stamp != self.last_plan_stamp:
                     self.last_plan_stamp = plan.header.stamp
-                    pts = [(p.pose.position.x, p.pose.position.y)
-                           for p in plan.poses]
+                    pts = self._path_xy_in_map(plan)
                     step = max(1, len(pts) // 300)
                     self._send_all(pack_floats(B_PLAN, pts[::step]))
                 if lplan is not None and \
                         lplan.header.stamp != self.last_local_plan_stamp:
                     self.last_local_plan_stamp = lplan.header.stamp
-                    lpts = [(p.pose.position.x, p.pose.position.y)
-                            for p in lplan.poses]
+                    lpts = self._path_xy_in_map(lplan)
                     lstep = max(1, len(lpts) // 300)
                     self._send_all(pack_floats(B_LOCAL_PLAN, lpts[::lstep]))
                 if mmsg is not None and mseq != self.map_cache_seq:
@@ -1025,7 +1473,17 @@ class WebConsole:
                     self._send_all(self.map_cache)
                 if cmmsg is not None and cmseq != self.costmap_cache_seq:
                     self.costmap_cache_seq = cmseq
-                    meta, png = costmap_to_png(cmmsg)
+                    # 取 map <- 代价地图所在系 的变换(通常是 odom_combined)。
+                    # 取不到就按恒等处理(退化成旧行为), 不至于整块图不显示。
+                    tf_map = None
+                    src_frame = cmmsg.header.frame_id or 'odom_combined'
+                    if src_frame not in ('map', ''):
+                        try:
+                            tf_map = self.node.tf_buf.lookup_transform(
+                                'map', src_frame, rclpy.time.Time())
+                        except Exception:
+                            tf_map = None
+                    meta, png = costmap_to_png(cmmsg, tf_map)
                     self._send_all(pack_map(meta, png, B_COSTMAP))
                 if cloud is not None:
                     self._send_all(pack_floats(B_CLOUD, cloud))
@@ -1039,6 +1497,30 @@ class WebConsole:
                         self._send_all(pack_floats(B_TRAJ, self.traj[-1:]))
             tick += 1
             await asyncio.sleep(0.2)
+
+    def _path_xy_in_map(self, path):
+        """把 nav_msgs/Path 的点统一转到 map 系再发给前端。
+
+        **不能直接用原始坐标**: /plan 由 planner 发在 map 系, 但 MPPI 的
+        /transformed_global_plan(网页"局部路径"的来源)发在**局部代价地图的 frame**,
+        而那个已经从 map 改成了 odom_combined(param_S100_diff.yaml, 为避免 AMCL
+        修正位姿后旧障碍标记落到车身底下)。两系之间既有平移也有偏航, 直接当 map 系
+        画的话局部路径就整条错位 —— 这和局部代价地图错位是同一个根因。
+        按消息自带的 header.frame_id 查变换, 不写死系名, 以后再改 global_frame
+        也不用动这里。
+        """
+        pts = [(p.pose.position.x, p.pose.position.y) for p in path.poses]
+        src = path.header.frame_id
+        if not pts or not src or src == 'map':
+            return pts
+        try:
+            tf = self.node.tf_buf.lookup_transform('map', src, rclpy.time.Time())
+        except Exception:
+            return pts          # 查不到就按原样发, 总比整条不显示强
+        t = tf.transform.translation
+        yaw = quat_to_yaw(tf.transform.rotation)
+        c, sn = math.cos(yaw), math.sin(yaw)
+        return [(t.x + c * x - sn * y, t.y + sn * x + c * y) for x, y in pts]
 
     @staticmethod
     def _scan_xy(scan: LaserScan):
@@ -1065,6 +1547,12 @@ class WebConsole:
             self.cmd_active = True
             self.cmd_last_t = time.monotonic()
             self.node.send_vel(msg.get('vx', 0.0), msg.get('wz', 0.0))
+        elif t == 'cam':
+            # 前端开/关"实时画面"卡片。关掉就彻底不编码, 省CPU和无线带宽。
+            self.node.cam_want = bool(msg.get('on'))
+        elif t == 'scene':
+            # 前端开/关建图页的"实景"开关: 只影响点云推送的帧率和密度
+            self.node.scene_want = bool(msg.get('on'))
         elif t == 'cmd_stop':
             self.cmd_active = False
             self.node.send_vel(0.0, 0.0)
@@ -1078,6 +1566,9 @@ class WebConsole:
             self.send_json(t='clear', what=mode)
             if mode == 'mapping':
                 self.map_saved_this_session = False
+                # 新会话 = 新的 camera_init(FAST-LIO 每次重新初始化世界系),
+                # 上一次拟合的地面平面完全作废, 必须重来
+                self.node.ground.reset()
 
             launch_args = {}
             if map_name and not _safe_map_name(map_name):
@@ -1170,14 +1661,47 @@ class WebConsole:
             self.send_json(t='toast', msg='急停: 已刹车并取消导航目标')
         elif t == 'nav_speed':
             vx = max(0.05, min(1.0, float(msg['vx_max'])))
+            vn = max(0.05, min(1.0, abs(float(msg.get('vx_min', -vx)))))
             wz = max(0.1, min(2.5, float(msg['wz_max'])))
             ok, err = await self._set_params('/controller_server', {
-                'FollowPath.vx_max': vx, 'FollowPath.vx_min': -vx,
+                'FollowPath.vx_max': vx, 'FollowPath.vx_min': -vn,
                 'FollowPath.wz_max': wz})
+            # 【为什么还要再发一条 speed_limit —— 这是"改了参数车速纹丝不动"的根因】
+            # humble 版 nav2_mppi_controller 的动态参数只写进 settings_.base_constraints,
+            # 而真正裁剪输出速度的是 settings_.constraints(optimizer.cpp 的
+            # xt::clip(..., s.constraints.vx_min, s.constraints.vx_max))。
+            # 两者只在 getParams() 里同步过一次(`s.constraints = s.base_constraints;`),
+            # 参数变更后挂的 post callback 是 reset(), **它不做这个拷贝**。
+            # 所以改完参数 base 变了、constraints 没变 = 完全不生效。
+            # 而且 ParametersHandler::dynamicParamsCallback 无论如何都返回
+            # successful=true, 连报错都没有, 界面还显示"已下发"。
+            #
+            # 唯一会做这个拷贝的是 Optimizer::setSpeedLimit(NO_SPEED_LIMIT):
+            #   s.constraints.vx_max = s.base_constraints.vx_max; ...
+            # 而 ControllerServer 正是通过 speed_limit 话题调它。所以这里补发一条
+            # "无限速"(speed_limit=0.0 即 NO_SPEED_LIMIT), 把新值刷进 constraints。
+            # 这样不用改 nav2 源码、不用重编 MPPI(xtensor 那套在本机编很久)。
+            if ok:
+                try:
+                    self.node.pub_speed_limit.publish(
+                        SpeedLimit(percentage=False, speed_limit=0.0))
+                except Exception:
+                    pass
             self.send_json(t='toast', ok=ok,
-                msg=(f'导航速度已更新: 线速度上限{vx:.2f}m/s 角速度上限{wz:.2f}rad/s '
+                msg=(f'导航速度已更新: 前进{vx:.2f} 后退{vn:.2f} 旋转{wz:.2f}rad/s '
                      '(仅本次导航会话有效, 重启导航恢复默认值)') if ok
                     else f'导航速度设置失败: {err}')
+        elif t == 'get_nav_params':
+            # 弹窗打开时把**当前真实值**读回来, 而不是每次都显示写死的默认值 ——
+            # 否则用户看到的滑条位置和车上实际参数根本不是一回事
+            vals = {}
+            got = await self._get_params('/controller_server', [
+                'FollowPath.vx_max', 'FollowPath.vx_min', 'FollowPath.wz_max',
+                'FollowPath.ObstaclesCritic.inflation_radius',
+                'FollowPath.ObstaclesCritic.cost_scaling_factor'])
+            vals.update(got)
+            self.send_json(t='nav_params', params=vals,
+                           live=bool(got))
         elif t == 'obstacle_params':
             r = max(0.1, min(1.0, float(msg['inflation_radius'])))
             c = max(0.5, min(20.0, float(msg['cost_scaling_factor'])))
@@ -1295,6 +1819,38 @@ class WebConsole:
             sensor = msg.get('sensor', 'mid360')
             maps = list_odin1_maps() if sensor == 'odin1' else list_2d_maps()
             self.send_json(t='maps', sensor=sensor, maps=maps)
+        elif t == 'preview_map':
+            # 【选中地图就把它画出来】以前选地图只是把名字记进 localStorage,
+            # 画布上什么都不变 —— 用户点了半天"地图加载不出来"。
+            # 这里把选中那张的 pgm 推给前端当底图, 和导航真正加载的是同一张图,
+            # 所以可以先看清楚再决定要不要用它启动导航。
+            # 注意: 只是**预览**, 不影响 nav2 实际加载哪张(那个仍由启动参数决定)。
+            name = (msg.get('name') or '').strip()
+            if not _safe_map_name(name):
+                self.send_json(t='toast', ok=False, msg='非法地图名')
+                return
+            # 导航跑着的时候不要拿静态图去盖实时 /map —— 那张才是当前真正在用的
+            if self.mgr.alive() and self.mgr.mode == 'navigation':
+                self.send_json(t='toast',
+                    msg=f'导航运行中, 画布显示的是正在使用的地图; "{name}" 已选中, '
+                        f'停止导航后重新启动才会加载它')
+                return
+            pgm = os.path.join(MAP_DIR_INSTALL, name + '.pgm')
+            yml = os.path.join(MAP_DIR_INSTALL, name + '.yaml')
+            if not (os.path.exists(pgm) and os.path.exists(yml)):
+                self.send_json(t='toast', ok=False,
+                               msg=f'地图 "{name}" 的文件不完整(缺 pgm 或 yaml)')
+                return
+            try:
+                meta, png = pgm_to_png(pgm, yml)
+                frame = pack_map(meta, png)
+                # seq 用 -2: 和 _push_saved_map 一样, 表示"这是主动推的静态图",
+                # 不会被后面 /map 话题的 seq 比较逻辑当成旧帧丢掉
+                self.map_cache, self.map_cache_seq = frame, -2
+                self._send_all(frame)
+                self.send_json(t='map_preview', name=name)
+            except Exception as e:
+                self.send_json(t='toast', ok=False, msg=f'加载地图失败: {e}')
         elif t == 'get_route':
             # 前端选中某张图时来拉这张图存过的巡航航点
             sensor = msg.get('sensor', 'mid360')
@@ -1359,15 +1915,18 @@ class WebConsole:
             except Exception as e:
                 self.send_json(t='toast', ok=False, msg=f'加载失败: {e}')
         elif t == 'save_map_edit':
+            # name = 存成哪张图(可以是个新名字 = 另存为), src = 分辨率/原点从哪张图来。
+            # 分开是因为另存为时新名字还没有 yaml, 元数据只能沿用被编辑的那张。
             name = (msg.get('name') or '').strip()
+            src = (msg.get('src') or name).strip()
             png_b64 = msg.get('png_b64') or ''
-            if not _safe_map_name(name) or not png_b64:
-                self.send_json(t='toast', ok=False, msg='参数缺失')
+            if not _safe_map_name(name) or not _safe_map_name(src) or not png_b64:
+                self.send_json(t='toast', ok=False, msg='参数缺失或地图名非法')
                 return
-            yml = os.path.join(MAP_DIR_INSTALL, name + '.yaml')
+            yml = os.path.join(MAP_DIR_INSTALL, src + '.yaml')
             if not os.path.exists(yml):
                 self.send_json(t='toast', ok=False,
-                    msg=f'原地图 "{name}" 不存在, 无法确定分辨率/原点')
+                    msg=f'原地图 "{src}" 不存在, 无法确定分辨率/原点')
                 return
             try:
                 png_bytes = base64.b64decode(png_b64)
@@ -1375,14 +1934,72 @@ class WebConsole:
                         os.path.join(MAP_DIR_INSTALL, name + '.yaml')),
                        (os.path.join(MAP_DIR, name + '.pgm'),
                         os.path.join(MAP_DIR, name + '.yaml'))]
+                bak = backup_map(name)
                 edit_png_to_pgm(png_bytes, dest, yml)
                 meta, png = pgm_to_png(dest[0][0], dest[0][1])
                 self.map_cache, self.map_cache_seq = pack_map(meta, png), -2
                 self._send_all(self.map_cache)
-                self.send_json(t='toast', msg=f'"{name}" 编辑已保存')
+                tip = f'"{name}" 已保存'
+                if bak:
+                    tip += f' (旧图备份: _backup/{bak})'
+                self.send_json(t='toast', msg=tip)
                 self.send_json(t='maps', sensor='mid360', maps=list_2d_maps())
+                # active=true 时前端才提示"要不要热加载" —— 编的正好是导航
+                # 此刻在用的那张图, 不然重载没有意义
+                self.send_json(t='map_saved', name=name,
+                               active=(self.mgr.alive()
+                                       and self.mgr.mode == 'navigation'
+                                       and name == (self.mgr.map_name or
+                                           DEFAULT_MAP_NAME.get(self.mgr.sensor, ''))))
             except Exception as e:
                 self.send_json(t='toast', ok=False, msg=f'保存失败: {e}')
+        elif t == 'reload_map':
+            # 让运行中的导航热加载磁盘上的图, 不必重启整套 nav2。
+            # 只有 map_server 会换图; AMCL 的似然场是订阅 /map 更新的, 会跟着变。
+            name = (msg.get('name') or '').strip()
+            if not _safe_map_name(name):
+                self.send_json(t='toast', ok=False, msg='地图名非法')
+                return
+            if not (self.node.cli_loadmap
+                    and self.node.cli_loadmap.service_is_ready()):
+                self.send_json(t='toast', ok=False,
+                    msg='/map_server/load_map 不在线 (导航没在跑), 下次启动导航时自动生效')
+                return
+            req = LoadMap.Request()
+            req.map_url = os.path.join(MAP_DIR_INSTALL, name + '.yaml')
+            fut = self.node.cli_loadmap.call_async(req)
+            try:
+                await asyncio.wait_for(self._wrap_future(fut), timeout=15.0)
+                r = fut.result()
+                ok = (r.result == LoadMap.Response.RESULT_SUCCESS)
+                self.send_json(t='toast', ok=ok,
+                    msg=(f'导航已换用 "{name}"' if ok else f'热加载失败(code={r.result})'))
+                # 换了图, AMCL 手里那个位姿是按旧图算的, 多半已经不成立
+                # —— 必须重定位, 否则车会以为自己在一个新图上不存在的地方
+                if ok and msg.get('reloc'):
+                    await self._call_relocalize()
+            except asyncio.TimeoutError:
+                self.send_json(t='toast', ok=False, msg='热加载超时')
+
+    async def _get_params(self, node_fqn, names):
+        """读回节点当前的参数值。取不到就返回空 dict(界面退回默认值显示)。"""
+        cli = self.node.get_param_client(node_fqn)
+        if not cli.service_is_ready():
+            return {}
+        req = GetParameters.Request()
+        req.names = list(names)
+        fut = cli.call_async(req)
+        try:
+            await asyncio.wait_for(self._wrap_future(fut), 5)
+        except asyncio.TimeoutError:
+            return {}
+        out = {}
+        for name, pv in zip(names, fut.result().values):
+            if pv.type == 3:            # PARAMETER_DOUBLE
+                out[name] = round(pv.double_value, 4)
+            elif pv.type == 2:          # PARAMETER_INTEGER
+                out[name] = pv.integer_value
+        return out
 
     async def _set_params(self, node_fqn, kv):
         cli = self.node.param_client(node_fqn)
@@ -1563,6 +2180,9 @@ class WebConsole:
                                             'msg': f'指令错误: {e}', 'ok': False}))
         finally:
             self.clients.discard(ws)
+            if not self.clients:
+                self.node.cam_want = False   # 没人看了就停止编码画面
+                self.node.scene_want = False  # 实景高帧率推送也一并退回 1Hz
             if not self.clients and self.cmd_active:
                 self.cmd_active = False
                 self.node.send_vel(0.0, 0.0)
@@ -1576,6 +2196,14 @@ class WebConsole:
                     [('Content-Type', 'text/html; charset=utf-8'),
                      ('Cache-Control', 'no-cache')],
                     self.index_html)
+        if p in ('/v2', '/v2.html'):
+            body = self.v2_html
+            if body is None:
+                return (http.HTTPStatus.NOT_FOUND, [], b'v2.html not found')
+            return (http.HTTPStatus.OK,
+                    [('Content-Type', 'text/html; charset=utf-8'),
+                     ('Cache-Control', 'no-cache')],
+                    body)
         # 预生成的语音播报音频 (供红米平板等无 Web Speech API 的系统浏览器播放)。
         # 只允许 [A-Za-z0-9_-].mp3, 防目录穿越。运行时纯静态, 不再依赖浏览器 TTS。
         m = re.fullmatch(r'/voice/([A-Za-z0-9_-]+\.mp3)', p)
@@ -1610,7 +2238,7 @@ class WebConsole:
                                     compression=None, max_size=2 ** 20,
                                     ping_interval=10, ping_timeout=20):
             print(f'* Web控制台已启动: http://<小车IP>:{self.port}  (Ctrl+C 退出)')
-            await asyncio.gather(self.task_state(), self.task_fast(),
+            await asyncio.gather(self.task_state(), self.task_fast(), self.task_cam(),
                                  self.task_cmd_watchdog())
 
 
