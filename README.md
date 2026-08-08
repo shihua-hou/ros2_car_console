@@ -7,7 +7,7 @@
 > 已在 **鲁班猫4（LubanCat4 / RK3588S，4GB 内存 / 32GB eMMC）** 无头小车主控上完整跑通，
 > 从雷达驱动、建图、点云转 2D 地图、自动重定位到 Nav2 导航全链路验证通过。
 
-![Web 控制台总览](docs/images/web-console.png)
+![Web 控制台首页](docs/images/v2-home.jpg)
 
 ---
 
@@ -29,13 +29,36 @@
 
 ## 🖼️ 界面展示
 
-| 建图运行页面 | 地图编辑 |
-|---|---|
-| ![建图运行](docs/images/mapping.png) | ![地图编辑](docs/images/map-edit.png) |
+以下为 **v2 控制台**（`/v2`）实拍，平板横屏。
 
-| 导航中（全局+局部路径） | 导航已到达 |
+### 建图页 — 3D 点云视图
+
+![建图页 3D 点云](docs/images/v2-mapping.jpg)
+
+WebGL 实时点云（按高度着色）叠加地面网格，左上角是相机实时画面，右下角虚拟摇杆。
+顶栏状态芯片里的 **`地面 25cm 11.9°`** 是**当场实测**出来的地面平面——法向取自 IMU 重力、
+高度取自点云直方图最低强峰，不读 launch 里会过期的标称安装角，所以雷达支架一松就能立刻看出来。
+`点云 21k` / `分段 5` 分别是当前帧点数和已落盘的 PCD 分段数。
+
+### 导航页 — 轻量 web-rviz
+
+![导航页](docs/images/v2-navigation.jpg)
+
+地图 / 激光 / 小车 / 目标点 / 巡航点 / 全局+局部路径 / 代价地图分层显示，
+顶部图例每一项都可点击开关。顶栏显示当前地图名与实时坐标。
+
+| 多点巡航 | 地图编辑器 |
 |---|---|
-| ![导航中](docs/images/navigation.png) | ![导航已到达](docs/images/nav-arrived.png) |
+| ![多点巡航](docs/images/v2-waypoints.jpg) | ![地图编辑](docs/images/v2-map-editor.jpg) |
+| 点图依次添加航点，支持循环巡航 | 直接在网页上擦除 / 补画障碍，三色严格对应占据/自由/未知 |
+
+| 地图库 | 设置 |
+|---|---|
+| ![地图库](docs/images/v2-map-library.jpg) | ![设置](docs/images/v2-settings.jpg) |
+| 多张地图管理，选中即预览 | 语音播报、热点开关、遥控速度上限 |
+
+> 老版界面（`/`）的截图仍保留在 `docs/images/` 下：`web-console.png`、`mapping.png`、
+> `map-edit.png`、`navigation.png`、`nav-arrived.png`。
 
 ---
 
@@ -102,6 +125,8 @@ RViz Fixed Frame 用 `camera_init`，导航时用 `map`。
 ---
 
 ## 🔧 硬件与实测标定
+
+![小车实物](docs/images/hardware.jpg)
 
 - **主控**：LubanCat4（RK3588S，4×A76 + 4×A55，4GB 内存 / 32GB eMMC）
 - **3D 雷达**：Livox MID360s（以太网，主机 `192.168.1.5`，雷达 `192.168.1.1XX`）
