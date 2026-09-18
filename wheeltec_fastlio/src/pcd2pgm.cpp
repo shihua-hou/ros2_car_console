@@ -10,10 +10,13 @@
  */
 #include <cstdio>
 #include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <limits>
 #include <filesystem>
 
 #include <rclcpp/rclcpp.hpp>
@@ -120,6 +123,23 @@ int main(int argc, char **argv)
   // 镜面/抛光地面掠射角下几乎收不到地面回波, 这个占比只有个位数; 地毯等漫反射
   // 地面能到 30~50%。占比高就说明拟合值比卷尺值更可信 —— 见下面校平那段的守卫。
   const double fit_trust_ratio = node->declare_parameter<double>("ground_fit_trust_ratio", 0.25);
+
+  // ---- 局部地面高度网格 (2026-09-15 新增, 解决坡地误判) ----
+  // 全局单平面在坡地上不成立: 实测 8° 坡、每10米爬升1.43m, 远处地面相对拟合
+  // 平面高出数米, 被 [min_z,max_z] 判成障碍。这里按网格统计局部地面高度。
+  const bool local_ground = node->declare_parameter<bool>("local_ground", true);
+  // 网格边长: 太小则很多格没有地面回波(靠插值补, 不准), 太大则跟不上坡度变化。
+  const double ground_cell = node->declare_parameter<double>("ground_cell", 2.0);
+  // 每格取第几分位当地面。用低分位而非最小值: 少数穿透/噪声点不会把地面拉低。
+  const double ground_pct = node->declare_parameter<double>("ground_percentile", 0.05);
+  // 少于这么多点的格子不算数, 交给邻居插值
+  const int ground_min_pts = node->declare_parameter<int>("ground_min_points", 8);
+
+  // ---- 轨迹距离裁剪 (2026-09-15 新增) ----
+  // 只把"离建图轨迹这么近"的点画进地图; <=0 关闭(室内默认关, 房间本来就小)。
+  const double traj_radius = node->declare_parameter<double>("traj_crop_radius", 0.0);
+  // 留空则按 pcd_dir 推出 <ROOT>/Log/mat_pre.txt
+  const std::string traj_file = node->declare_parameter<std::string>("traj_file", "");
 
   std::vector<std::string> pcd_files;
   if (!pcd_file.empty()) {
@@ -253,6 +273,121 @@ int main(int argc, char **argv)
   }
   RCLCPP_INFO(logger, "共 %zu 个文件, 合计 %zu 点", pcd_files.size(), cloud->size());
 
+  // ---------------- 轨迹距离裁剪 (2026-09-15 新增) ----------------
+  // 只保留离建图轨迹 <= traj_crop_radius 米的点(XY 平面距离)。
+  //
+  // 为什么需要: MID360 的 det_range 是 100m, 空旷户外收得到 30~40m 外楼房的回波,
+  // 包围盒因此撑到 77x80m。那些远点是掠射来的 —— 又稀又不可靠, 还把局部地面网格
+  // 的格子摊薄。2026-09-15 实测一次户外建图: 包围盒 73.7x77.6m, 自由区只有 4.6%。
+  //
+  // 为什么不直接调小 det_range: 空旷草坪上唯一可靠的几何特征恰恰是远处的楼房,
+  // FAST-LIO 要靠它们约束里程计。砍掉远点图是干净了, 里程计反而更容易漂。
+  // 所以远点照常参与里程计, 只在**出图**这一步按"离轨迹多远"裁掉。
+  //
+  // 必须放在地面校平**之前**: 校平会旋转平移点云, 之后就和轨迹不是一个系了。
+  if (traj_radius > 0.0) {
+    std::string tf = traj_file;
+    if (tf.empty()) {
+      // pcd_dir 形如 <ROOT>/PCD, 轨迹在 <ROOT>/Log/mat_pre.txt
+      std::filesystem::path pp(pcd_dir);
+      tf = (pp.parent_path() / "Log" / "mat_pre.txt").string();
+    }
+    std::vector<std::pair<float, float>> traj;
+    size_t nline = 0;
+    {
+      std::ifstream fin(tf);
+      if (!fin) {
+        RCLCPP_WARN(logger,
+            "轨迹文件打不开 (%s), 跳过轨迹裁剪 —— 地图会包含远处掠射点", tf.c_str());
+      } else {
+        std::string line;
+        double lastx = 0, lasty = 0;
+        bool has_last = false;
+        while (std::getline(fin, line)) {
+          std::istringstream ss(line);
+          double v[7];
+          bool ok = true;
+          for (int i = 0; i < 7; ++i) if (!(ss >> v[i])) { ok = false; break; }
+          if (!ok) continue;
+          ++nline;
+          const double x = v[4], y = v[5];     // 第5,6列 = state_point.pos 的 x,y
+          if (!std::isfinite(x) || !std::isfinite(y)) continue;
+          // 抽稀到 0.5m: 原始轨迹 10Hz、逐帧中位才 1.4cm, 全用上是白费
+          if (has_last && std::hypot(x - lastx, y - lasty) < 0.5) continue;
+          traj.emplace_back((float)x, (float)y);
+          lastx = x; lasty = y; has_last = true;
+        }
+      }
+    }
+    if (!traj.empty() && traj.size() < 2) {
+      RCLCPP_WARN(logger, "轨迹只有 %zu 个有效点(读了 %zu 行), 跳过轨迹裁剪",
+                  traj.size(), nline);
+    } else if (!traj.empty()) {
+      // 掩膜法: 先把轨迹周围 traj_radius 内的格子刷成 1, 再每点查一次表。
+      // 比"每点对全轨迹算最近距离"快几个数量级。
+      const double cell = 0.5;   // 20m 半径下边界模糊 <0.4m, 可以忽略
+      double tmnx = 1e9, tmny = 1e9, tmxx = -1e9, tmxy = -1e9;
+      for (const auto &q : traj) {
+        tmnx = std::min(tmnx, (double)q.first);  tmxx = std::max(tmxx, (double)q.first);
+        tmny = std::min(tmny, (double)q.second); tmxy = std::max(tmxy, (double)q.second);
+      }
+      tmnx -= traj_radius; tmny -= traj_radius;
+      tmxx += traj_radius; tmxy += traj_radius;
+      const int mw = std::max(1, (int)std::ceil((tmxx - tmnx) / cell));
+      const int mh = std::max(1, (int)std::ceil((tmxy - tmny) / cell));
+      if ((long long)mw * mh > 40000000LL) {
+        // 轨迹本身跑飞时别开天量内存, 宁可不裁
+        RCLCPP_WARN(logger, "轨迹掩膜过大 %dx%d, 跳过轨迹裁剪", mw, mh);
+      } else {
+        std::vector<uint8_t> mask((size_t)mw * mh, 0);
+        const int rc = (int)std::ceil(traj_radius / cell);
+        const double r2 = traj_radius * traj_radius;
+        for (const auto &q : traj) {
+          const int cx = (int)((q.first - tmnx) / cell);
+          const int cy = (int)((q.second - tmny) / cell);
+          for (int dy = -rc; dy <= rc; ++dy) {
+            const int yy = cy + dy;
+            if (yy < 0 || yy >= mh) continue;
+            const double py = tmny + (yy + 0.5) * cell;
+            for (int dx = -rc; dx <= rc; ++dx) {
+              const int xx = cx + dx;
+              if (xx < 0 || xx >= mw) continue;
+              const double px = tmnx + (xx + 0.5) * cell;
+              const double ex = px - q.first, ey = py - q.second;
+              if (ex * ex + ey * ey <= r2) mask[(size_t)yy * mw + xx] = 1;
+            }
+          }
+        }
+        const size_t n_before = cloud->size();
+        pcl::PointCloud<pcl::PointXYZI>::Ptr traj_kept(
+            new pcl::PointCloud<pcl::PointXYZI>);
+        traj_kept->reserve(n_before);
+        for (const auto &p : cloud->points) {
+          if (!std::isfinite(p.x) || !std::isfinite(p.y)) continue;
+          const int cx = (int)((p.x - tmnx) / cell);
+          const int cy = (int)((p.y - tmny) / cell);
+          if (cx < 0 || cx >= mw || cy < 0 || cy >= mh) continue;
+          if (mask[(size_t)cy * mw + cx]) traj_kept->push_back(p);
+        }
+        if (traj_kept->empty()) {
+          // 裁没了说明轨迹和点云对不上(多半是 mat_pre.txt 来自另一次建图),
+          // 与其存一张空图, 不如原样保留并报警
+          RCLCPP_WARN(logger,
+              "轨迹裁剪把点全裁光了(轨迹 %zu 点, 半径 %.1fm) —— "
+              "多半是轨迹文件和这批 PCD 不是同一次建图, 已放弃裁剪",
+              traj.size(), traj_radius);
+        } else {
+          const double keep_pct = 100.0 * traj_kept->size() / (double)n_before;
+          cloud = traj_kept;
+          RCLCPP_INFO(logger,
+              "轨迹裁剪(半径 %.1fm, 轨迹 %zu 点/抽稀自 %zu 帧): "
+              "%zu -> %zu 点 (保留 %.1f%%)",
+              traj_radius, traj.size(), nline, n_before, cloud->size(), keep_pct);
+        }
+      }
+    }
+  }
+
   // ---------------- 离群点裁剪 (2026-08-06 新增, 必须在降采样之前) ----------------
   // 症状: 几十个离群点就能把包围盒撑到 150x173x54m(实际内容只有 23x19m), 后果有两个,
   // 而且都是**静默**的:
@@ -298,6 +433,10 @@ int main(int argc, char **argv)
   }
 
 
+  // 地面校平变换: 地图系 = ground_tf * camera_init 系。
+  // 提到块外面是因为末尾要把它导出给 GPS 地理配准用(见 .tf.yaml)。
+  // align_ground=false 时保持单位阵, 两个系重合。
+  Eigen::Affine3f ground_tf = Eigen::Affine3f::Identity();
   if (align_ground) {
     // 【坐标系】点云是 FAST-LIO 的 camera_init 系, 而 camera_init **不是重力对齐的**:
     // IMU_Processing 初始化时 rot=单位阵、grav=-mean_acc, 也就是说世界系直接取了
@@ -379,6 +518,7 @@ int main(int argc, char **argv)
         Eigen::Quaternionf q = Eigen::Quaternionf::FromTwoVectors(n, Eigen::Vector3f::UnitZ());
         Eigen::Affine3f tf = Eigen::Translation3f(0, 0, (float)lidar_height) * Eigen::Affine3f(q);
         pcl::transformPointCloud(*cloud, *cloud, tf);
+        ground_tf = tf;
         // 实测地面法向与"按安装角推出的期望法向"的夹角。这不再是"雷达装歪了多少"
         // (雷达就是故意装歪42°的), 而是**安装角标定的残差**: >3° 说明 launch 里的
         // lidar_pitch/lidar_roll 与实际不符, 该重标了。
@@ -415,11 +555,107 @@ int main(int argc, char **argv)
     }
   }
 
+  // ---------------- 局部地面高度网格 (2026-09-15 新增) ----------------
+  // 网格自己的包围盒用**全部点**算(不能用高度带过滤): 坡地上远处地面早就超出
+  // max_z 了, 用高度带筛会把那片区域整个漏掉, 网格也就补不出地面高度。
+  double gmin_x = 1e9, gmin_y = 1e9, gmax_x = -1e9, gmax_y = -1e9;
+  for (const auto &p : cloud->points) {
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+    gmin_x = std::min(gmin_x, (double)p.x); gmax_x = std::max(gmax_x, (double)p.x);
+    gmin_y = std::min(gmin_y, (double)p.y); gmax_y = std::max(gmax_y, (double)p.y);
+  }
+  const int gw = std::max(1, (int)std::ceil((gmax_x - gmin_x) / ground_cell));
+  const int gh = std::max(1, (int)std::ceil((gmax_y - gmin_y) / ground_cell));
+  const float NANF = std::numeric_limits<float>::quiet_NaN();
+  std::vector<float> gz((size_t)gw * gh, NANF);
+
+  if (local_ground) {
+    // 每格收集 z, 取低分位数当该格地面高度
+    std::vector<std::vector<float>> zs((size_t)gw * gh);
+    for (const auto &p : cloud->points) {
+      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+      const int cx = (int)((p.x - gmin_x) / ground_cell);
+      const int cy = (int)((p.y - gmin_y) / ground_cell);
+      if (cx < 0 || cx >= gw || cy < 0 || cy >= gh) continue;
+      zs[(size_t)cy * gw + cx].push_back(p.z);
+    }
+    size_t filled = 0;
+    for (size_t i = 0; i < zs.size(); ++i) {
+      auto &v = zs[i];
+      if ((int)v.size() < ground_min_pts) continue;
+      size_t k = (size_t)(v.size() * ground_pct);
+      if (k >= v.size()) k = v.size() - 1;
+      std::nth_element(v.begin(), v.begin() + k, v.end());
+      gz[i] = v[k];
+      ++filled;
+      std::vector<float>().swap(v);        // 尽早释放, 点多时省内存
+    }
+    // 空洞格(没有地面回波)用邻居均值迭代扩散补上
+    size_t holes = zs.size() - filled;
+    for (int iter = 0; iter < 60 && holes > 0; ++iter) {
+      std::vector<float> next = gz;
+      size_t still = 0;
+      for (int y = 0; y < gh; ++y) {
+        for (int x = 0; x < gw; ++x) {
+          const size_t i = (size_t)y * gw + x;
+          if (std::isfinite(gz[i])) continue;
+          float s = 0.0f; int c = 0;
+          for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+              const int nx = x + dx, ny = y + dy;
+              if (nx < 0 || nx >= gw || ny < 0 || ny >= gh) continue;
+              const float v = gz[(size_t)ny * gw + nx];
+              if (std::isfinite(v)) { s += v; ++c; }
+            }
+          }
+          if (c) next[i] = s / c; else ++still;
+        }
+      }
+      gz.swap(next);
+      if (still == holes) break;           // 补不动了(整片没数据), 停
+      holes = still;
+    }
+    RCLCPP_INFO(logger,
+                "局部地面网格: %dx%d 格(%.1fm), 实测地面 %zu 格, 插值补 %zu 格, "
+                "仍空 %zu 格(这些位置退回全局平面)",
+                gw, gh, ground_cell, filled, zs.size() - filled - holes, holes);
+  } else {
+    RCLCPP_INFO(logger, "local_ground=false, 使用原来的全局平面判定");
+  }
+
+  // 查某点脚下的地面高度; 网格没覆盖到就返回 0(= 退回全局平面)。
+  // 用双线性插值而不是直接取格值: 格值只代表"格中心"的地面高度, 若按格取常数,
+  // 地面模型就是台阶状 —— 2m 格在 8° 坡上格内高差 0.28m, 远超 min_z(0.10m),
+  // 靠上坡那侧的地面照样被判成障碍(2026-09-15 实测障碍仍有 3.2%)。
+  // 插值后地面模型是连续斜面, 恒定坡度几乎被完全抵消, 只剩地形曲率的残差。
+  auto cell_z = [&](int cx, int cy) -> float {
+    cx = std::min(std::max(cx, 0), gw - 1);      // 边界外夹回来, 避免边缘断崖
+    cy = std::min(std::max(cy, 0), gh - 1);
+    return gz[(size_t)cy * gw + cx];
+  };
+  auto ground_at = [&](float x, float y) -> float {
+    if (!local_ground) return 0.0f;
+    // 减 0.5 是因为格值代表格中心, 不是格左下角
+    const double fx = (x - gmin_x) / ground_cell - 0.5;
+    const double fy = (y - gmin_y) / ground_cell - 0.5;
+    const int x0 = (int)std::floor(fx), y0 = (int)std::floor(fy);
+    const double tx = fx - x0, ty = fy - y0;
+    const float v00 = cell_z(x0, y0),     v10 = cell_z(x0 + 1, y0);
+    const float v01 = cell_z(x0, y0 + 1), v11 = cell_z(x0 + 1, y0 + 1);
+    // 任一角是 NaN(该格无地面数据且插值也没补上)就退回全局平面
+    if (!std::isfinite(v00) || !std::isfinite(v10) ||
+        !std::isfinite(v01) || !std::isfinite(v11)) return 0.0f;
+    const double a = v00 * (1 - tx) + v10 * tx;
+    const double b = v01 * (1 - tx) + v11 * tx;
+    return (float)(a * (1 - ty) + b * ty);
+  };
+
   // 计算高度带内点的XY范围
   double min_x = 1e9, min_y = 1e9, max_x = -1e9, max_y = -1e9;
   for (const auto &p : cloud->points) {
     if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
-    if (p.z < ground_min_z || p.z > max_z) continue;
+    const float h = p.z - ground_at(p.x, p.y);   // 相对脚下地面的高度
+    if (h < ground_min_z || h > max_z) continue;
     min_x = std::min(min_x, (double)p.x); max_x = std::max(max_x, (double)p.x);
     min_y = std::min(min_y, (double)p.y); max_y = std::max(max_y, (double)p.y);
   }
@@ -443,12 +679,13 @@ int main(int argc, char **argv)
   std::vector<uint16_t> occ_cnt(width * height, 0), free_cnt(width * height, 0);
   for (const auto &p : cloud->points) {
     if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
-    if (p.z < ground_min_z || p.z > max_z) continue;
+    const float h = p.z - ground_at(p.x, p.y);   // 相对脚下地面的高度
+    if (h < ground_min_z || h > max_z) continue;
     const int gx = (int)((p.x - min_x) / resolution);
     const int gy = (int)((p.y - min_y) / resolution);
     if (gx < 0 || gx >= width || gy < 0 || gy >= height) continue;
     const int idx = gy * width + gx;
-    if (p.z >= min_z) {
+    if (h >= min_z) {
       if (occ_cnt[idx] < 65535) occ_cnt[idx]++;
     } else {
       if (free_cnt[idx] < 65535) free_cnt[idx]++;
@@ -540,6 +777,33 @@ int main(int argc, char **argv)
   bool ok = save_map(map_dir, map_name, grid, width, height, resolution, min_x, min_y, logger);
   if (ok && !backup_dir.empty()) {
     save_map(backup_dir, map_name, grid, width, height, resolution, min_x, min_y, logger);
+  }
+
+  // 导出地面校平变换, 供 georef_map.py 把轨迹从 camera_init 转到地图系。
+  // 不导的话 GPS 标定会漏掉校平这一层, 带一个约 0.7% 的单向尺度误差。
+  if (ok) {
+    const std::string tf_path = map_dir + "/" + map_name + ".tf.yaml";
+    std::ofstream tfs(tf_path);
+    if (tfs) {
+      const Eigen::Matrix4f M = ground_tf.matrix();
+      tfs << std::setprecision(10);
+      tfs << "# pcd2pgm 存图时使用的地面校平变换\n";
+      tfs << "# 地图系坐标 = ground_align_matrix * camera_init 系坐标 (行优先 4x4)\n";
+      tfs << "# 再减去 map_origin 才是像素坐标。georef_map.py 会读这个文件。\n";
+      tfs << "ground_align_matrix:\n";
+      for (int r = 0; r < 4; ++r) {
+        tfs << "  - [";
+        for (int c = 0; c < 4; ++c) tfs << (c ? ", " : "") << M(r, c);
+        tfs << "]\n";
+      }
+      tfs << "map_origin: [" << min_x << ", " << min_y << "]\n";
+      tfs << "resolution: " << resolution << "\n";
+      tfs << "align_ground: " << (align_ground ? "true" : "false") << "\n";
+      RCLCPP_INFO(logger, "校平变换已导出: %s", tf_path.c_str());
+    } else {
+      RCLCPP_WARN(logger, "校平变换写不出 (%s), GPS 地理配准会退回单位阵",
+                  tf_path.c_str());
+    }
   }
 
   rclcpp::shutdown();

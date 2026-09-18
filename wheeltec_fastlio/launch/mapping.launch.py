@@ -9,6 +9,7 @@ MID360 + FAST-LIO2 3D建图
 import glob
 import os
 import subprocess
+import sys
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
@@ -22,23 +23,68 @@ PCD_DIR = '/home/cat/wheeltec_ros2/src/FAST_LIO/PCD'
 
 
 def _clean_stale_dds_shm():
-    """清理被强杀进程残留的 FastDDS 共享内存/信号量文件(死锁毒源)。
-    仅在当前没有其它ROS进程运行时清理。详见 navigation.launch.py 同名函数。"""
-    probe = subprocess.run(
-        ['pgrep', '-f',
-         'component_container|livox_ros_driver2|wheeltec_robot_node|'
-         'fastlio_mapping|ekf_node|rviz2|pointcloud_to_laserscan|'
-         'astra_camera_node'],
-        capture_output=True, text=True)
-    if probe.stdout.strip():
+    """清理被强杀进程残留的 FastDDS 共享内存/信号量文件。
+
+    进程被 kill -9 或段错误退出后, /dev/shm 会残留已锁定的
+    sem.fastrtps_portXXXX_mutex, 新启动的节点(尤其nav2容器)尝试加锁时
+    会在 futex 上永久死锁(表现为100%CPU且无日志)。
+
+    只删没有任何活进程在用的文件(2026-09-18 改)。原来按进程名猜"还有没有别的
+    ROS 进程在跑", 名单总有漏的(RTK驱动/gps_map_odom/ros2 daemon/手敲的命令),
+    会删掉活进程的文件使其通信断开; FastDDS 还靠 *_el 锁文件判断端口/段的主人
+    是否活着, 锁文件被删, 后来的进程会把活端口当空闲占用, 两个进程共用一个端口。
+    现在直接问内核: 被某个进程映射(/proc/*/maps)或打开(/proc/*/fd)就是在用。
+    同一段/端口的几个文件(本体、_el 锁、sem.*_mutex)算一组, 组内有一个在用或
+    10 秒内新建(防止和正在启动的进程赛跑), 整组保留。
+    """
+    import time
+    groups = {}
+    for f in (glob.glob('/dev/shm/fastrtps_*') +
+              glob.glob('/dev/shm/sem.fastrtps_*') +
+              glob.glob('/dev/shm/fast_datasharing*')):
+        key = os.path.basename(f)
+        if key.startswith('sem.'):
+            key = key[4:]
+        for suffix in ('_mutex', '_el', '_sl'):
+            if key.endswith(suffix):
+                key = key[:-len(suffix)]
+                break
+        groups.setdefault(key, []).append(f)
+    if not groups:
         return
-    for f in glob.glob('/dev/shm/fastrtps_*') + \
-             glob.glob('/dev/shm/sem.fastrtps_*') + \
-             glob.glob('/dev/shm/fast_datasharing*'):
+    used = set()  # 在用文件的 inode
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit():
+            continue
         try:
-            os.remove(f)
+            with open('/proc/%s/maps' % pid) as fh:
+                for line in fh:
+                    if ' /dev/shm/' in line:
+                        used.add(line.split()[4])
+            fds = os.listdir('/proc/%s/fd' % pid)
         except OSError:
-            pass
+            continue
+        for fd in fds:
+            link = '/proc/%s/fd/%s' % (pid, fd)
+            try:
+                if os.readlink(link).startswith('/dev/shm/'):
+                    used.add(str(os.stat(link).st_ino))
+            except OSError:
+                pass
+    now = time.time()
+    for files in groups.values():
+        try:
+            stats = [os.stat(f) for f in files]
+        except OSError:
+            continue
+        if any(str(s.st_ino) in used or now - max(s.st_mtime, s.st_ctime) < 10.0
+               for s in stats):
+            continue
+        for f in files:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
 
 def _abort_if_already_running():
@@ -47,7 +93,7 @@ def _abort_if_already_running():
     probe = subprocess.run(
         ['pgrep', '-af',
          'component_container_isolated|livox_ros_driver2_node|'
-         'wheeltec_robot_node|fastlio_mapping|astra_camera_node'],
+         'wheeltec_robot_node|fastlio_mapping|astra_camera_node|nav2_waypoint_cycle'],
         capture_output=True, text=True)
     lines = [l for l in probe.stdout.strip().splitlines() if l]
     if lines:
@@ -88,13 +134,37 @@ def _check_disk():
         print(f'磁盘剩余 {free_gb:.1f}GB, 约够建图 {minutes} 分钟(每分钟约100MB)')
 
 
+def _handle_stale_pcd():
+    """处理上次建图遗留的分段点云。
+
+    这些分段必须先清掉, 否则 save_map 会把两次建图的点云混在一起 —— FAST-LIO
+    每次都重新初始化世界系, 混出来的是废图。
+    但**不再静默删除**(2026-09-14 改): 删掉的可能是用户还没来得及存图的数据。
+    要清理就显式传 clear_pcd:=true, 否则直接拒绝启动并说明怎么处理。
+    """
+    stale = sorted(glob.glob(os.path.join(PCD_DIR, 'scans*.pcd')))
+    if not stale:
+        return
+    if any(a.strip() == 'clear_pcd:=true' for a in sys.argv):
+        for f in stale:
+            os.remove(f)
+        print(f'\033[33m[PCD] 已清理上次建图遗留的 {len(stale)} 个分段\033[0m')
+        return
+    raise RuntimeError(
+        f'\n检测到上次建图遗留的 {len(stale)} 个 PCD 分段, 拒绝启动!\n'
+        '直接开始新建图, save_map 会把新旧两次的点云混在一起(生成废图)。\n'
+        '请二选一:\n'
+        '  1) 旧数据不要了(已经存过图) —— 清理后启动:\n'
+        '     ros2 launch wheeltec_fastlio mapping.launch.py clear_pcd:=true\n'
+        '  2) 旧数据还要 —— 先备份再启动:\n'
+        f'     mv {PCD_DIR}/scans*.pcd <备份目录>/\n'
+        '(网页控制台点"建图"会弹窗确认, 不用手敲命令)\n')
+
+
 def generate_launch_description():
     _abort_if_already_running()
     _clean_stale_dds_shm()
-    # 清理上次建图的分段点云, 防止 save_map 时新旧数据混在一起
-    # (如需保留上次的3D点云, 启动建图前请自行备份 PCD 目录)
-    for f in glob.glob(os.path.join(PCD_DIR, 'scans*.pcd')):
-        os.remove(f)
+    _handle_stale_pcd()
     _check_disk()
     pkg_dir = get_package_share_directory('wheeltec_fastlio')
     wheeltec_launch_dir = os.path.join(
@@ -222,6 +292,8 @@ def generate_launch_description():
             description='建图时是否起相机(仅彩色流, 给网页看实时画面; 不参与建图)'),
         DeclareLaunchArgument('blind_back_deg', default_value='90.0',
             description='屏蔽雷达正后方多少度的扇区(全角), 防止跟车的人被建进地图; 0=不屏蔽'),
+        DeclareLaunchArgument('clear_pcd', default_value='false',
+            description='true=启动前清掉上次建图遗留的PCD分段; false=有遗留就拒绝启动'),
         wheeltec_robot,
         livox_driver,
         fast_lio,

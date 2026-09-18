@@ -25,29 +25,71 @@ def _clean_stale_dds_shm():
     进程被 kill -9 或段错误退出后, /dev/shm 会残留已锁定的
     sem.fastrtps_portXXXX_mutex, 新启动的节点(尤其nav2容器)尝试加锁时
     会在 futex 上永久死锁(表现为100%CPU且无日志)。
-    仅在当前没有其它ROS进程运行时清理, 避免误删活动会话的文件。
+
+    只删没有任何活进程在用的文件(2026-09-18 改)。原来按进程名猜"还有没有别的
+    ROS 进程在跑", 名单总有漏的(RTK驱动/gps_map_odom/ros2 daemon/手敲的命令),
+    会删掉活进程的文件使其通信断开; FastDDS 还靠 *_el 锁文件判断端口/段的主人
+    是否活着, 锁文件被删, 后来的进程会把活端口当空闲占用, 两个进程共用一个端口。
+    现在直接问内核: 被某个进程映射(/proc/*/maps)或打开(/proc/*/fd)就是在用。
+    同一段/端口的几个文件(本体、_el 锁、sem.*_mutex)算一组, 组内有一个在用或
+    10 秒内新建(防止和正在启动的进程赛跑), 整组保留。
     """
-    probe = subprocess.run(
-        ['pgrep', '-f',
-         'component_container|livox_ros_driver2|wheeltec_robot_node|'
-         'fastlio_mapping|ekf_node|rviz2|pointcloud_to_laserscan|'
-         'astra_camera_node'],
-        capture_output=True, text=True)
-    others = [p for p in probe.stdout.split() if p and int(p) != os.getpid()]
-    if others:
+    import time
+    groups = {}
+    for f in (glob.glob('/dev/shm/fastrtps_*') +
+              glob.glob('/dev/shm/sem.fastrtps_*') +
+              glob.glob('/dev/shm/fast_datasharing*')):
+        key = os.path.basename(f)
+        if key.startswith('sem.'):
+            key = key[4:]
+        for suffix in ('_mutex', '_el', '_sl'):
+            if key.endswith(suffix):
+                key = key[:-len(suffix)]
+                break
+        groups.setdefault(key, []).append(f)
+    if not groups:
         return
-    for f in glob.glob('/dev/shm/fastrtps_*') + \
-             glob.glob('/dev/shm/sem.fastrtps_*') + \
-             glob.glob('/dev/shm/fast_datasharing*'):
+    used = set()  # 在用文件的 inode
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit():
+            continue
         try:
-            os.remove(f)
+            with open('/proc/%s/maps' % pid) as fh:
+                for line in fh:
+                    if ' /dev/shm/' in line:
+                        used.add(line.split()[4])
+            fds = os.listdir('/proc/%s/fd' % pid)
         except OSError:
-            pass
+            continue
+        for fd in fds:
+            link = '/proc/%s/fd/%s' % (pid, fd)
+            try:
+                if os.readlink(link).startswith('/dev/shm/'):
+                    used.add(str(os.stat(link).st_ino))
+            except OSError:
+                pass
+    now = time.time()
+    for files in groups.values():
+        try:
+            stats = [os.stat(f) for f in files]
+        except OSError:
+            continue
+        if any(str(s.st_ino) in used or now - max(s.st_mtime, s.st_ctime) < 10.0
+               for s in stats):
+            continue
+        for f in files:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.actions import Node
 
 
@@ -57,7 +99,7 @@ def _abort_if_already_running():
     probe = subprocess.run(
         ['pgrep', '-af',
          'component_container_isolated|livox_ros_driver2_node|'
-         'wheeltec_robot_node|fastlio_mapping|astra_camera_node'],
+         'wheeltec_robot_node|fastlio_mapping|astra_camera_node|nav2_waypoint_cycle'],
         capture_output=True, text=True)
     lines = [l for l in probe.stdout.strip().splitlines() if l]
     if lines:
@@ -182,8 +224,12 @@ def generate_launch_description():
             # min_height 不能太低: 车身加减速俯仰1~2°时, 远处地面点表观高度会
             # 抬升(5m外抬~0.1m), 低于0.15会把地面扫成环状幻影障碍, 导致
             # "Starting point in lethal space" 时好时坏
-            'min_height': 0.15,
-            'max_height': 0.45,   # 与save_map的max_z一致(小车可通行高度)
+            'min_height': ParameterValue(LaunchConfiguration('scan_min_z'),
+                                         value_type=float),
+            # 与 save_map 的 max_z 必须一致 —— 地图和 /scan 不同带, 似然场会把
+            # 差集当失配。户外模式两边一起提到 2.0(见 outdoor_navigation.launch.py)
+            'max_height': ParameterValue(LaunchConfiguration('scan_max_z'),
+                                         value_type=float),
             'angle_min': -3.14159,
             'angle_max': 3.14159,
             'angle_increment': 0.0058,   # ~0.33度
@@ -228,6 +274,20 @@ def generate_launch_description():
 
     # 直接起驱动节点(不 include astra.launch.xml): 那个 xml 没暴露
     # camera_link_frame_id, 而我们必须换掉这个名字 —— 见下面 camera_tf 的说明。
+
+    # 标定内参(可选): tagdocking 包的 ost.yaml 存在时让驱动加载, 否则用驱动默认内参。
+    # 标定方法: tagdocking/scripts/calibrate_camera (需 ssh -X 跑 cameracalibrator)。
+    # 文件不存在时留空 —— astra 驱动 color_info_url 为空就不建 CameraInfoManager,
+    # 不刷 warn; 标定后 colcon build --packages-select tagdocking 把 ost.yaml 装进 install 即生效。
+    # 注意: ost 的 [name] 段必须是 "rgb_camera"(驱动 setupCameraInfoManager 硬编码的
+    # CameraInfoManager 名), 否则 isCalibrated() 返 false 静默回退默认内参;
+    # 标定分辨率须 == color_width/height(640x480), 否则 getColorCameraInfo() 会 warn 回退。
+    calibration_ost_path = os.path.join(
+        get_package_share_directory('tagdocking'),
+        'config', 'calibration', 'ost.yaml')
+    color_info_url = ('file://' + calibration_ost_path
+                      if os.path.exists(calibration_ost_path) else '')
+
     astra_camera = Node(
         condition=IfCondition(use_camera),
         package='astra_camera',
@@ -238,6 +298,7 @@ def generate_launch_description():
         parameters=[{
             'camera_name': 'camera',
             'camera_link_frame_id': 'camera_mount_link',
+            'color_info_url': color_info_url,
             'vendor_id': '0x2bc5',
             'device_num': 1,
             'connection_delay': 100,
@@ -361,7 +422,11 @@ def generate_launch_description():
 
     # 扫描匹配自动重定位: 启动后自动定位(无需2D Pose Estimate),
     # 定位丢失可手动触发: ros2 service call /relocalize std_srvs/srv/Trigger
+    # 户外 gps 定位模式下关闭(见 outdoor_navigation.launch.py): 那时 GPS 直接给
+    # 绝对位姿, 点云配准的重定位只会反复给出错误坐标。室内默认开, 行为不变。
     auto_relocalize = Node(
+        condition=IfCondition(LaunchConfiguration('use_auto_relocalize',
+                                                  default='true')),
         package='wheeltec_fastlio',
         executable='auto_relocalize',
         name='auto_relocalize',
@@ -406,6 +471,12 @@ def generate_launch_description():
             description='雷达下倾角(弧度), 2026-08-06 实测 10.94°(IMU重力法)'),
         DeclareLaunchArgument('lidar_roll', default_value='0.006',
             description='雷达横滚角(弧度), 实测 0.32°'),
+        DeclareLaunchArgument('use_auto_relocalize', default_value='true',
+            description='是否启动点云配准自动重定位(户外 RTK 定位时应关闭)'),
+        DeclareLaunchArgument('scan_min_z', default_value='0.15',
+            description='/scan 障碍带下限(米, 地面上方)'),
+        DeclareLaunchArgument('scan_max_z', default_value='0.45',
+            description='/scan 障碍带上限(米)。必须与存图时的 max_z 一致'),
         DeclareLaunchArgument('use_camera', default_value='true',
             description='是否启动 Astra 相机驱动(网页实时画面用; false=完全不起相机)'),
         DeclareLaunchArgument('camera_avoid', default_value='false',

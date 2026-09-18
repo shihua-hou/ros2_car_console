@@ -23,6 +23,7 @@ from collections import deque
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from apriltag_msgs.msg import AprilTagDetectionArray
 import tf2_ros
 
@@ -57,7 +58,7 @@ class TestApriltag(Node):
 
     def __init__(self, tag_id=0, tag_family='36h11', tag_size=0.16,
                  camera_frame='camera_color_optical_frame',
-                 base_frame='base_link', measure_frame='',
+                 base_frame='base_link', measure_frame='camera_color_optical_frame',
                  sample_batch=50, known_distance=0.0):
         super().__init__('test_apriltag')
 
@@ -149,12 +150,19 @@ class TestApriltag(Node):
             return
 
         # TF 查询 src_frame→tag 的结果已经是 src_frame 坐标系的表示。
-        # base_link 遵循 REP-103: x=前, y=左, z=上。
-        # 直接取 x 为距离, y 为横向即可，不需要再做光学坐标系转换。
-        dist = t.transform.translation.x
-        lat  = t.transform.translation.y
+        # 取轴方式取决于 src_frame 是光学系还是常规 REP-103 系：
+        #   光学坐标系 (camera_*_optical_frame): z=前, x=右, y=下
+        #   常规系 (base_link 等 REP-103):      x=前, y=左, z=上
+        # 统一成 "距离>0=在前方, 横向>0=在左" 的语义, 与 _describe_lat/yaw 一致。
+        is_optical = 'optical_frame' in src_frame
+        if is_optical:
+            dist = t.transform.translation.z      # z = 相机正前方距离
+            lat  = -t.transform.translation.x     # x=右 → 取负变"左为正"
+        else:
+            dist = t.transform.translation.x
+            lat  = t.transform.translation.y
 
-        # 方位角 = 机器人需要转多少弧度才能正对 Tag
+        # 方位角 = 需要转多少弧度才能正对 Tag
         # atan2(lat, dist)，正=Tag在左边，需要左转(CCW)
         yaw = math.atan2(lat, dist) if dist > 0.001 else 0.0
 
@@ -278,7 +286,12 @@ def _launch_apriltag_node(tag_family: str, tag_size: float, tag_id: int,
         stderr=subprocess.DEVNULL,
         preexec_fn=os.setsid,
     )
-    time.sleep(2.0)
+    try:
+        time.sleep(2.0)
+    except KeyboardInterrupt:
+        # 启动等待期间被 Ctrl+C: 先把子进程杀了再走, 否则泄漏
+        _kill_apriltag_node(proc)
+        raise
     if proc.poll() is not None:
         print('失败！请检查 apriltag_ros 是否已安装。')
         sys.exit(1)
@@ -330,8 +343,9 @@ def main(args=None):
     parser.add_argument('--camera-frame', default='camera_color_optical_frame',
                         help='相机光学坐标系帧名')
     parser.add_argument('--base-frame', default='base_link', help='机器人基座坐标系')
-    parser.add_argument('--measure-frame', default='',
-                        help='直接从此坐标系查 Tag（跳过相机坐标转换）')
+    parser.add_argument('--measure-frame', default='camera_color_optical_frame',
+                        help='从此坐标系查 Tag (默认相机光学系, 直测相机→Tag 距离; '
+                             '设为 base_link 测底盘→Tag; 空字符串=用 --base-frame)')
     parser.add_argument('--sample-batch', type=int, default=50,
                         help='每 N 帧输出一次汇总 (默认 50)')
     parser.add_argument('--known-distance', type=float, default=0.0,
@@ -353,12 +367,17 @@ def main(args=None):
 
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        # 先杀 apriltag_node, 再收拾 rclpy:
+        # Ctrl+C 时 rclpy 的信号处理器已把 context 关掉了, spin 抛的是
+        # ExternalShutdownException, 且 rclpy.shutdown() 会因重复关闭
+        # 抛 RCLError —— 如果先调 shutdown, 异常会跳过子进程清理, 造成泄漏
         _kill_apriltag_node(apriltag_proc)
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
         print('  已退出。')
 
 

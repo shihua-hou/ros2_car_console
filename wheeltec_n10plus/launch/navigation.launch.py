@@ -40,17 +40,68 @@ def _abort_if_already_running():
 
 
 def _clean_stale_dds_shm():
-    probe = subprocess.run(['pgrep', '-f', EXT_PATTERN],
-                           capture_output=True, text=True)
-    if probe.stdout.strip():
+    """清理被强杀进程残留的 FastDDS 共享内存/信号量文件。
+
+    进程被 kill -9 或段错误退出后, /dev/shm 会残留已锁定的
+    sem.fastrtps_portXXXX_mutex, 新启动的节点(尤其nav2容器)尝试加锁时
+    会在 futex 上永久死锁(表现为100%CPU且无日志)。
+
+    只删没有任何活进程在用的文件(2026-09-18 改)。原来按进程名猜"还有没有别的
+    ROS 进程在跑", 名单总有漏的(RTK驱动/gps_map_odom/ros2 daemon/手敲的命令),
+    会删掉活进程的文件使其通信断开; FastDDS 还靠 *_el 锁文件判断端口/段的主人
+    是否活着, 锁文件被删, 后来的进程会把活端口当空闲占用, 两个进程共用一个端口。
+    现在直接问内核: 被某个进程映射(/proc/*/maps)或打开(/proc/*/fd)就是在用。
+    同一段/端口的几个文件(本体、_el 锁、sem.*_mutex)算一组, 组内有一个在用或
+    10 秒内新建(防止和正在启动的进程赛跑), 整组保留。
+    """
+    import time
+    groups = {}
+    for f in (glob.glob('/dev/shm/fastrtps_*') +
+              glob.glob('/dev/shm/sem.fastrtps_*') +
+              glob.glob('/dev/shm/fast_datasharing*')):
+        key = os.path.basename(f)
+        if key.startswith('sem.'):
+            key = key[4:]
+        for suffix in ('_mutex', '_el', '_sl'):
+            if key.endswith(suffix):
+                key = key[:-len(suffix)]
+                break
+        groups.setdefault(key, []).append(f)
+    if not groups:
         return
-    for f in glob.glob('/dev/shm/fastrtps_*') + \
-             glob.glob('/dev/shm/sem.fastrtps_*') + \
-             glob.glob('/dev/shm/fast_datasharing*'):
+    used = set()  # 在用文件的 inode
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit():
+            continue
         try:
-            os.remove(f)
+            with open('/proc/%s/maps' % pid) as fh:
+                for line in fh:
+                    if ' /dev/shm/' in line:
+                        used.add(line.split()[4])
+            fds = os.listdir('/proc/%s/fd' % pid)
         except OSError:
-            pass
+            continue
+        for fd in fds:
+            link = '/proc/%s/fd/%s' % (pid, fd)
+            try:
+                if os.readlink(link).startswith('/dev/shm/'):
+                    used.add(str(os.stat(link).st_ino))
+            except OSError:
+                pass
+    now = time.time()
+    for files in groups.values():
+        try:
+            stats = [os.stat(f) for f in files]
+        except OSError:
+            continue
+        if any(str(s.st_ino) in used or now - max(s.st_mtime, s.st_ctime) < 10.0
+               for s in stats):
+            continue
+        for f in files:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
 
 def generate_launch_description():

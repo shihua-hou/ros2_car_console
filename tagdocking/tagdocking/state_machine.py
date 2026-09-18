@@ -2,12 +2,13 @@
 
 States:
     IDLE         — waiting for start command
-    NAVIGATING   — Nav2 pre-dock navigation (optional, skipped if nav disabled)
     SEARCH_TAG   — rotating/pausing to find the AprilTag
     ALIGN        — (legacy, skipped — absorbed into APPROACH stop-and-go)
     APPROACH     — stop-and-go: lateral→yaw→forward via geometry planner
     FINAL_SERVO  — stability confirmation (tag pose stable + velocity zero)
     DOCKED       — success: position + yaw within tolerance, robot stable
+    UNDOCKING    — pulling out: blind reverse a distance + 180° turn
+    UNDOCKED     — success: undock maneuver complete
 
 Error terminal states:
     TAG_LOST     — tag not visible for > timeout
@@ -24,30 +25,33 @@ from .utils import normalize_angle
 
 class DockingState(enum.IntEnum):
     IDLE = 0
-    NAVIGATING = 1
     SEARCH_TAG = 2
     ALIGN = 3
     APPROACH = 4
     FINAL_SERVO = 5
     DOCKED = 6
+    RETRYING = 8          # 失败后倒车重试(活动态, 节点驱动盲退后转 SEARCH_TAG)
+    UNDOCKING = 9         # 泊出(活动态): 盲退一段距离 + 原地转180°
     # Error states
     TAG_LOST = 10
     TIMEOUT = 11
     MOTION_FAILED = 12
     CANCELLED = 13
+    UNDOCKED = 14         # 泊出成功(终态)
 
 
 # States that are considered "active" (not terminal)
 _ACTIVE_STATES = {
-    DockingState.NAVIGATING,
     DockingState.SEARCH_TAG,
     DockingState.ALIGN,
     DockingState.APPROACH,
     DockingState.FINAL_SERVO,
+    DockingState.RETRYING,
+    DockingState.UNDOCKING,
 }
 
-# Terminal success state
-_SUCCESS_STATE = DockingState.DOCKED
+# Terminal success states
+_SUCCESS_STATES = {DockingState.DOCKED, DockingState.UNDOCKED}
 
 # Terminal error states
 _ERROR_STATES = {
@@ -66,7 +70,7 @@ class DockingStateMachine:
 
     Usage:
         sm = DockingStateMachine(params)
-        sm.start(enable_navigation=False)
+        sm.start()
         # In control loop:
         sm.evaluate(tag_pose, tag_visible, odom_data, now_ns)
         state = sm.state
@@ -79,8 +83,6 @@ class DockingStateMachine:
         self._docking_start_ns = 0
 
         # Per-state sub-phase tracking
-        self._search_phase = 'rotate'     # 'rotate' | 'pause'
-        self._search_phase_start_ns = 0
         self._search_tag_hold_start_ns = 0
         self._align_hold_count = 0
         self._tag_lost_count = 0
@@ -88,6 +90,10 @@ class DockingStateMachine:
         # Final servo stability
         self._stable_since_ns = 0
         self._last_velocity = (0.0, 0.0, 0.0)
+
+        # 失败重试: 倒车后重新停靠。max_retries 由节点从参数写入。
+        self._retry_count = 0
+        self._max_retries = 2
 
     # ── Properties ──────────────────────────────────────────────────
 
@@ -105,15 +111,19 @@ class DockingStateMachine:
 
     @property
     def is_terminal(self) -> bool:
-        return self._state in _ERROR_STATES or self._state == _SUCCESS_STATE
+        return self._state in _ERROR_STATES or self._state in _SUCCESS_STATES
 
     @property
     def is_success(self) -> bool:
-        return self._state == _SUCCESS_STATE
+        return self._state in _SUCCESS_STATES
 
     @property
     def is_error(self) -> bool:
         return self._state in _ERROR_STATES
+
+    @property
+    def retry_count(self) -> int:
+        return self._retry_count
 
     def elapsed_ns(self, now_ns: int) -> int:
         """Nanoseconds since docking started."""
@@ -129,34 +139,97 @@ class DockingStateMachine:
 
     # ── Actions ─────────────────────────────────────────────────────
 
-    def start(self, enable_navigation: bool):
-        """Initiate docking. Transitions to NAVIGATING or SEARCH_TAG."""
-        if self._state not in (DockingState.IDLE, DockingState.DOCKED,
-                               *[s for s in _ERROR_STATES]):
+    def start(self):
+        """Initiate docking. Transitions straight to SEARCH_TAG.
+
+        Navigation (Nav2 pre-dock) has been removed — an external service is
+        expected to bring the robot into tag range before calling start.
+
+        Allowed from any non-active state: IDLE, a success terminal (DOCKED /
+        UNDOCKED), or an error terminal. In particular re-docking after an
+        undock (UNDOCKED) must be allowed — otherwise a dock→undock→dock cycle
+        gets stuck at "无法启动：当前状态=UNDOCKED".
+        """
+        if self._state not in (DockingState.IDLE, *_SUCCESS_STATES, *_ERROR_STATES):
             self._node.get_logger().warn(f'无法启动：当前状态={self._state.name}')
             return False
 
-        self._transition_to(
-            DockingState.NAVIGATING if enable_navigation else DockingState.SEARCH_TAG)
-        if self._docking_start_ns == 0:
-            self._docking_start_ns = self._state_start_ns
+        self._retry_count = 0   # 用户主动启动: 重试计数清零
+        self._transition_to(DockingState.SEARCH_TAG)
+        # 每次用户触发都是一次全新的停泊: 重置整体超时起点。
+        # (重试走 retry_search(), 不动 _docking_start_ns, 故同一次停泊内的
+        #  多次倒车重试仍累计在同一超时窗口内。)
+        self._docking_start_ns = self._state_start_ns
         return True
+
+    def start_undock(self):
+        """Initiate undocking (pull out): blind reverse + 180° turn.
+
+        Allowed from any non-active state (IDLE / DOCKED / error terminals) —
+        typically called after DOCKED. Rejected if a docking sequence is in
+        progress. The node drives the blind two-step maneuver; on completion
+        it calls finish_undock() → UNDOCKED.
+        """
+        if self._state in _ACTIVE_STATES:
+            self._node.get_logger().warn(
+                f'无法泊出：停泊进行中({self._state.name})')
+            return False
+        self._transition_to(DockingState.UNDOCKING)
+        # 泊出是一次独立操作: 重置整体超时起点, 否则 UNDOCKING 也受全局超时
+        # (_ACTIVE_STATES) 管辖, 而 _docking_start_ns 还停留在上次停泊的 t0,
+        # 隔一阵再触发泊出会立刻 elapsed>timeout_sec 落 TIMEOUT。
+        self._docking_start_ns = self._state_start_ns
+        return True
+
+    def finish_undock(self):
+        """Node calls this when the undock maneuver completed → UNDOCKED."""
+        self._transition_to(DockingState.UNDOCKED)
 
     def cancel(self):
         """User cancel — transition to CANCELLED."""
         self._transition_to(DockingState.CANCELLED)
+
+    def fail(self, reason: str = ''):
+        """节点主动报失败 — 可重试的失败(如直行阶段对准过差)。
+
+        若还有重试次数, 转 RETRYING: 节点盲退一段距离后由 retry_search() 转
+        SEARCH_TAG 重新锁定靠近。退满 max_retries 次仍失败才落 MOTION_FAILED 终态。
+        AprilTag 近场位姿(尤其降采样后的小码)单帧噪声大, 直行入口一次方位超限
+        往往是抖动而非真没对准 —— 后退重锁给一次重新靠近的机会。
+        与 cancel()(用户主动取消)区分: cancel() 不重试, 直接终态。
+        """
+        if reason:
+            self._node.get_logger().error(f'导航失败：{reason}')
+        if self._retry_count < self._max_retries:
+            self._retry_count += 1
+            self._node.get_logger().warn(
+                f'停靠失败，自动重试({self._retry_count}/{self._max_retries}) '
+                f'→ 倒车后重新锁定')
+            self._transition_to(DockingState.RETRYING)
+        else:
+            self._node.get_logger().error(
+                f'停靠失败且已达最大重试次数({self._max_retries})')
+            self._transition_to(DockingState.MOTION_FAILED)
+
+    def retry_search(self):
+        """RETRYING 倒车到位后调用: 转 SEARCH_TAG 重新锁定。
+
+        保留 _docking_start_ns(整体超时累计), 只重置搜索子相位。
+        """
+        self._search_tag_hold_start_ns = 0
+        self._tag_lost_count = 0
+        self._transition_to(DockingState.SEARCH_TAG)
 
     def reset(self):
         """Full reset to IDLE."""
         self._state = DockingState.IDLE
         self._state_start_ns = 0
         self._docking_start_ns = 0
-        self._search_phase = 'rotate'
-        self._search_phase_start_ns = 0
         self._search_tag_hold_start_ns = 0
         self._align_hold_count = 0
         self._tag_lost_count = 0
         self._stable_since_ns = 0
+        self._retry_count = 0
 
     # ── State machine evaluation ────────────────────────────────────
 
@@ -170,8 +243,6 @@ class DockingStateMachine:
                  cmd_vy: float,
                  cmd_wz: float,
                  motion_stalled: bool,
-                 nav_done: bool,
-                 nav_success: bool,
                  now_ns: int,
                  params: dict,
                  maneuver_active: bool = False):
@@ -183,8 +254,6 @@ class DockingStateMachine:
             odom_*: Current odometry.
             cmd_*: Current velocity command being sent.
             motion_stalled: True if motion stalled (handled by action_executor now).
-            nav_done: True if Nav2 navigation completed.
-            nav_success: True if Nav2 succeeded.
             now_ns: Current ROS time in nanoseconds.
             params: Dict of all relevant parameters (see _get_params_keys).
             maneuver_active: True while a blind turn-drive-turn maneuver is
@@ -241,20 +310,6 @@ class DockingStateMachine:
         if state == DockingState.IDLE:
             pass  # wait for start command
 
-        elif state == DockingState.NAVIGATING:
-            nav_timeout = params.get('navigation', {}).get('nav2_timeout_sec', 60.0)
-            elapsed = self.state_elapsed_ns(now_ns) * 1e-9
-            if nav_done:
-                if nav_success:
-                    self._node.get_logger().info('Nav2 完成 → SEARCH_TAG')
-                    self._transition_to(DockingState.SEARCH_TAG)
-                else:
-                    self._node.get_logger().error('Nav2 失败')
-                    self._transition_to(DockingState.TIMEOUT)
-            elif elapsed > nav_timeout:
-                self._node.get_logger().error(f'Nav2 超时（{nav_timeout:.0f}s）')
-                self._transition_to(DockingState.TIMEOUT)
-
         elif state == DockingState.SEARCH_TAG:
             self._eval_search(tag_visible, tag_pose, now_ns, params)
 
@@ -268,7 +323,23 @@ class DockingStateMachine:
             self._eval_final_servo(tag_visible, tag_pose, now_ns,
                                    cmd_vx, cmd_vy, cmd_wz, params)
 
-        elif state in _ERROR_STATES or state == _SUCCESS_STATE:
+        elif state == DockingState.RETRYING:
+            # 倒车超时保护: 里程计不走(底盘卡死/失联)会卡在 RETRYING,
+            # 直接落 MOTION_FAILED 终态(不再重试, 防止无限倒车)。
+            retry_timeout = params.get('retry', {}).get('timeout_sec', 15.0)
+            if self.state_elapsed_ns(now_ns) * 1e-9 > retry_timeout:
+                self._node.get_logger().error('重试倒车超时 — MOTION_FAILED')
+                self._transition_to(DockingState.MOTION_FAILED)
+
+        elif state == DockingState.UNDOCKING:
+            # 泊出超时保护: 里程计不走(底盘卡死/失联)会卡在 UNDOCKING,
+            # 直接落 MOTION_FAILED 终态。
+            undock_timeout = params.get('undock', {}).get('timeout_sec', 30.0)
+            if self.state_elapsed_ns(now_ns) * 1e-9 > undock_timeout:
+                self._node.get_logger().error('泊出超时 — MOTION_FAILED')
+                self._transition_to(DockingState.MOTION_FAILED)
+
+        elif state in _ERROR_STATES or state in _SUCCESS_STATES:
             pass  # terminal states
 
         return self._state
@@ -276,13 +347,14 @@ class DockingStateMachine:
     # ── Per-state evaluators ───────────────────────────────────────
 
     def _eval_search(self, tag_visible, tag_pose, now_ns, params):
-        """SEARCH_TAG: rotate-pause scan pattern."""
+        """SEARCH_TAG: 角度步进扫描；节点负责转/检循环，这里只判超时和锁定。
+
+        节点的 _run_search 负责转固定角度(里程计闭环)→停稳→检测的循环。
+        转动期节点冻结检测(_frozen=True)，_on_detections 直接返回，故
+        tag_visible 在转动期恒为 False，这里的 tag-lock 不会在转动中误触发。
+        """
         search_cfg = params.get('search', {})
-        rotate_time = search_cfg.get('rotate_time_sec', 0.8)
-        pause_time = search_cfg.get('pause_time_sec', 1.5)
         hold_time = search_cfg.get('hold_time_sec', 0.5)
-        angular_speed = search_cfg.get('angular_speed', 0.3)
-        search_dir = search_cfg.get('search_direction', 1)
         search_timeout = search_cfg.get('timeout_sec', 60.0)
 
         # Per-state timeout
@@ -291,26 +363,8 @@ class DockingStateMachine:
             self._transition_to(DockingState.TIMEOUT)
             return
 
-        # Phase switching
-        elapsed_phase = (now_ns - self._search_phase_start_ns) * 1e-9
-
-        if self._search_phase == 'rotate':
-            if elapsed_phase > rotate_time:
-                self._search_phase = 'pause'
-                self._search_phase_start_ns = now_ns
-                self._node.get_logger().debug('Search: pause for detection',
-                                              throttle_duration_sec=1.0)
-                return
-        elif self._search_phase == 'pause':
-            if elapsed_phase > pause_time:
-                self._search_phase = 'rotate'
-                self._search_phase_start_ns = now_ns
-                self._node.get_logger().debug('Search: rotate',
-                                              throttle_duration_sec=1.0)
-                return
-
-        # Tag lock during pause
-        if tag_visible and self._search_phase == 'pause':
+        # Tag lock: 检测期持续可见 hold_time → APPROACH
+        if tag_visible and tag_pose is not None:
             if self._search_tag_hold_start_ns == 0:
                 self._search_tag_hold_start_ns = now_ns
             else:
@@ -445,8 +499,6 @@ class DockingStateMachine:
         self._state_start_ns = self._node.get_clock().now().nanoseconds
 
         # Reset per-state tracking
-        self._search_phase = 'rotate'
-        self._search_phase_start_ns = self._state_start_ns
         self._search_tag_hold_start_ns = 0
         self._align_hold_count = 0
         self._tag_lost_count = 0

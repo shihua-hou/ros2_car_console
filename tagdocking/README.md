@@ -1,6 +1,6 @@
 # tagdocking — AprilTag 自动停靠框架
 
-工业级 ROS2 Humble AprilTag 视觉自动停靠系统，支持多底盘（差速/全向/四足）、Nav2 预导航、PID 视觉伺服、时间同步、里程计校验、完整状态机。
+工业级 ROS2 Humble AprilTag 视觉自动停靠系统，支持多底盘（差速/全向/四足）、走停式视觉伺服、时间同步、里程计校验、完整状态机。停靠由外部服务直接触发（`/docking_node/start_docking`），预停靠导航由调用方负责把机器人送入 Tag 范围。
 
 ---
 
@@ -23,19 +23,7 @@
 ### 整体流程
 
 ```
-                          开始停靠
-                             |
-                             |
-                    navigation.enable?
-                     /              \
-                   yes               no
-                    |                 |
-                    v                 |
-              [NAVIGATING]            |
-            Nav2 导航到预停靠点         |
-          (Tag 前方 1m 处)            |
-                    |                 |
-                    -----------------
+                  开始停靠 (/docking_node/start_docking)
                              |
                              v
                       [SEARCH_TAG]
@@ -47,7 +35,7 @@
                              |
                              v
                        [APPROACH]
-                   PID 视觉伺服逼近 Tag
+                   走停式视觉伺服逼近 Tag
                              |
                              v
                      [FINAL_SERVO]
@@ -56,6 +44,10 @@
                              v
                         [DOCKED] ✓
 ```
+
+> 停靠节点本身不负责把机器人导航到 Tag 附近——由外部服务（Nav2 / 业务节点 /
+> 遥控）把机器人送到 Tag 视野内后，再调用 `/docking_node/start_docking` 进入
+> 上面的视觉停靠流程。
 
 ### 模块结构
 
@@ -72,7 +64,6 @@ tagdocking/
 │   ├── pid_controller.py        # PID (含 anti-windup)
 │   ├── pose_buffer.py           # 时间戳位姿缓冲 (延迟过滤)
 │   ├── motion_monitor.py        # 里程计运动校验 (堵转检测)
-│   ├── navigation_manager.py    # Nav2 NavigateToPose 封装
 │   ├── utils.py                 # 角度/四元数工具函数
 │   └── base_adapter/
 │       ├── base_adapter.py      # 抽象基类: send_velocity(vx, vy, wz)
@@ -116,7 +107,7 @@ tagdocking/
 - `apriltag_ros` 已安装并能正常检测 Tag
 - 相机已标定，发布 `/image_raw` 和 `/camera_info`
 - Tag 贴在停靠目标上，且 TF 树连通（`camera_optical_frame → tag36h11:0`）
-- （可选）Nav2 已配置并运行，用于 Mode A 预导航
+- 机器人已被外部服务（Nav2 / 业务节点 / 遥控）送到 Tag 视野范围内
 
 ### 2.2 编译
 
@@ -126,37 +117,26 @@ colcon build --packages-select tagdocking --symlink-install
 source install/setup.bash
 ```
 
-### 2.3 启动 (Mode B — 直接视觉停靠，跳过 Nav2)
-
-最简单的启动方式，不依赖 Nav2：
+### 2.3 启动
 
 ```bash
 # 终端 1: 启动停靠系统
 ros2 launch tagdocking docking.launch.py \
-    navigation_enable:=false \
     base_type:=diff_drive
 
 # 终端 2: 先启动你的机器人底层驱动 (若未启动)
 # ros2 launch turn_on_wheeltec_robot turn_on_wheeltec_robot.launch.py
 
 # 终端 3: 确保 apriltag_ros 有图像输入 (若 launch 中的 camera 话题不匹配)
-# ros2 run autodock camera_info_bridge
+# ros2 run tagdocking camera_info_bridge
 ```
 
 > **注意**: launch 文件默认启动 `apriltag_node`，它会订阅 `image_rect` 话题（实际 remap 到 `image_topic` 参数指定的值，默认 `/image_raw`）。如果你的相机话题不是 `/image_raw`，需要通过 launch 参数指定。
 
-### 2.4 启动 (Mode A — Nav2 预导航 + 视觉停靠)
+> 停泊节点只做视觉停靠。若需要先把机器人导航到 Tag 附近，由外部 Nav2 / 业务
+> 节点完成，到位后再触发 `/docking_node/start_docking`。
 
-```bash
-# 终端 1: 启动 Nav2
-ros2 launch my_nav2_bringup nav2.launch.py
-
-# 终端 2: 启动停靠系统 (navigation_enable=true 是默认值)
-ros2 launch tagdocking docking.launch.py \
-    navigation_enable:=true
-```
-
-### 2.5 底盘类型选择
+### 2.4 底盘类型选择
 
 ```bash
 # 差速轮 (默认) — 只输出 linear.x + angular.z
@@ -170,7 +150,7 @@ ros2 launch tagdocking docking.launch.py base_type:=omni
 # 并在代码中注入 move_callback
 ```
 
-### 2.6 自定义 Tag
+### 2.5 自定义 Tag
 
 ```bash
 ros2 launch tagdocking docking.launch.py \
@@ -230,13 +210,39 @@ class MyDockingClient(Node):
     def __init__(self):
         super().__init__('my_docking_client')
         self._start_cli = self.create_client(Trigger, '/docking_node/start_docking')
+        self._undock_cli = self.create_client(Trigger, '/docking_node/start_undock')
 
     def start_docking(self):
         req = Trigger.Request()
         future = self._start_cli.call_async(req)
         rclpy.spin_until_future_complete(self, future)
         print(future.result().message)
+
+    def undock(self):
+        req = Trigger.Request()
+        future = self._undock_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+        print(future.result().message)
 ```
+
+### 泊出 (Undock)
+
+停泊完成后 (`DOCKED`)，调用 `~/start_undock` 把车退出停靠位：
+
+```bash
+ros2 service call /docking_node/start_undock std_srvs/srv/Trigger
+```
+
+泊出是一个固定的两段式盲动序列，纯里程计闭环、不看二维码：
+
+1. **盲退** `undock.backup_distance` (默认 0.5 m，同重试倒车的 negative jog)
+2. **原地转 180°** (`undock.turn_angle_deg`，正=CCW / 负=CW)
+
+两段到位后进入 `UNDOCKED` 终态。`~/state` 依次发布 `undocking` → `undocked`，
+webapp 据此弹"泊出完成"提示。泊出可从任意非停泊态触发 (IDLE / DOCKED / 错误终态)，
+停泊进行中 (`SEARCH_TAG` / `APPROACH` …) 调用会被拒绝。
+
+> 泊出是盲动 (后退 + 转向)，**调用方需确保车后方无障碍**。
 
 ---
 
@@ -247,12 +253,13 @@ class MyDockingClient(Node):
 | 状态 | 枚举值 | 说明 | 超时 |
 |------|--------|------|------|
 | `IDLE` | 0 | 空闲，等待启动命令 | — |
-| `NAVIGATING` | 1 | Nav2 导航到预停靠点 (可选) | 60s |
 | `SEARCH_TAG` | 2 | 转-停交替扫描搜索 AprilTag | 60s |
 | `ALIGN` | 3 | 原地旋转粗对中 (仅 yaw) | 15s |
 | `APPROACH` | 4 | PID 视觉伺服逼近 Tag | 60s |
 | `FINAL_SERVO` | 5 | 减速精确逼近 + 稳定确认 | 30s |
 | `DOCKED` | 6 | 停靠成功 | — |
+| `UNDOCKING` | 9 | 泊出: 盲退 + 原地转 180° | 30s (`undock.timeout_sec`) |
+| `UNDOCKED` | 14 | 泊出成功 | — |
 
 ### 4.2 异常状态
 
@@ -388,16 +395,7 @@ adapter = QuadrupedAdapter(
 
 全部参数在 `config/docking.yaml` 中，运行时可被 launch 参数覆盖。
 
-### 6.1 导航参数
-
-```yaml
-navigation.enable: true               # 启用 Nav2 预导航 (false=跳过直接进入搜索)
-navigation.pre_dock_distance: 1.0     # 预停靠点距离 Tag 多远 (m)
-navigation.nav2_timeout_sec: 60.0     # Nav2 导航超时
-navigation.pre_dock_frame: "map"      # 预停靠点的坐标参考系
-```
-
-### 6.2 Tag 参数
+### 6.1 Tag 参数
 
 ```yaml
 tag.family: "36h11"                   # AprilTag 家族
@@ -409,7 +407,7 @@ tag.ema_alpha: 0.5                    # EMA 平滑 (0=重滤波, 1=原始值)
 tag.max_pose_jump_m: 0.3              # 位姿跳变阈值 (防误识别抖动)
 ```
 
-### 6.3 停靠目标
+### 6.2 停靠目标
 
 ```yaml
 dock_target.distance: 0.30            # 最终距 Tag 多远停下 (m)
@@ -425,7 +423,7 @@ dock_target.yaw_offset_deg: 0.0       # 朝向偏移 (°), 0=正对 Tag
 | 横向靠边卸货 | 0.50 | 0.3 | 0.0 | 停在 Tag 前方 50cm 偏左 30cm |
 | 90° 侧向停靠 | 0.40 | 0.0 | 90.0 | 停在 Tag 正前方 40cm，但侧向对齐 |
 
-### 6.4 PID 参数
+### 6.3 PID 参数
 
 ```yaml
 pid.kp_x: 0.8                         # X 轴比例增益
@@ -441,7 +439,7 @@ pid.integral_limit: 0.5               # 积分抗饱和上限
 - `ki` 通常保持 0，除非有系统性稳态误差（如地面倾斜）
 - 差速轮 `kp_yaw` 同时影响 K_angle 和 K_yaw
 
-### 6.5 安全参数
+### 6.4 安全参数
 
 ```yaml
 safety.minimum_distance_m: 0.15       # 最小安全距离 (m) — 防止撞 Tag
@@ -515,7 +513,6 @@ ros2 topic echo /tf | grep tag36h11
 1. 添加 **TF** 显示：确认 `camera_optical_frame → tag36h11:0` 连线
 2. 添加 **Image** 显示：查看相机画面，确认 Tag 在视野内
 3. 添加 **Odometry** 显示：确认里程计箭头随机器人运动
-4. 添加 **Path** 显示(可选)：可视化 Nav2 规划路径
 
 ### 7.6 常见问题排查
 
@@ -539,7 +536,7 @@ ros2 topic echo /tf | grep tag36h11
 ros2 launch my_sim world.launch.py
 
 # 2. 启动停靠
-ros2 launch tagdocking docking.launch.py navigation_enable:=false
+ros2 launch tagdocking docking.launch.py
 
 # 3. 将机器人手动放到距 Tag ~2m 处
 #    (在 Gazebo 中拖动机器人模型)
@@ -636,21 +633,14 @@ map → odom → base_footprint → base_link → camera_optical_frame → tag36
 - ROS context 关闭时也会触发 `_safe_stop()`
 - **不会出现 Ctrl+C 后机器人还继续前进的情况**
 
-### 9.6 Nav2 预导航 (Mode A) 前提
-
-- Nav2 必须正常运行 (`navigate_to_pose` action server 可用)
-- 预停靠点坐标通过参数 `navigation.pre_dock_x/y/yaw` 指定 (map 坐标系)
-- Tag 在 map 中的位置需要事先标定 (推荐用 ROS2 静态 TF 发布)
-- 如果 Nav2 不可用，设置 `navigation.enable: false` 进入 Mode B
-
-### 9.7 性能要求
+### 9.6 性能要求
 
 - 控制循环: **20 Hz** (50ms 周期)
 - 推荐相机帧率: **≥ 10 Hz** (apriltag_ros 在 CPU 上约 15~30 Hz)
 - 视觉延迟: **< 200ms** 以获得稳定控制效果
 - PoseBuffer 容量: 30 帧 (覆盖 1.5s @ 20Hz 或 3s @ 10Hz)
 
-### 9.8 构建说明
+### 9.7 构建说明
 
 - 使用 **ament_cmake** 构建（非 ament_python），因为包含自定义 Action 接口
 - `Dock.action` 由 `rosidl_generate_interfaces` 编译生成 Python 模块
@@ -663,7 +653,7 @@ map → odom → base_footprint → base_link → camera_optical_frame → tag36
 
 ```
 rclpy, std_msgs, std_srvs, geometry_msgs, nav_msgs
-action_msgs, apriltag_msgs, nav2_msgs
+action_msgs, apriltag_msgs
 tf2_ros, tf2_geometry_msgs
 apriltag_ros (运行时)
 ```

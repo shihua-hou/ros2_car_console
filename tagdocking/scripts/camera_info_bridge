@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Entry-point script for the CameraInfo timestamp-synchronization bridge.
+
+Usage:
+    ros2 run tagdocking camera_info_bridge
+    # or via launch:
+    ros2 launch tagdocking docking.launch.py
+"""
+
+from tagdocking.camera_info_bridge import main
+
+
+if __name__ == '__main__':
+    main()

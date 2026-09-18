@@ -1,0 +1,99 @@
+# 户外全局 EKF: 发布 map -> odom_combined, 取代 AMCL 的定位职责。
+#
+# 两层结构(robot_localization 标准用法):
+#   局部 EKF  ekf_filter_node (turn_on_wheeltec_robot/config/ekf.yaml)
+#             轮速 + IMU -> odom_combined -> base_footprint   连续平滑, 不跳变
+#   全局 EKF  ekf_global_node (本文件)
+#             轮速 + IMU + GPS -> map -> odom_combined        绝对位置, 允许跳变
+#
+# 为什么用它替掉 AMCL(2026-09-16 实测):
+#   AMCL 在人群中一帧跳了 13.99m, 而自报协方差从 0.23m 变成 0.24m —— 它不知道
+#   自己错了。同期 GPS 换算到地图系的位置帧间最大位移 0.53m、零跳变, 与健康时
+#   的 AMCL 吻合在 0.22~0.41m(标定 RMS 0.38m)。
+#
+# GPS 输入来自 gps_map_odom.py(不是 navsat_transform): 地图存图时已经地理配准,
+# <地图名>.gps.yaml 里就是精确的 map<->UTM 变换, 直接换算更简单, 也少一个
+# 容易配错的环节。航向用双天线(偏置 -85.1°, 两个相反朝向上极差 0.0°)。
+
+ekf_global_node:
+  ros__parameters:
+    frequency: 10.0
+    sensor_timeout: 1.0
+    two_d_mode: true
+    transform_time_offset: 0.0
+    transform_timeout: 0.0
+    print_diagnostics: false
+    debug: false
+    publish_tf: true
+    publish_acceleration: false
+    # 开机时 RTC 可能还停在上次关机的时刻, NTP 校正后会有大幅时间跳变
+    # (2026-09-16 实际遇到过约 21 小时的跳变), 跳变后重置滤波器, 别拿旧状态硬算。
+    reset_on_time_jump: true
+
+    map_frame: map
+    odom_frame: odom_combined          # 必须与局部 EKF 和 AMCL 的 odom_frame_id 一致
+    base_link_frame: base_footprint
+    world_frame: map                   # world_frame=map -> 本节点发布 map->odom_combined
+
+    # ---- 轮速里程计: 只用线速度 ----
+    # 不用它的转向速率: 2026-09-18 以 GPS 航向为真值标定, 轮速多报约 8% 转角
+    # (k=0.924)且比陀螺慢约 0.4s; 陀螺 k=1.013。转向全交给陀螺。
+    odom0: /odom
+    odom0_config: [false, false, false,
+                      false, false, false,
+                      true, true, false,
+                      false, false, false,
+                      false, false, false]
+    odom0_differential: false
+    odom0_relative: false
+    odom0_queue_size: 10
+
+    # ---- IMU: 只用偏航角速度 ----
+    # 不用它的绝对姿态: 驱动自报 orientation_covariance = 1e6(磁力计在金属车体上
+    # 不可信), 局部 EKF 也是 imu0_relative:true 当相对量用。绝对航向交给双天线。
+    imu0: /imu/data_filtered
+    imu0_config: [false, false, false,
+                      false, false, false,
+                      false, false, false,
+                      false, false, true,
+                      false, false, false]
+    imu0_differential: false
+    imu0_relative: false
+    imu0_queue_size: 10
+    imu0_remove_gravitational_acceleration: false
+
+    # ---- GPS: 绝对位置 + 绝对航向 ----
+    # 协方差由 gps_map_odom 按解算等级给(固定 2cm / 浮点 0.5m / 单点 5m, 再叠加
+    # 标定 RMS), 航向 8°。没航向或航向超时时 yaw 方差是 1e6, EKF 自然忽略。
+    #
+    # 故意**不设** odom1_pose_rejection_threshold: 设了以后, 一旦里程计在 GPS
+    # 失锁期间漂得够远, 重新拿到 GPS 时会被当成离群值一直拒收, 滤波器永远回不来。
+    # 离群点的防线放在上游 —— 按解算等级给协方差, 差的解本来就不怎么被信。
+    odom1: /odometry/gps
+    odom1_config: [true, true, false,
+                      false, false, true,
+                      false, false, false,
+                      false, false, false,
+                      false, false, false]
+    odom1_differential: false
+    odom1_relative: false
+    odom1_queue_size: 10
+
+    # 开机时对 x/y/yaw 完全不自信, 第一帧 GPS 直接把状态拽到位。
+    # (robot_localization 默认 1e-9, 全局 EKF 用默认值会被第一帧 GPS 拉不动)
+    initial_estimate_covariance: [
+                                    1000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                    0.0, 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                    0.0, 0.0, 1e-09, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                    0.0, 0.0, 0.0, 1e-09, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                    0.0, 0.0, 0.0, 0.0, 1e-09, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                    0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-09, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-09, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-09, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-09, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-09, 0.0, 0.0, 0.0, 0.0,
+                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-09, 0.0, 0.0, 0.0,
+                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-09, 0.0, 0.0,
+                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-09, 0.0,
+                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-09]

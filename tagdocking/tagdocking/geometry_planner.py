@@ -233,6 +233,32 @@ class GeometryPlanner:
             return [ActionPlan(kind='done')]
         return seq
 
+    # ── Straight-line final approach (two-phase docking phase 2) ────
+
+    def plan_straight(self, dist: float) -> list[ActionPlan]:
+        """Plan a pure straight-line forward jog — no angle adjustment.
+
+        Two-phase docking phase 2: the caller has already confirmed the robot
+        is within ``start_distance`` of the tag and the heading is square-on
+        within the dedicated yaw threshold. Drive straight forward along the
+        current heading until within ``position_tol`` of ``target_distance``.
+
+        Lateral and yaw errors are intentionally NOT corrected — the robot
+        drives straight regardless, like parking into a garage. Any lateral
+        offset present at the phase-2 handoff is preserved to the final pose.
+
+        Returns ``[done]`` when within position tolerance of target_distance.
+        """
+        residual = dist - self._target_dist
+        if abs(residual) <= self._pos_tol:
+            return [ActionPlan(kind='done')]
+        # Clamp to jog_max — iterative stop-and-go, re-measure after each step
+        # (preserves re-measure safety and narrow-FOV tag retention).
+        drive = min(residual, self._jog_max)
+        if drive <= self._jog_min * 0.5:
+            return [ActionPlan(kind='done')]
+        return [ActionPlan(kind='forward', jog_distance=drive)]
+
     # ── Lateral correction helpers ──────────────────────────────────
 
     def _start_lateral(self, dist: float, lat: float, yaw: float) -> ActionPlan:

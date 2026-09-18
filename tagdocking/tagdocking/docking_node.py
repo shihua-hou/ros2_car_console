@@ -5,7 +5,6 @@ Architecture:
     /detections      → AprilTag detection array
     /tf              → (via tf2_ros.Buffer) tag pose lookup
     /odom            → odometry feedback
-    /amcl_pose       → robot pose in map (for Nav2 pre-dock computation)
 
   Publishers:
     /cmd_vel         → (via BaseAdapter) velocity commands
@@ -15,6 +14,7 @@ Architecture:
   Services:
     ~/start_docking  → std_srvs/Trigger — start docking
     ~/cancel_docking → std_srvs/Trigger — cancel docking
+    ~/start_undock   → std_srvs/Trigger — pull out (reverse + 180° turn)
 
   Action:
     ~/dock           → Dock.action — full docking with feedback
@@ -50,7 +50,6 @@ from .utils import TagPose, yaw_from_quat, normalize_angle, tag_normal_angle
 from .pose_buffer import PoseBuffer
 from .geometry_planner import GeometryPlanner, ActionPlan
 from .action_executor import ActionExecutor
-from .navigation_manager import NavigationManager
 from .state_machine import DockingStateMachine, DockingState
 
 
@@ -94,14 +93,9 @@ class DockingNode(Node):
             yaw_threshold=math.radians(self._p('stopgo.yaw_threshold_deg')),
         )
 
-        # ── Navigation ────────────────────────────────────────────
-        self._nav = NavigationManager(
-            self,
-            action_name=self._p('navigation.nav2_action_name'),
-            timeout_sec=self._p('navigation.nav2_timeout_sec'))
-
         # ── State machine ─────────────────────────────────────────
         self._sm = DockingStateMachine(self)
+        self._sm._max_retries = int(self._p('retry.max_retries'))
 
         # ── Base adapter ──────────────────────────────────────────
         self._adapter = self._create_adapter()
@@ -148,6 +142,9 @@ class DockingNode(Node):
         self._maneuver_queue: list = []
         self._maneuver_active = False
         self._maneuver_iters = 0
+        # 直行失败标志：进入直行距离时方位误差超门槛只判一次（首次进入），
+        # 防止直行中方位自然漂动误触发失败。_reset_maneuver 时清零。
+        self._straight_failed = False
         # 检测冻结标志：机动（盲转/盲走）期间为 True，此时 _on_detections 直接
         # 丢弃所有帧（运动模糊、视野边缘的坏帧绝不能污染规划用的位姿）。停稳
         # settle 结束后解冻，并清空滤波/缓冲，强制下一次规划只用停稳后的新鲜帧。
@@ -159,12 +156,19 @@ class DockingNode(Node):
         # own timeout bounds wall-clock independently.
         self._max_maneuver_iters = 40
 
+        # ── Undock (泊出) sub-phase ──────────────────────────────────
+        # 0 = 盲退 undock.backup_distance, 1 = 原地转 180°, 2 = 完成。
+        # 由 _run_undock 在 UNDOCKING 态驱动, 纯里程计闭环, 不看 tag。
+        self._undock_phase = 0
+
         # Recovery-search state: remember which side the tag was last seen on
-        # (sign of lat) so a bidirectional sweep starts toward it, and track the
-        # rotate-phase boundary to alternate + widen each sweep.
+        # (sign of lat) so the angle-stepped sweep starts toward it. The node
+        # rotates a fixed angle (odometry-closed), stops, detects, repeats —
+        # sweeping a full 360° in one direction until the tag is found.
         self._last_seen_lat = 0.0
-        self._search_sweep_idx = 0
-        self._search_last_phase_start = 0
+        self._search_step = 0
+        self._search_detect_start = 0
+        self._search_direction = 1.0
 
         # Adaptive detection-rate tracking. The pose-buffer staleness window is
         # derived from the measured inter-detection interval, so the controller
@@ -181,11 +185,17 @@ class DockingNode(Node):
         self._odom_yaw = 0.0
         self._has_odom = False
 
-        # AMCL pose (for Nav2 pre-dock)
-        self._amcl_pose = None
-
         # Control period
         self._dt = 0.05  # 20 Hz
+
+        # Quiescent cmd_vel policy: brake briefly on entering an idle/terminal
+        # state, then release /cmd_vel so teleop can drive the robot.
+        # Continuously publishing zero at 20 Hz otherwise monopolises the topic
+        # and locks out manual control after docking. The chassis watchdog stops
+        # the robot if nobody publishes.
+        self._quiescent = False
+        self._brake_until_ns = 0
+        self._BRAKE_WINDOW_NS = int(0.3 * 1e9)   # ~0.3 s firm brake on entry
 
         # ── ROS interfaces ─────────────────────────────────────────
         self._init_ros_interfaces()
@@ -198,22 +208,12 @@ class DockingNode(Node):
         self._install_signal_handlers()
 
         self.get_logger().info(
-            f'停靠节点就绪 | 底盘={self._p("base.type")} | '
-            f'导航={self._p("navigation.enable")} | 走停模式')
+            f'停靠节点就绪 | 底盘={self._p("base.type")} | 走停模式')
 
     # ── Parameter helpers ──────────────────────────────────────────
 
     def _declare_params(self):
         """Declare all ROS2 parameters with defaults."""
-        # Navigation
-        self.declare_parameter('navigation.enable', True)
-        self.declare_parameter('navigation.pre_dock_distance', 1.0)
-        self.declare_parameter('navigation.position_tolerance', 0.1)
-        self.declare_parameter('navigation.yaw_tolerance_deg', 5.0)
-        self.declare_parameter('navigation.nav2_action_name', 'navigate_to_pose')
-        self.declare_parameter('navigation.nav2_timeout_sec', 60.0)
-        self.declare_parameter('navigation.pre_dock_frame', 'map')
-
         # Camera / timing
         self.declare_parameter('camera.max_latency_ms', 200)
         self.declare_parameter('camera.expected_fps', 30)
@@ -253,9 +253,23 @@ class DockingNode(Node):
         self.declare_parameter('safety.minimum_distance_m', 0.15)
         self.declare_parameter('timeout_sec', 120.0)
 
+        # Retry (失败后倒车一段距离再重新 dock)
+        self.declare_parameter('retry.max_retries', 2)
+        self.declare_parameter('retry.backup_distance', 0.5)
+        self.declare_parameter('retry.linear_rate', 0.08)
+        self.declare_parameter('retry.timeout_sec', 15.0)
+
+        # Undock (泊出: 盲退一段距离 → 原地转 180° → 完成)
+        self.declare_parameter('undock.backup_distance', 0.5)
+        self.declare_parameter('undock.linear_rate', 0.08)
+        self.declare_parameter('undock.turn_angle_deg', 180.0)   # 正=CCW, 负=CW
+        self.declare_parameter('undock.angular_rate', 0.3)
+        self.declare_parameter('undock.timeout_sec', 30.0)
+
         # Search
         self.declare_parameter('search.angular_speed', 0.3)
-        self.declare_parameter('search.rotate_time_sec', 0.8)
+        self.declare_parameter('search.step_angle_deg', 30.0)
+        self.declare_parameter('search.rotate_time_sec', 0.8)  # deprecated, unused
         self.declare_parameter('search.pause_time_sec', 1.5)
         self.declare_parameter('search.hold_time_sec', 0.5)
         self.declare_parameter('search.search_direction', 1)
@@ -273,6 +287,11 @@ class DockingNode(Node):
         self.declare_parameter('final_servo.distance', 0.20)
         self.declare_parameter('final_servo.max_linear_speed', 0.05)
         self.declare_parameter('final_servo.max_yaw_speed', 0.2)
+
+        # Final straight (两阶段停泊: 85cm 对准 → 55cm 纯直行)
+        self.declare_parameter('final_straight.enable', True)
+        self.declare_parameter('final_straight.start_distance', 0.85)
+        self.declare_parameter('final_straight.yaw_threshold_deg', 3.0)
 
         # Stop-and-go params
         self.declare_parameter('stopgo.lateral_threshold', 0.04)
@@ -293,7 +312,7 @@ class DockingNode(Node):
 
         # Detection topic
         self.declare_parameter('detection_topic', '/detections')
-        self.declare_parameter('odom_topic', '/odom')
+        self.declare_parameter('odom_topic', '/odom_combined')
 
     def _p(self, name: str):
         return self.get_parameter(name).value
@@ -310,9 +329,6 @@ class DockingNode(Node):
         self._odom_sub = self.create_subscription(
             Odometry, odom_topic, self._on_odom, 10)
 
-        self._amcl_sub = self.create_subscription(
-            Odometry, '/amcl_pose', self._on_amcl_pose, 10)
-
         self._state_pub = self.create_publisher(String, '~/state', 10)
         self._error_pub = self.create_publisher(Vector3, '~/error', 10)
 
@@ -320,6 +336,8 @@ class DockingNode(Node):
             Trigger, '~/start_docking', self._on_start_docking)
         self._srv_cancel = self.create_service(
             Trigger, '~/cancel_docking', self._on_cancel_docking)
+        self._srv_undock = self.create_service(
+            Trigger, '~/start_undock', self._on_start_undock)
 
         try:
             from tagdocking.action import Dock
@@ -381,9 +399,6 @@ class DockingNode(Node):
         self._odom_y = msg.pose.pose.position.y
         self._odom_yaw = yaw_from_quat(msg.pose.pose.orientation)
         self._has_odom = True
-
-    def _on_amcl_pose(self, msg: Odometry):
-        self._amcl_pose = msg
 
     # ── TF tag pose lookup ─────────────────────────────────────────
 
@@ -529,10 +544,6 @@ class DockingNode(Node):
             error_yaw = normalize_angle(
                 tag_pose.yaw - math.radians(self._p('dock_target.yaw_offset_deg')))
 
-        # Navigation status
-        nav_done = self._nav.is_done()
-        nav_success = self._nav.success()
-
         # State machine evaluation
         params = self._build_params_dict()
         self._sm.evaluate(
@@ -543,8 +554,6 @@ class DockingNode(Node):
             odom_yaw=self._odom_yaw,
             cmd_vx=0.0, cmd_vy=0.0, cmd_wz=0.0,  # not used in stop-and-go
             motion_stalled=False,  # handled by action_executor
-            nav_done=nav_done,
-            nav_success=nav_success,
             now_ns=now_ns,
             params=params,
             maneuver_active=self.maneuver_active,
@@ -561,43 +570,68 @@ class DockingNode(Node):
             self._executor.cancel()
             self._planner.reset()
             self._reset_maneuver()
-        # Entering SEARCH_TAG (fresh start or re-lock): restart the widening
-        # bidirectional sweep from scratch so each search begins narrow and
-        # grows, rather than resuming a wide sweep left over from a prior attempt.
+        # 出 UNDOCKING: 终止可能还在跑的盲退/盲转, 清掉 _frozen, 否则下一次
+        # 停泊会带着冻结态启动、丢弃所有检测帧。
+        if (self._prev_state == DockingState.UNDOCKING
+                and state != DockingState.UNDOCKING):
+            self._executor.cancel()
+            self._reset_maneuver()
+        # 出 SEARCH_TAG：终止可能正在转的搜索步 + 解冻
+        if (self._prev_state == DockingState.SEARCH_TAG
+                and state != DockingState.SEARCH_TAG):
+            self._reset_search()
+        # 入 SEARCH_TAG (全新开始或丢标重锁)：从头开始角度步进扫描
         if (state == DockingState.SEARCH_TAG
                 and self._prev_state != DockingState.SEARCH_TAG):
-            self._search_sweep_idx = 0
-            self._search_last_phase_start = 0
+            self._reset_search()
         self._prev_state = state
 
         # ── Per-state behaviour ───────────────────────────────────
-        if state == DockingState.NAVIGATING:
-            self._adapter.publish_stop()
-
-        elif state == DockingState.SEARCH_TAG:
-            vx, vy, wz = self._compute_search_velocity(now_ns)
-            if abs(wz) > 0:
-                # Rotate IN PLACE to find the tag. No forward creep here: search
-                # is a large continuous rotation (momentum already beats static
-                # friction), and creeping forward over a 60 s search would walk
-                # the robot across the room. Arc-creep is only for the small,
-                # stall-prone APPROACH turns.
-                self._adapter.publish_turn(wz)
-            elif abs(vx) > 0:
-                self._adapter.publish_jog(vx)
-            else:
-                self._adapter.publish_stop()
+        # Active motion states own /cmd_vel and command motion each tick.
+        # Quiescent states (IDLE/DOCKED/errors) must NOT keep publishing zero —
+        # that monopolises /cmd_vel and locks out teleop. Brake briefly on
+        # entry, then release the topic so other publishers can drive the robot.
+        if state == DockingState.SEARCH_TAG:
+            self._quiescent = False
+            self._run_search(tag_visible, tag_pose, base_type, now_ns)
 
         elif state in (DockingState.ALIGN, DockingState.APPROACH,
                        DockingState.FINAL_SERVO):
+            self._quiescent = False
             self._run_stop_and_go(tag_visible, tag_pose, base_type, now_ns)
 
-        else:  # IDLE, DOCKED, error states
-            self._adapter.publish_stop()
+        elif state == DockingState.RETRYING:
+            self._quiescent = False
+            self._run_retry(base_type, now_ns)
+
+        elif state == DockingState.UNDOCKING:
+            self._quiescent = False
+            self._run_undock(base_type, now_ns)
+
+        else:  # IDLE, DOCKED, UNDOCKED, error states
+            self._brake_and_release(now_ns)
 
         # Publish state and error
         self._publish_state(state)
         self._publish_error(error_x, error_y, error_yaw)
+
+    # ── Quiescent cmd_vel policy ────────────────────────────────────
+
+    def _brake_and_release(self, now_ns: int):
+        """Quiescent-state /cmd_vel policy: brake briefly on entry, then release.
+
+        Continuously publishing Twist() at 20 Hz while idle/docked monopolises
+        /cmd_vel — every teleop command is overwritten by zero within 50 ms, so
+        the robot appears "locked" until the docking launch is killed. Instead
+        publish a short burst of stops on the entry edge (firm brake in case the
+        robot still has residual velocity), then publish nothing and let teleop
+        own the topic. The chassis watchdog stops the robot if nobody publishes.
+        """
+        if not self._quiescent:
+            self._quiescent = True
+            self._brake_until_ns = now_ns + self._BRAKE_WINDOW_NS
+        if now_ns < self._brake_until_ns:
+            self._adapter.publish_stop()
 
     # ── Stop-and-go loop ───────────────────────────────────────────
 
@@ -678,8 +712,59 @@ class DockingNode(Node):
             return
 
         yaw_tol = math.radians(self._p('tolerance.yaw_deg'))
-        seq = self._planner.plan_sequence(
-            tag_pose.dist, tag_pose.lat, tag_pose.normal, yaw_tol=yaw_tol)
+
+        # ── 两阶段停泊门控 ──────────────────────────────────────
+        # 阶段1(带角度修正)为默认：用 plan_sequence 转向对准+前进, 尽量对准。
+        # 阶段2(纯直行, 不修 yaw/横向)：dist ≤ start_distance 即无条件激活——
+        # 进入直行距离后像停车入库, 不再打方向(再往前已无空间调位姿)。
+        # 进入时做一次性失败检查：方位误差超 yaw_threshold_deg(默认10°)说明
+        # 对准过差、入库会撞偏 → 报 MOTION_FAILED。_straight_failed 保证只判一次,
+        # 防止直行中方位自然漂动(tag 抖动+车体微偏)误触发失败。
+        # start_distance ≤ target_distance 视为误配置, 静默回退单阶段。
+        straight_enabled = self._p('final_straight.enable')
+        straight_start = self._p('final_straight.start_distance')
+        straight_yaw_tol = math.radians(self._p('final_straight.yaw_threshold_deg'))
+
+        # 方位误差用车体朝向(bearing=atan2(lat,dist))，不用方阵误差(square_err)。
+        # square_err 依赖 tag 法线(normal)，而 normal 是 AprilTag 最不可靠的自由度
+        # ——近场时在 ±180° 附近抖动，经 ±π 归一化后误差被放大到 4~5°，即使车已
+        # 正对标签(方位角<1°)也会误判超差。bearing 只取决于标签在画面中的位置，稳定可靠。
+        bearing = math.atan2(tag_pose.lat, tag_pose.dist)
+        bearing_err = abs(normalize_angle(bearing))
+
+        go_straight = False
+        if straight_enabled and straight_start > target_distance:
+            if tag_pose.dist <= straight_start:
+                # 进入直行距离 → 无条件直行（不再调角）。
+                # 仅首次进入时做一次失败检查：方位误差超门槛 → 报导航失败。
+                if not self._straight_failed and bearing_err > straight_yaw_tol:
+                    self._straight_failed = True
+                    self.get_logger().error(
+                        f'直行失败：进入直行距离({tag_pose.dist:.2f}m)时方位误差 '
+                        f'{math.degrees(bearing_err):.1f}° > 门槛 '
+                        f'{math.degrees(straight_yaw_tol):.1f}°，对准过差无法入库')
+                    self._sm.fail()
+                    self._adapter.publish_stop()
+                    return
+                go_straight = True
+            elif (bearing_err <= straight_yaw_tol
+                  and abs(tag_pose.lat) <= self._p('stopgo.lateral_threshold')):
+                # 阶段1 已基本对准(方位+横向都在容差内) → 直接直行, 不再做
+                # turn-drive-turn。plan_sequence 的 turn1/turn2 依赖 tag 法线
+                # normal, 而 normal 是 AprilTag 最不可靠的自由度(近场 ±180° 抖动,
+                # 实测已对正标签仍被算成 ~8° 偏角), 会平白多一次 [转+10° 前进 转-10°]
+                # 的摆头。方位(bearing)只依赖标签在画面中的位置, 稳定可靠。
+                go_straight = True
+
+        if go_straight:
+            seq = self._planner.plan_straight(tag_pose.dist)
+            self.get_logger().info(
+                f'走停 直线阶段 iter={self._maneuver_iters}: '
+                f'距离={tag_pose.dist:.3f}m → 目标={target_distance:.3f}m',
+                throttle_duration_sec=2.0)
+        else:
+            seq = self._planner.plan_sequence(
+                tag_pose.dist, tag_pose.lat, tag_pose.normal, yaw_tol=yaw_tol)
 
         # 移动前打印：二维码相对位姿 + 完整规划路径，仅凭日志即可诊断丢标问题。
         # bearing = 指向二维码的方向；normal = 二维码朝外法线方向；
@@ -699,6 +784,8 @@ class DockingNode(Node):
             f'方位={bearing_deg:+.1f}° 法线={math.degrees(tag_pose.normal):+.1f}° '
             f'| 原始 距离={self._raw_dist:.3f} 横向={self._raw_lat:+.3f} '
             f'法线={math.degrees(self._raw_normal):+.1f}° '
+            f'| 直行={go_straight} 方位误差={math.degrees(bearing_err):.1f}°'
+            f'(失败门槛{math.degrees(straight_yaw_tol):.1f}°) '
             f'| 路径 [{", ".join(steps)}]')
 
         if len(seq) == 1 and seq[0].kind == 'done':
@@ -713,6 +800,211 @@ class DockingNode(Node):
         self._frozen = True          # 开始盲动：冻结检测，运动期丢弃所有帧
         self._maneuver_iters += 1
         self._start_next_maneuver_step(base_type)
+
+    def _run_retry(self, base_type: str, now_ns: int):
+        """重试倒车的一个 tick: 盲退 retry.backup_distance, 到位后 → SEARCH_TAG。
+
+        镜像 _run_search 的 Case 1/2 结构。倒车纯里程计闭环(blind), 不看 tag;
+        退够距离后调状态机 retry_search() 转 SEARCH_TAG 重新锁定靠近。
+        进入 RETRYING 时控制循环的 cleanup(离开 stopgo 态)已 cancel 旧 executor
+        + _reset_maneuver, 故首 tick executor 空闲 → Case 2 启动盲退。
+        """
+        # Case 1: 倒车执行中
+        if self._executor.is_active:
+            done = self._executor.update(
+                self._odom_x, self._odom_y, self._odom_yaw,
+                False, None,   # blind: 不看 tag
+                self._bearing_fn, self._theta_bounds_fn,
+                self._p('dock_target.distance'),
+                self._p('stopgo.drift_tol'), now_ns,
+            )
+            if done:
+                self._maneuver_active = False
+                self._executor.mark_stop_time(now_ns)
+                self._sm.retry_search()
+            self._publish_action_cmd(base_type)
+            return
+
+        # Case 2: 倒车未开始 → 启动盲退(负距离 = 后退)
+        dist = abs(float(self._p('retry.backup_distance')))
+        rate = float(self._p('retry.linear_rate'))
+        if dist < 1e-3:
+            self._sm.retry_search()
+            self._adapter.publish_stop()
+            return
+        self._executor.start_jog(-dist, rate, blind=True)
+        self._executor.set_odom_ref(self._odom_x, self._odom_y, self._odom_yaw)
+        self._maneuver_active = True
+        self._frozen = True
+        self.get_logger().info(
+            f'重试：盲退 {-dist:+.3f}m (速率 {rate:.2f}m/s) 后重新锁定')
+        self._publish_action_cmd(base_type)
+
+    def _run_undock(self, base_type: str, now_ns: int):
+        """泊出的一个 tick: 盲退 → 原地转 180° → UNDOCKED。
+
+        两段纯里程计闭环盲动顺序执行 (镜像 _run_retry 的 Case 结构)：
+          phase 0: 盲退 undock.backup_distance (负 jog, 同重试倒车)
+          phase 1: 原地转 undock.turn_angle_deg (默认 180°)
+        两段都到位后调状态机 finish_undock() → UNDOCKED。
+        不看 tag；运动期冻结检测 (与停泊盲动一致)。
+        """
+        # Case 1: 子动作执行中
+        if self._executor.is_active:
+            done = self._executor.update(
+                self._odom_x, self._odom_y, self._odom_yaw,
+                False, None,   # blind: 不看 tag
+                self._bearing_fn, self._theta_bounds_fn,
+                self._p('dock_target.distance'),
+                self._p('stopgo.drift_tol'), now_ns,
+            )
+            if done:
+                self._maneuver_active = False
+                self._executor.mark_stop_time(now_ns)
+                self._undock_phase += 1
+                if not self._start_undock_step(base_type):
+                    # 两段盲动均完成 → 泊出成功
+                    self._adapter.publish_stop()
+                    self._sm.finish_undock()
+                    return
+            self._publish_action_cmd(base_type)
+            return
+
+        # Case 2: 首次进入 → 启动第一段(盲退)
+        if not self._has_odom:
+            self._adapter.publish_stop()
+            self.get_logger().warn('泊出：等待里程计...', throttle_duration_sec=1.0)
+            return
+        self._undock_phase = 0
+        if not self._start_undock_step(base_type):
+            self._adapter.publish_stop()
+            self._sm.finish_undock()
+            return
+        self._publish_action_cmd(base_type)
+
+    def _start_undock_step(self, base_type: str) -> bool:
+        """启动 _undock_phase 指示的泊出子动作。
+
+        phase 0 = 盲退, phase 1 = 原地转 180°。
+        返回 True = 已启动一个动作; False = 该相位空跳或已全部完成(调用方据此收尾)。
+        空跳(距离/角度过小)时自动推进到下一相位再试, 与 _start_next_maneuver_step
+        的"跳过过小子步"行为一致。
+        """
+        if self._undock_phase == 0:
+            dist = abs(float(self._p('undock.backup_distance')))
+            rate = float(self._p('undock.linear_rate'))
+            if dist < 1e-3:
+                self._undock_phase += 1   # 距离为 0, 跳过盲退直接转
+            else:
+                self._executor.start_jog(-dist, rate, blind=True)
+                self._executor.set_odom_ref(
+                    self._odom_x, self._odom_y, self._odom_yaw)
+                self._maneuver_active = True
+                self._frozen = True
+                self.get_logger().info(
+                    f'泊出：盲退 {-dist:+.3f}m (速率 {rate:.2f}m/s)')
+                return True
+        if self._undock_phase == 1:
+            angle = math.radians(float(self._p('undock.turn_angle_deg')))
+            rate = float(self._p('undock.angular_rate'))
+            if self._executor.start_turn(angle, rate, full=True):
+                self._executor.set_odom_ref(
+                    self._odom_x, self._odom_y, self._odom_yaw)
+                self._maneuver_active = True
+                self._frozen = True
+                self.get_logger().info(
+                    f'泊出：原地转 {math.degrees(angle):+.1f}°')
+                return True
+            self._undock_phase += 1   # 角度过小未启动 → 视为完成
+        return False
+
+    # ── Angle-stepped search loop ─────────────────────────────────
+
+    def _run_search(self, tag_visible: bool, tag_pose, base_type: str,
+                    now_ns: int):
+        """角度步进搜索的一个 tick：转固定角度(里程计闭环)→停稳→检测→再转。
+
+        转满 360° 直到找到二维码或状态机超时。结构镜像 _run_stop_and_go 的
+        Case 级联（执行中→等待稳定→解冻清旧数据→空闲检测），区别是检测期
+        不规划靠近动作，而是累计 pause_time_sec 不可见就再转一个 step_angle。
+        冻结机制保证转动期 tag_visible 恒为 False，状态机的 tag-lock 不会误触发。
+        """
+        # ── Case 1: 搜索步正在执行（里程计闭环盲转）──────────────
+        if self._executor.is_active:
+            done = self._executor.update(
+                self._odom_x, self._odom_y, self._odom_yaw,
+                tag_visible, self._raw_dist,
+                self._bearing_fn, self._theta_bounds_fn,
+                self._p('dock_target.distance'),
+                self._p('stopgo.drift_tol'), now_ns,
+            )
+            if done:
+                self._maneuver_active = False
+                self._executor.mark_stop_time(now_ns)
+            self._publish_action_cmd(base_type)
+            return
+
+        # ── Case 2: 转完后等待图像稳定 ────────────────────────────
+        if self._executor.wait_visual_settle(tag_visible, now_ns):
+            self._adapter.publish_stop()
+            return
+
+        # ── Case 2.5: 稳定窗口刚结束 → 解冻，强制下一帧只用停稳后的新鲜帧
+        if self._frozen:
+            self._frozen = False
+            self._filter_init = False
+            self._last_detection_ns = 0
+            self._pose_buffer.clear()
+            self._search_detect_start = 0
+            self._adapter.publish_stop()
+            return
+
+        # ── Case 3: 空闲且已稳定 — 检测期 ─────────────────────────
+        if not self._has_odom:
+            self._adapter.publish_stop()
+            self.get_logger().warn('搜索：等待里程计...', throttle_duration_sec=1.0)
+            return
+
+        # 二维码可见 → 原地停住，状态机累积 hold 转 APPROACH。
+        # 重置检测停留计数，让闪烁的二维码每次消失都重获完整停留窗口。
+        if tag_visible and tag_pose is not None:
+            self._search_detect_start = 0
+            self._adapter.publish_stop()
+            return
+
+        # 检测停留：累计 pause_time_sec 的持续不可见，然后转下一步
+        pause_time = self._p('search.pause_time_sec')
+        if self._search_detect_start == 0:
+            self._search_detect_start = now_ns
+            self._adapter.publish_stop()
+            self.get_logger().info(
+                f'搜索：检测停留 (步数={self._search_step})',
+                throttle_duration_sec=1.0)
+            return
+
+        if (now_ns - self._search_detect_start) * 1e-9 < pause_time:
+            self._adapter.publish_stop()
+            return
+
+        # 停留期满仍未见到 → 转下一步
+        self._search_detect_start = 0
+        self._search_step += 1
+        step_angle = math.radians(self._p('search.step_angle_deg'))
+        angle = step_angle * self._search_direction
+        rate = self._p('search.angular_speed')
+        if self._executor.start_turn(angle, rate, full=True):
+            self._executor.set_odom_ref(
+                self._odom_x, self._odom_y, self._odom_yaw)
+            self._maneuver_active = True
+            self._frozen = True
+            self.get_logger().info(
+                f'搜索：第{self._search_step}步 原地转 '
+                f'{math.degrees(angle):+.1f}° '
+                f'(方向={"CCW" if angle > 0 else "CW"})')
+        else:
+            self._frozen = False
+            self._maneuver_active = False
+        self._publish_action_cmd(base_type)
 
     def _start_next_maneuver_step(self, base_type: str):
         """Pop and start the next queued sub-step, re-referencing odometry.
@@ -814,6 +1106,26 @@ class DockingNode(Node):
         self._maneuver_active = False
         self._maneuver_iters = 0
         self._frozen = False
+        self._straight_failed = False
+
+    def _reset_search(self):
+        """重置角度步进搜索：计数器、方向、执行器、冻结态。
+
+        进入 SEARCH_TAG 时按最后见到二维码的一侧选初始方向（+lat=左=CCW→+1），
+        从未见过则退回 search.search_direction；之后始终同向，12 步转满 360°。
+        出 SEARCH_TAG 时也调用，终止可能正在转的搜索步并解冻。
+        """
+        self._search_step = 0
+        self._search_detect_start = 0
+        if self._last_seen_lat > 0.0:
+            self._search_direction = 1.0
+        elif self._last_seen_lat < 0.0:
+            self._search_direction = -1.0
+        else:
+            self._search_direction = 1.0 if self._p('search.search_direction') >= 0 else -1.0
+        self._executor.cancel()
+        self._frozen = False
+        self._maneuver_active = False
 
     # ── Helpers for the action executor ────────────────────────────
 
@@ -844,58 +1156,14 @@ class DockingNode(Node):
     def _is_omni(base_type: str) -> bool:
         return base_type in ('omni', 'quadruped')
 
-    # ── Search velocity ────────────────────────────────────────────
-
-    def _compute_search_velocity(self, now_ns: int) -> tuple[float, float, float]:
-        """Velocity for SEARCH_TAG — bidirectional widening sweep.
-
-        The old single-direction scan could never recover a tag lost off the
-        opposite FOV edge. This alternates direction each rotate phase and
-        widens the sweep, so both sides are covered:
-
-            sweep 0: toward last-seen side, 1× base width
-            sweep 1: opposite side,         2× width
-            sweep 2: back,                  3× width
-            ...
-
-        Starting toward the side where the tag was last seen (sign of
-        _last_seen_lat, +lat = left = CCW = +wz) finds it fastest in the common
-        case where a turn just nudged it past the edge.
-        """
-        base_speed = self._p('search.angular_speed')
-        rotate_time = self._p('search.rotate_time_sec')
-
-        # Detect entry into a new rotate phase → advance the sweep index.
-        if self._sm._search_phase == 'rotate':
-            if self._sm._search_phase_start_ns != self._search_last_phase_start:
-                self._search_last_phase_start = self._sm._search_phase_start_ns
-                self._search_sweep_idx += 1
-        else:
-            return 0.0, 0.0, 0.0
-
-        # First sweep direction: toward last-seen side (+lat → CCW → +).
-        first_dir = 1.0 if self._last_seen_lat >= 0.0 else -1.0
-        # Alternate each sweep.
-        direction = first_dir * (1.0 if (self._search_sweep_idx % 2 == 1) else -1.0)
-        # Widen: sweep 1→1×, 2→2×, 3→3×, capped at 4×.
-        width = min(self._search_sweep_idx, 4)
-
-        phase_ns = now_ns - self._sm._search_phase_start_ns
-        if phase_ns * 1e-9 < rotate_time * width:
-            return 0.0, 0.0, base_speed * direction
-        return 0.0, 0.0, 0.0
-
     # ── Params dict ────────────────────────────────────────────────
 
     def _build_params_dict(self) -> dict:
         return {
             'timeout_sec': self._p('timeout_sec'),
-            'navigation': {
-                'nav2_timeout_sec': self._p('navigation.nav2_timeout_sec'),
-                'pre_dock_distance': self._p('navigation.pre_dock_distance'),
-            },
             'search': {
                 'angular_speed': self._p('search.angular_speed'),
+                'step_angle_deg': self._p('search.step_angle_deg'),
                 'rotate_time_sec': self._p('search.rotate_time_sec'),
                 'pause_time_sec': self._p('search.pause_time_sec'),
                 'hold_time_sec': self._p('search.hold_time_sec'),
@@ -914,6 +1182,12 @@ class DockingNode(Node):
             },
             'safety': {
                 'minimum_distance_m': self._p('safety.minimum_distance_m'),
+            },
+            'retry': {
+                'timeout_sec': self._p('retry.timeout_sec'),
+            },
+            'undock': {
+                'timeout_sec': self._p('undock.timeout_sec'),
             },
             'align_timeout_sec': self._p('align_timeout_sec'),
             'approach_timeout_sec': self._p('approach_timeout_sec'),
@@ -937,12 +1211,9 @@ class DockingNode(Node):
     # ── Service callbacks ──────────────────────────────────────────
 
     def _on_start_docking(self, request, response):
-        nav_enable = self._p('navigation.enable')
-        ok = self._sm.start(enable_navigation=nav_enable)
+        ok = self._sm.start()
         response.success = ok
         response.message = f'state={self._sm.state_name}' if ok else 'already active'
-        if ok and nav_enable:
-            self._start_navigation()
         self._planner.reset()
         self._executor.cancel()
         self._reset_maneuver()
@@ -950,7 +1221,6 @@ class DockingNode(Node):
 
     def _on_cancel_docking(self, request, response):
         self._sm.cancel()
-        self._nav.cancel()
         self._planner.reset()
         self._executor.cancel()
         self._reset_maneuver()
@@ -959,19 +1229,27 @@ class DockingNode(Node):
         response.message = 'cancelled'
         return response
 
+    def _on_start_undock(self, request, response):
+        ok = self._sm.start_undock()
+        response.success = ok
+        response.message = f'state={self._sm.state_name}' if ok else 'docking active'
+        if ok:
+            self._planner.reset()
+            self._executor.cancel()
+            self._reset_maneuver()
+            self._undock_phase = 0
+        return response
+
     # ── Action callbacks ───────────────────────────────────────────
 
     def _execute_dock_cb(self, goal_handle):
         """Action execute callback — blocks until docking completes."""
         from tagdocking.action import Dock
 
-        nav_enable = self._p('navigation.enable')
-        ok = self._sm.start(enable_navigation=nav_enable)
+        ok = self._sm.start()
         if not ok:
             goal_handle.abort()
             return Dock.Result(success=False, message='already active')
-        if nav_enable:
-            self._start_navigation()
 
         self._planner.reset()
         self._executor.cancel()
@@ -983,7 +1261,6 @@ class DockingNode(Node):
             if goal_handle.is_cancel_requested:
                 goal_handle.canceled()
                 self._sm.cancel()
-                self._nav.cancel()
                 self._planner.reset()
                 self._executor.cancel()
                 self._reset_maneuver()
@@ -1009,40 +1286,11 @@ class DockingNode(Node):
 
     def _dock_cancel_cb(self, cancel_request):
         self._sm.cancel()
-        self._nav.cancel()
         self._planner.reset()
         self._executor.cancel()
         self._reset_maneuver()
         self._adapter.publish_stop()
         return CancelResponse.ACCEPT
-
-    # ── Navigation ─────────────────────────────────────────────────
-
-    def _start_navigation(self):
-        """Compute and send Nav2 pre-dock goal."""
-        from geometry_msgs.msg import PoseStamped, Quaternion
-
-        pre_dock_x = 0.0
-        pre_dock_y = 0.0
-        pre_dock_yaw = 0.0
-        pre_dock_frame = self._p('navigation.pre_dock_frame')
-
-        if self._amcl_pose is not None:
-            pre_dock_x = self._amcl_pose.pose.pose.position.x
-            pre_dock_y = self._amcl_pose.pose.pose.position.y
-            pre_dock_yaw = yaw_from_quat(self._amcl_pose.pose.pose.orientation)
-
-        pose = PoseStamped()
-        pose.header.frame_id = pre_dock_frame
-        pose.header.stamp = self.get_clock().now().to_msg()
-        pose.pose.position.x = pre_dock_x
-        pose.pose.position.y = pre_dock_y
-        pose.pose.position.z = 0.0
-        pose.pose.orientation = Quaternion()
-        pose.pose.orientation.z = math.sin(pre_dock_yaw / 2.0)
-        pose.pose.orientation.w = math.cos(pre_dock_yaw / 2.0)
-
-        self._nav.send_goal(pose)
 
     # ── Emergency stop ─────────────────────────────────────────────
 
@@ -1085,6 +1333,13 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except Exception:
+        # 信号处理器(_handle_signal)会调用 rclpy.shutdown() 以便打断 spin,
+        # 但这会让正在转的 spin 下一轮 wait_set 初始化抛 RCLError
+        # ("context is not valid")。上下文已被有意关闭时属正常退出路径,
+        # 吞掉以免 launch 报 process died; 仅真异常(rclpy 仍 ok)才重新抛出。
+        if rclpy.ok():
+            raise
     finally:
         try:
             node.destroy_node()

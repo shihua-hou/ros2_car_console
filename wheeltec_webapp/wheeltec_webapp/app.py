@@ -48,8 +48,8 @@ from rclpy.qos import (QoSProfile, ReliabilityPolicy, DurabilityPolicy,
                        HistoryPolicy)
 from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
-from sensor_msgs.msg import Image as ImageMsg, Imu, LaserScan, PointCloud2
-from std_msgs.msg import Float32
+from sensor_msgs.msg import Image as ImageMsg, Imu, LaserScan, PointCloud2, NavSatFix
+from std_msgs.msg import Float32, String, UInt8
 from std_srvs.srv import Trigger
 try:
     from nav2_msgs.srv import LoadMap        # 编辑完热加载进运行中的导航用
@@ -68,6 +68,45 @@ import websockets
 
 HOME = os.path.expanduser('~')
 PCD_DIR = os.path.join(HOME, 'wheeltec_ros2/src/FAST_LIO/PCD')
+
+# 户外模式的障碍带上限(米)。室内用 launch 默认的 0.45(=小车可通行高度),
+# 户外空旷草坪上 0.45 以下几乎没有可匹配结构, 放开到 2.0 把楼房树木纳入。
+# 改这个值必须同时改 outdoor_navigation.launch.py 的 scan_max_z 默认值,
+# 地图和 /scan 不同带会让 AMCL 的似然场把差集当失配。
+OUTDOOR_MAX_Z = 2.0
+
+# 户外障碍带下限(米)。室内 0.10 是为了抓桌椅腿; 草坪上草高就有 0.1~0.3m,
+# 用 0.10 会把整片草判成障碍 —— 2026-09-15 实测: 0.10->0.40 可通行格 +86%、
+# 障碍 3.5%->2.4%。取 0.30 折中: 清掉大部分草, 又不至于漏掉太矮的真实障碍。
+# 若场地草很高可调大, 若需要识别矮路沿则调小。
+OUTDOOR_MIN_Z = 0.30
+
+# 户外存图时"一格里至少几个点才算障碍"的默认值。
+# 保持 5 = pcd2pgm 自带默认, 也是室内路径用的值。
+#
+# 2026-09-15 一度改成 10, 当天测完改回来 —— 方向是反的:
+# 同一份户外点云里 30.1% 的点(约110万)本就落在 0.3~2m 障碍带内, 结构是有的;
+# 但 0.10m 分辨率下 occ=1 -> 障碍 5.2%, occ=5 -> 2.6%, occ=40 -> 0.5%。
+# 调高这个阈值删的是**真实结构**, 户外扫描本就稀疏, 越调图越空。
+#
+# "大片地面变黑"是另一个问题(坡地上地面被判成障碍), 已由局部地面网格
+# (local_ground / ground_cell)解决, 不要再拿这个阈值去压。
+OUTDOOR_OCC_PTS = 5
+
+# 户外出图时只保留离建图轨迹这么远(米)以内的点。
+# MID360 的 det_range 是 100m, 空旷处能收到 30~40m 外楼房的回波, 包围盒被撑到
+# 77x80m, 而那些远点是掠射来的 —— 又稀又不可靠(2026-09-15 实测: 包围盒
+# 73.7x77.6m, 自由区仅 4.6%)。裁掉让地图聚焦在真正走过的范围。
+# 注意这只影响**出图**; 远点照常参与 FAST-LIO 里程计, 空旷草坪上恰恰要靠远处
+# 楼房做几何约束, 所以不能改 det_range。
+# 2026-09-15 实测(一次 24m 直线来回的户外建图, 0.05m 分辨率)扫描结果:
+#   r=20 -> 自由 22.1%, 原始自由格 161479   r=15 -> 29.2%, 154152
+#   r=12 -> 34.7%, 149664                  r=8  -> 40.1%, 127306
+# 看**绝对自由格**(= 真正观测到的可通行面积): 20->12 只多丢 7%, 12->8 一下丢 15%
+# —— 拐点在 12 和 8 之间, 所以 12~15 都在安全区。取 15: 比 20 密得多, 又比 12
+# 保守, 对形状不同的路线更稳。注意这组数是在"直线型轨迹"上调的; 绕环建图时
+# 环内本来就被覆盖, 半径的影响会小很多。
+OUTDOOR_TRAJ_CROP = 15.0
 MAP_DIR = os.path.join(HOME, 'wheeltec_ros2/src/wheeltec_robot_nav2/map')
 STATIC_DIR = os.path.join(os.path.dirname(__file__), 'static')
 
@@ -75,6 +114,7 @@ STATIC_DIR = os.path.join(os.path.dirname(__file__), 'static')
 B_MAP, B_SCAN, B_CLOUD, B_PLAN, B_TRAJ, B_COSTMAP, B_MAP_EDIT = 1, 2, 3, 4, 5, 6, 7
 B_LOCAL_PLAN = 8            # 局部规划路径 (/local_plan, 控制器/MPPI 输出)
 B_CAM = 9                   # Astra 彩色相机画面 (JPEG, 前端要了才推)
+B_GPS = 10                  # GPS 数据 (NavSatFix)
 
 # 网页实时画面: 推流帧率/宽度/JPEG质量 (见 _cam_cb 里的权衡说明)
 CAM_FPS, CAM_W, CAM_Q = 12, 512, 70
@@ -97,6 +137,12 @@ SENSOR_PROFILES = {
         'package': 'wheeltec_fastlio',
         'launches': {'mapping': 'mapping.launch.py', 'save_map': 'save_map.launch.py',
                      'navigation': 'navigation.launch.py', 'lidar_test': 'lidar_test.launch.py'},
+    },
+    'outdoor': {
+        'label': 'MID360s 户外',
+        'package': 'wheeltec_outdoor_nav',
+        'launches': {'mapping': 'outdoor_mapping.launch.py', 'save_map': None,
+                     'navigation': 'outdoor_navigation.launch.py', 'lidar_test': None},
     },
     'n10plus': {
         'label': 'N10Plus',
@@ -193,6 +239,59 @@ def delete_route(sensor, name):
         _write_routes(d)
 
 
+# ---------- 回充点的持久化 ----------
+# 与巡航航点同构: 按"传感器桶/地图名"存每张图上的回充点(单点 {x,y,yaw})。
+# yaw 是"车到达回充点时应朝向"的朝向(即正对二维码), 让 Nav2 尽量正对停靠,
+# 减少到达后 SEARCH_TAG 角度步进搜索的耗时。
+DOCK_FILE = os.path.join(HOME, '.wheeltec', 'webapp_dock.json')
+
+
+def _load_dock():
+    try:
+        with open(DOCK_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_dock(d):
+    try:
+        os.makedirs(os.path.dirname(DOCK_FILE), exist_ok=True)
+        tmp = DOCK_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, DOCK_FILE)   # 原子替换
+        return True
+    except OSError:
+        return False
+
+
+def get_dock_point(sensor, name):
+    """返回 {'x','y','yaw'} 或 None。"""
+    v = _load_dock().get(_route_key(sensor, name))
+    if not isinstance(v, dict) or 'x' not in v or 'y' not in v:
+        return None
+    try:
+        return {'x': float(v['x']), 'y': float(v['y']),
+                'yaw': float(v.get('yaw', 0.0))}
+    except (TypeError, ValueError):
+        return None
+
+
+def save_dock_point(sensor, name, x, y, yaw):
+    d = _load_dock()
+    key = _route_key(sensor, name)
+    d[key] = {'x': float(x), 'y': float(y), 'yaw': float(yaw)}
+    return _write_dock(d)
+
+
+def delete_dock_point(sensor, name):
+    d = _load_dock()
+    if d.pop(_route_key(sensor, name), None) is not None:
+        _write_dock(d)
+
+
 def list_2d_maps():
     """扫描 install 版地图目录, 列出可用的 <name>.yaml+.pgm 配对(mid360/n10plus共用)。"""
     maps = []
@@ -225,10 +324,17 @@ def list_odin1_maps():
 
 # 外部实例探测特征 (与各 launch 文件自己的防重复启动逻辑一致, 覆盖三种传感器
 # 各自的关键进程名, 缺一个就会漏判导致双实例同时抢串口/cmd_vel)
+# ekf_node / gps_map_odom 是 2026-09-17 加的: 户外 gps 模式新增的全局 EKF
+# 若残留, 会一直发 map->odom_combined 和下次启动的定位抢 TF。
 EXT_PATTERN = ('component_container_isolated|livox_ros_driver2_node|'
                'wheeltec_robot_node|fastlio_mapping|lslidar_driver_node|'
-               'async_slam_toolbox_node|host_sdk_sample')
-_LAUNCH_PKG_PATTERN = 'wheeltec_fastlio|wheeltec_n10plus|wheeltec_odin1'
+               'async_slam_toolbox_node|host_sdk_sample|astra_camera_node|'
+               'nav2_waypoint_cycle|dual_rtk_driver|ekf_node|gps_map_odom')
+# astra_camera_node 是 2026-09-15 补的: mapping/navigation.launch.py 的防重复
+# 启动一直在查它, 这里却漏了。残留的相机节点对 webapp 隐形 -> "停止"按钮不亮、
+# 启动前的拦截也不触发, 用户在界面上完全无法自救, 只能 SSH 进去 pkill。
+# 两边的进程名清单必须保持一致, 加新节点时记得同步。
+_LAUNCH_PKG_PATTERN = 'wheeltec_fastlio|wheeltec_n10plus|wheeltec_odin1|wheeltec_outdoor_nav'
 
 # 网络: 板载网卡(wlan0)常连家里WiFi, USB网卡(wlan1)常开热点, 两块卡同时在线。
 #
@@ -740,6 +846,92 @@ class GroundFitter:
                 'roll': round(float(math.atan2(n[1], n[2])), 4)}
 
 
+class GpsMonitor:
+    """户外模式下单独托管一个 RTK 驱动进程。
+
+    为什么需要: RTK 驱动原本只在 outdoor_mapping/outdoor_navigation 这两个
+    launch 里起。没跑任务时没人发 /gps/fix, 界面只能显示"无信号" —— 2026-09-14
+    用户在户外反复以为是天线/信号问题, 实际只是驱动没启动。
+    所以切到户外模式就把它拉起来, 随时能看到定位状态。
+
+    与任务的冲突: 两个驱动抢同一个串口会互相偷字节。所以任务启动前先停掉本
+    进程(launch 自带驱动), 任务退出后再拉回来。
+    """
+
+    CMD = ['ros2', 'run', 'wheeltec_dual_rtk_driver', 'dual_rtk_driver_node',
+           '--ros-args', '-p', 'port:=/dev/wheeltec_gnss', '-p', 'baud:=115200']
+
+    # 驱动的输出落到这里。别再用 DEVNULL —— 2026-09-16 驱动起来后又自己死掉,
+    # 因为输出全被丢弃, 连 traceback 都没有, 只能看到"GPS 又没了"。
+    LOG = os.path.join(HOME, '.ros', 'wheeltec_gps_monitor.log')
+    LOG_MAX = 2 * 1024 * 1024        # 盘只剩 3G, 超过就截断重来
+
+    def __init__(self):
+        self.proc = None
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def _open_log(self):
+        os.makedirs(os.path.dirname(self.LOG), exist_ok=True)
+        try:
+            if os.path.getsize(self.LOG) > self.LOG_MAX:
+                os.replace(self.LOG, self.LOG + '.1')
+        except OSError:
+            pass
+        f = open(self.LOG, 'ab', buffering=0)
+        f.write(('\n===== %s 启动 RTK 驱动 =====\n'
+                 % time.strftime('%Y-%m-%d %H:%M:%S')).encode())
+        return f
+
+    def start(self):
+        if self.alive():
+            return
+        f = None
+        try:
+            f = self._open_log()
+            self.proc = subprocess.Popen(
+                self.CMD, stdin=subprocess.DEVNULL,
+                stdout=f, stderr=subprocess.STDOUT,
+                preexec_fn=os.setsid, close_fds=True)
+        except Exception:
+            # 启动失败原本也是静默的(直接 self.proc = None), 界面上只表现为
+            # "GPS未启动", 没法区分"没启动"和"启动了但失败"
+            self.proc = None
+            try:
+                import traceback
+                with open(self.LOG, 'a', encoding='utf-8') as g:
+                    g.write('启动失败:\n' + traceback.format_exc())
+            except Exception:
+                pass
+        finally:
+            if f is not None:
+                f.close()    # 子进程已经继承了 fd, 父进程这份可以关
+
+    def stop(self):
+        """先 SIGINT 让驱动自己收尾(它注册了 SIGINT handler), 收不掉再 SIGKILL。
+        注意: UM982Serial 的读串口线程不是守护线程, 只发 SIGINT 有概率留下占着
+        串口的僵尸进程(2026-09-14 实际发生过), 所以超时必须补 SIGKILL。"""
+        if not self.alive():
+            self.proc = None
+            return
+        pgid = os.getpgid(self.proc.pid)
+        try:
+            os.killpg(pgid, signal.SIGINT)
+        except Exception:
+            pass
+        for _ in range(30):
+            if self.proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        if self.proc.poll() is None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except Exception:
+                pass
+        self.proc = None
+
+
 class LaunchManager:
     """托管 wheeltec_fastlio 各 launch 的启停; 严格遵守项目规范:
     停止只发 SIGINT(等价Ctrl+C, 建图靠它保存PCD), 超时才 SIGKILL + 清 /dev/shm。"""
@@ -831,22 +1023,38 @@ class LaunchManager:
         self.loop.call_soon_threadsafe(self.on_exit, sensor, mode, rc)
 
     def _external_pids(self):
-        """本进程管理之外的 ROS 实例 pid 列表。"""
+        """本进程管理之外的 ROS 实例 pid 列表。
+
+        "自己人"有两拨, 都要排掉:
+          ① 当前任务那棵进程树(同一个进程组);
+          ② webapp 自己托管的 GPS 监控(GpsMonitor setsid 过, 自成一组)。
+        第②条是 2026-09-15 加的: 清单里补了 dual_rtk_driver 之后, 不排掉监控
+        的话, 户外模式一开界面就常亮"有残留进程"。
+        """
         r = subprocess.run(['pgrep', '-f', EXT_PATTERN],
                            capture_output=True, text=True)
         pids = [int(p) for p in r.stdout.split()]
+        own_pgids = set()
         if self.alive():
-            # 排除自己孩子: 同进程组的都算自己人
-            pgid = self.proc.pid
-            own = []
-            for p in pids:
-                try:
-                    if os.getpgid(p) == pgid:
-                        own.append(p)
-                except OSError:
-                    own.append(p)
-            pids = [p for p in pids if p not in own]
-        return pids
+            own_pgids.add(self.proc.pid)
+        hook = getattr(self, 'own_pgid_hook', None)
+        if hook:
+            try:
+                g = hook()
+                if g:
+                    own_pgids.add(g)
+            except Exception:
+                pass          # 钩子坏了不能拖垮残留检测
+        if not own_pgids:
+            return pids
+        out = []
+        for p in pids:
+            try:
+                if os.getpgid(p) not in own_pgids:
+                    out.append(p)
+            except OSError:
+                pass          # 查不到 = 刚退出, 不算残留
+        return out
 
     async def stop(self):
         """优雅停止: SIGINT -> 最多等22s -> SIGKILL + 清SHM。返回描述文本。"""
@@ -901,16 +1109,68 @@ class LaunchManager:
         return '外部实例已强杀并清理 /dev/shm'
 
     def _cleanup_shm(self):
-        """仅在无其它ROS进程时清理 FastDDS 残留 (fastrtps_* 与 sem.fastrtps_* 都要)。"""
-        if self._external_pids():
-            return
+        """清理被强杀进程残留的 FastDDS 共享内存/信号量文件。
+
+        进程被 kill -9 或段错误退出后, /dev/shm 会残留已锁定的
+        sem.fastrtps_portXXXX_mutex, 新启动的节点(尤其nav2容器)尝试加锁时
+        会在 futex 上永久死锁(表现为100%CPU且无日志)。
+
+        只删没有任何活进程在用的文件(2026-09-18 改)。原来按进程名猜"还有没有别的
+        ROS 进程在跑", 名单总有漏的(RTK驱动/gps_map_odom/ros2 daemon/手敲的命令),
+        会删掉活进程的文件使其通信断开; FastDDS 还靠 *_el 锁文件判断端口/段的主人
+        是否活着, 锁文件被删, 后来的进程会把活端口当空闲占用, 两个进程共用一个端口。
+        现在直接问内核: 被某个进程映射(/proc/*/maps)或打开(/proc/*/fd)就是在用。
+        同一段/端口的几个文件(本体、_el 锁、sem.*_mutex)算一组, 组内有一个在用或
+        10 秒内新建(防止和正在启动的进程赛跑), 整组保留。
+        """
+        import time
+        groups = {}
         for f in (glob.glob('/dev/shm/fastrtps_*') +
                   glob.glob('/dev/shm/sem.fastrtps_*') +
                   glob.glob('/dev/shm/fast_datasharing*')):
+            key = os.path.basename(f)
+            if key.startswith('sem.'):
+                key = key[4:]
+            for suffix in ('_mutex', '_el', '_sl'):
+                if key.endswith(suffix):
+                    key = key[:-len(suffix)]
+                    break
+            groups.setdefault(key, []).append(f)
+        if not groups:
+            return
+        used = set()  # 在用文件的 inode
+        for pid in os.listdir('/proc'):
+            if not pid.isdigit():
+                continue
             try:
-                os.remove(f)
+                with open('/proc/%s/maps' % pid) as fh:
+                    for line in fh:
+                        if ' /dev/shm/' in line:
+                            used.add(line.split()[4])
+                fds = os.listdir('/proc/%s/fd' % pid)
             except OSError:
-                pass
+                continue
+            for fd in fds:
+                link = '/proc/%s/fd/%s' % (pid, fd)
+                try:
+                    if os.readlink(link).startswith('/dev/shm/'):
+                        used.add(str(os.stat(link).st_ino))
+                except OSError:
+                    pass
+        now = time.time()
+        for files in groups.values():
+            try:
+                stats = [os.stat(f) for f in files]
+            except OSError:
+                continue
+            if any(str(s.st_ino) in used or now - max(s.st_mtime, s.st_ctime) < 10.0
+                   for s in stats):
+                continue
+            for f in files:
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
 
 
 class Bridge(Node):
@@ -960,11 +1220,17 @@ class Bridge(Node):
         self.create_subscription(Float32, 'PowerVoltage', self._cb('voltage'), 5)
         self.create_subscription(PointCloud2, '/cloud_registered',
                                  self.cloud_cb, sensor_qos)
+        # 订阅 /Laser_map 作为备用（FAST-LIO 在某些配置下只发布这个话题）
+        self.create_subscription(PointCloud2, '/Laser_map',
+                                 self.cloud_cb, sensor_qos)
         # 雷达内置 IMU: 只用来定"哪边是上"(见 GroundFitter)。200Hz 全收会白烧 CPU,
         # 回调里按 20Hz 抽。建图没起时这个话题根本不存在, 订阅着也没开销。
         self.create_subscription(Imu, '/livox/imu', self.imu_cb, sensor_qos)
         self.create_subscription(ImageMsg, '/camera/color/image_raw',
                                  self.image_cb, sensor_qos)
+        # GPS 数据订阅 (NavSatFix)
+        self.create_subscription(NavSatFix, '/gps/fix', self._cb('gps'), 10)
+        self.create_subscription(UInt8, '/gps/quality', self._cb('gps_quality'), 10)
 
         self.pub_vel = self.create_publisher(Twist, '/cmd_vel', 2)
         # 【MPPI 速度上限的 workaround】见 handle_msg 里 nav_speed 的长注释:
@@ -975,6 +1241,15 @@ class Bridge(Node):
         self.pub_init = self.create_publisher(PoseWithCovarianceStamped,
                                               '/initialpose', 2)
         self.cli_reloc = self.create_client(Trigger, '/relocalize')
+        # 停靠/泊出服务客户端 (tagdocking)。服务不在线时 call_async 会超时, 调用方
+        # 用 service_is_ready() 先探一遍并给 toast 提示。
+        self.cli_dock_start = self.create_client(
+            Trigger, '/docking_node/start_docking')
+        self.cli_dock_undock = self.create_client(
+            Trigger, '/docking_node/start_undock')
+        self.dock_state_seq = 0
+        self.create_subscription(
+            String, '/docking_node/state', self._cb_dock_state, 10)
         self.cli_loadmap = (self.create_client(LoadMap, '/map_server/load_map')
                             if LoadMap else None)
         self.cli_cancel = self.create_client(
@@ -996,6 +1271,18 @@ class Bridge(Node):
                 elif key == 'odom':
                     self.odom_mono = time.monotonic()
         return f
+
+    def _cb_dock_state(self, msg):
+        """停靠状态回调: 只在状态字符串真正变化时递增序号(触发推送)。
+
+        /docking_node/state 是 20Hz 连续发布(终态如 timeout 也一直重复发),
+        若每条都推给前端, 前端会在同一终态上反复弹 toast。只在状态跳变时推。
+        """
+        with self.lock:
+            if self.latest.get('dock_state') == msg.data:
+                return
+            self.latest['dock_state'] = msg.data
+            self.dock_state_seq += 1
 
     def param_client(self, node_fqn):
         """rcl_interfaces/SetParameters 客户端(懒加载复用): 用于运行时调整
@@ -1191,6 +1478,7 @@ class WebConsole:
         self.last_plan_stamp = None
         self.last_local_plan_stamp = None
         self.cam_seq_sent = -1       # 已推给前端的相机帧序号
+        self.dock_seq_sent = -1      # 已推给前端的停靠状态序号
         self.reloc_mode = 'auto'     # 'auto'=自动重定位模式 / 'odom'=里程计模式
         self.cmd_active = False
         self.cmd_last_t = 0.0
@@ -1273,6 +1561,9 @@ class WebConsole:
         self.send_json(t='log', line=line)
 
     def on_launch_exit(self, sensor, mode, rc):
+        # 任务结束, 户外模式下把常驻 RTK 驱动拉回来
+        if self.gps_mon_want:
+            self.gps_mon.start()
         label = SENSOR_PROFILES.get(sensor, {}).get('label', sensor)
         self.send_json(t='log', line=f'--- {label}/{mode} 进程退出 (code {rc}) ---')
         if mode == 'save_map':      # 只有 mid360 有这个launch模式
@@ -1370,7 +1661,12 @@ class WebConsole:
                     # 不会 —— 只 colcon build 没重启服务时, 新前端会配着旧后端跑,
                     # "保存前自动备份/另存为/热加载"三样都还没有。有这个标志就不会
                     # 在对话框里承诺一个后端做不到的事。
-                    caps=['map_edit_backup', 'map_edit_saveas', 'map_reload'],
+                    caps=['map_edit_backup', 'map_edit_saveas', 'map_reload',
+                          'pcd_confirm', 'gps_monitor', 'save_occ_pts'],
+                    # gps_pub: 当前有几个节点在发 /gps/fix。用来区分"驱动没启动"
+                    # 和"驱动在跑但搜不到星" —— 以前两种都显示"GPS无信号", 害人。
+                    gps_pub=self.node.count_publishers('/gps/fix'),
+                    gps_mon=self.gps_mon.alive(),
                     running=self.mgr.alive(), stopping=self.mgr.stopping,
                     external=self.ext_running and not self.mgr.alive(),
                     voltage=round(v.data, 1) if v else None,
@@ -1442,6 +1738,12 @@ class WebConsole:
                     cloud = self.node.cloud_out
                     self.node.cloud_out = None
                     odom = self.node.latest.get('odom')
+                    dstate = self.node.latest.get('dock_state')
+                    dseq = self.node.dock_state_seq
+                    gps = self.node.latest.get('gps')
+                if dstate is not None and dseq != self.dock_seq_sent:
+                    self.dock_seq_sent = dseq
+                    self.send_json(t='dock_state', state=dstate)
                 if scan is not None and tick % 2 == 0 and \
                         scan.header.stamp != self.last_scan_stamp:
                     self.last_scan_stamp = scan.header.stamp
@@ -1495,6 +1797,20 @@ class WebConsole:
                         self.traj.append((p.x, p.y))
                         del self.traj[:-20000]
                         self._send_all(pack_floats(B_TRAJ, self.traj[-1:]))
+                # GPS 数据推送 (约 2Hz)
+                if gps is not None and tick % 3 == 0:
+                    self.send_json(
+                        t='gps',
+                        lat=gps.latitude,
+                        lon=gps.longitude,
+                        alt=gps.altitude,
+                        status=gps.status.status,
+                        service=gps.status.service,
+                        cov=list(gps.position_covariance[:3]),  # 只发经纬度和高度的协方差
+                        # 原始GGA质量位, 界面据此显示准确的定位类型
+                        quality=getattr(
+                            self.node.latest.get('gps_quality'), 'data', None)
+                    )
             tick += 1
             await asyncio.sleep(0.2)
 
@@ -1553,13 +1869,26 @@ class WebConsole:
         elif t == 'scene':
             # 前端开/关建图页的"实景"开关: 只影响点云推送的帧率和密度
             self.node.scene_want = bool(msg.get('on'))
+        elif t == 'gps_monitor':
+            # 切到户外模式就常驻一个 RTK 驱动, 切回室内就停掉。
+            # 有任务在跑时不启动 —— launch 自带驱动, 两个抢串口会互相偷字节。
+            self.gps_mon_want = bool(msg.get('on'))
+            if self.gps_mon_want:
+                if not self.mgr.alive():
+                    self.gps_mon.start()
+            else:
+                self.gps_mon.stop()
         elif t == 'cmd_stop':
             self.cmd_active = False
             self.node.send_vel(0.0, 0.0)
         elif t == 'start':
+            # launch 自带 RTK 驱动, 先让开串口
+            self.gps_mon.stop()
             sensor = msg.get('sensor', 'mid360')
             mode = msg.get('mode')
             map_name = (msg.get('map_name') or '').strip()
+            outdoor = msg.get('outdoor', False)  # 户外模式标志
+
             # 任何新任务启动都清掉上一次会话的轨迹/点云/路径残留(建图轨迹是
             # camera_init系, 导航路径是map系, 混杂展示在新地图上容易让人误解)
             self.traj.clear()
@@ -1571,14 +1900,41 @@ class WebConsole:
                 self.node.ground.reset()
 
             launch_args = {}
+            # 建图: 只有前端弹窗确认过"清理上次PCD分段"才带这个参数。
+            # 不带的话 launch 里遇到遗留分段会直接拒绝启动, 避免新旧点云混成废图。
+            if mode == 'mapping' and msg.get('clear_pcd'):
+                launch_args['clear_pcd'] = 'true'
             if map_name and not _safe_map_name(map_name):
                 self.send_json(t='toast', ok=False,
                     msg='地图名不合法(只能中英文/数字/下划线/中划线, 1-64字符)')
                 return
+
+            # 户外模式：使用 wheeltec_outdoor_nav 功能包
+            if outdoor and mode in ('mapping', 'navigation'):
+                sensor = 'outdoor'  # 使用特殊标识，后面会映射到 outdoor 配置
+
             if mode == 'save_map':          # 只有mid360有这个launch模式
                 self.pending_map_name = map_name or 'WHEELTEC3D'
                 launch_args['map_name'] = self.pending_map_name
-            elif mode == 'navigation' and sensor in ('mid360', 'n10plus'):
+                # 户外: 障碍带提到 2.0m, 把楼房/树木纳入地图。必须和
+                # outdoor_navigation 里 /scan 的 scan_max_z 保持一致。
+                if outdoor:
+                    launch_args['max_z'] = str(OUTDOOR_MAX_Z)
+                    launch_args['min_z'] = str(OUTDOOR_MIN_Z)
+                    # 散点过滤强度由前端逐次给; 旧前端不带这个字段, 退回默认。
+                    # 必须夹范围: 传 0 会让所有非空格子都变障碍, 传太大真实
+                    # 墙面也被滤掉, 两头都是废图, 不能让前端字段直接下发。
+                    try:
+                        occ = int(msg.get('occ_pts') or OUTDOOR_OCC_PTS)
+                    except (TypeError, ValueError):
+                        occ = OUTDOOR_OCC_PTS
+                    launch_args['occupied_min_points'] = str(min(max(occ, 1), 50))
+                    launch_args['traj_crop_radius'] = str(OUTDOOR_TRAJ_CROP)
+                    # 存完图顺手做 GPS 地理配准, 结果绑定到这张地图。
+                    # 数据不合格时 georef_map.py 会拒绝写文件, 结果是
+                    # "没有标定"(守卫不激活)而不是"错的标定", 所以可以常开。
+                    launch_args['georef'] = 'true'
+            elif mode == 'navigation' and sensor in ('mid360', 'n10plus', 'outdoor'):
                 if map_name:
                     yaml_path = os.path.join(MAP_DIR_INSTALL, map_name + '.yaml')
                     if not os.path.exists(yaml_path):
@@ -1638,6 +1994,12 @@ class WebConsole:
             await self._cancel_active()
         elif t == 'relocalize':
             await self._call_relocalize()
+        elif t == 'dock':
+            # 回充: 导航到回充点 → 到达后触发停靠
+            await self._start_recharge(
+                msg.get('sensor', 'mid360'), msg.get('name', ''))
+        elif t == 'undock':
+            await self._call_undock()
         elif t == 'reloc_mode':
             # 里程计模式(odom): 关掉自动重定位看门狗, 侧重里程计, 避免长走廊等
             # 相似场景里频繁误重定位; 自动重定位模式(auto): 看门狗照常工作。
@@ -1872,6 +2234,29 @@ class WebConsole:
                 msg=(f'巡航路线已保存到地图 "{name}" ({len(pts)}点)' if pts
                      else f'已清除地图 "{name}" 的巡航路线') if ok
                     else '保存巡航路线失败(磁盘写入错误)')
+        elif t == 'get_dock_point':
+            sensor = msg.get('sensor', 'mid360')
+            name = (msg.get('name') or '').strip()
+            p = get_dock_point(sensor, name) if _safe_map_name(name) else None
+            self.send_json(t='dock_point', sensor=sensor, name=name, point=p)
+        elif t == 'save_dock_point':
+            sensor = msg.get('sensor', 'mid360')
+            name = (msg.get('name') or '').strip()
+            if not _safe_map_name(name):
+                self.send_json(t='toast', ok=False,
+                    msg='请先在地图库选中一张要绑定回充点的地图')
+                return
+            ok = save_dock_point(sensor, name, msg['x'], msg['y'],
+                                 msg.get('yaw', 0.0))
+            self.send_json(t='toast', ok=ok,
+                msg=(f'回充点已保存到地图 "{name}"'
+                     if ok else '保存回充点失败(磁盘写入错误)'))
+        elif t == 'clear_dock_point':
+            sensor = msg.get('sensor', 'mid360')
+            name = (msg.get('name') or '').strip()
+            if _safe_map_name(name):
+                delete_dock_point(sensor, name)
+            self.send_json(t='toast', msg=f'已清除地图 "{name}" 的回充点')
         elif t == 'delete_map':
             sensor = msg.get('sensor', 'mid360')
             name = (msg.get('name') or '').strip()
@@ -2082,6 +2467,9 @@ class WebConsole:
             if missed:
                 text = f'⚠ 多点导航完成, 但错过航点 {[i+1 for i in missed]}'
         self.send_json(t='toast', msg=text, ok=name == 'succeeded')
+        # 回充编排第二步: 到达回充点后触发停靠 (docking 节点须已启动)
+        if kind == 'dock' and name == 'succeeded':
+            await self._call_start_docking()
         # 循环模式: 全部到达后从头再来
         if kind == 'follow' and name == 'succeeded' and self.wps_loop \
                 and self.wps_points:
@@ -2101,7 +2489,9 @@ class WebConsole:
             return
         self._fb_mono = now
         f = fb.feedback
-        if kind == 'single':
+        # 'dock' 也走 NavigateToPose (ac_nav), 反馈字段与 'single' 一致;
+        # 只有 'follow' 是 FollowWaypoints, 才有 current_waypoint。
+        if kind in ('single', 'dock'):
             kw = dict(dist=round(f.distance_remaining, 2),
                       time=f.navigation_time.sec,
                       recov=f.number_of_recoveries)
@@ -2126,7 +2516,14 @@ class WebConsole:
 
     async def _call_relocalize(self):
         if not self.node.cli_reloc.service_is_ready():
-            self.send_json(t='toast', msg='/relocalize 服务不在线 (导航未启动?)', ok=False)
+            # 户外 RTK 定位模式下 auto_relocalize 是故意关的: 位置由 GPS 直接给出,
+            # 点云配准重定位只会给出错误坐标。只有全局 EKF 发 /odometry/global,
+            # 据此区分"故意关了"和"导航没起来", 别让用户误以为导航挂了。
+            if self.node.count_publishers('/odometry/global') > 0:
+                self.send_json(t='toast', ok=True,
+                    msg='RTK 定位模式: 位置由 GPS 直接给出, 不需要重定位')
+            else:
+                self.send_json(t='toast', msg='/relocalize 服务不在线 (导航未启动?)', ok=False)
             return
         fut = self.node.cli_reloc.call_async(Trigger.Request())
         try:
@@ -2135,6 +2532,75 @@ class WebConsole:
             self.send_json(t='toast', msg=f'重定位: {r.message}', ok=r.success)
         except asyncio.TimeoutError:
             self.send_json(t='toast', msg='重定位超时', ok=False)
+
+    async def _call_start_docking(self):
+        """触发 AprilTag 停靠。Trigger 只表示"已启动", 完成信号靠 /docking_node/state
+        话题(见 task_fast 里的 dock_state 推送)。
+
+        停靠节点已不再自带 pre-dock 导航(tagdocking 移除了 Nav2 预停靠):
+        start_docking 直接 IDLE→SEARCH_TAG 搜码。回充时网页已用 Nav2 把车开到回充点
+        并正对二维码, 到达后直接触发即可, 无需(也无法)再设 navigation.enable。
+        """
+        if not self.node.cli_dock_start.service_is_ready():
+            self.send_json(t='toast', ok=False,
+                msg='停靠节点未启动 (请先 ros2 launch tagdocking docking.launch.py)')
+            return
+        fut = self.node.cli_dock_start.call_async(Trigger.Request())
+        try:
+            await asyncio.wait_for(self._wrap_future(fut), timeout=10.0)
+            r = fut.result()
+            self.send_json(t='toast', msg=f'停靠: {r.message}', ok=r.success)
+        except asyncio.TimeoutError:
+            self.send_json(t='toast', msg='停靠服务超时', ok=False)
+
+    async def _call_undock(self):
+        if not self.node.cli_dock_undock.service_is_ready():
+            self.send_json(t='toast', ok=False,
+                msg='停靠节点未启动 (请先 ros2 launch tagdocking docking.launch.py)')
+            return
+        fut = self.node.cli_dock_undock.call_async(Trigger.Request())
+        try:
+            await asyncio.wait_for(self._wrap_future(fut), timeout=10.0)
+            r = fut.result()
+            self.send_json(t='toast', msg=f'泊出: {r.message}', ok=r.success)
+        except asyncio.TimeoutError:
+            self.send_json(t='toast', msg='泊出服务超时', ok=False)
+
+    async def _start_recharge(self, sensor='mid360', name=''):
+        """回充编排: 导航到回充点(带朝向) → 到达后由 _run_nav 触发停靠。
+
+        回充点是"pre-docking"点: 坐标 + yaw 让 Nav2 把车开到点且尽量正对二维码,
+        这样到达后 SEARCH_TAG 几乎不用旋转搜索, 停泊时间最短。
+        """
+        # 1) 导航必须已在运行
+        if not (self.mgr.alive() and self.mgr.mode == 'navigation'):
+            self.send_json(t='toast', ok=False, msg='导航未启动，无法回充')
+            return
+        # 2) 已有导航任务 → 什么也不做
+        if self.goal_handle is not None or \
+                (self.nav_task and not self.nav_task.done()):
+            self.send_json(t='toast', ok=False, msg='已有导航任务，忽略回充')
+            return
+        # 2.5) 停靠/泊出进行中也不要再触发回充 (到达后的停靠不会走状态机, 得在这里拦)
+        ds = self.node.latest.get('dock_state')
+        if ds in ('navigating', 'search_tag', 'align', 'approach',
+                  'final_servo', 'undocking'):
+            self.send_json(t='toast', ok=False, msg='停靠/泊出进行中，忽略回充')
+            return
+        # 3) 回充点必须已设置
+        name = (name or '').strip()
+        if not _safe_map_name(name):
+            self.send_json(t='toast', ok=False, msg='请先在地图库选中一张地图')
+            return
+        p = get_dock_point(sensor, name)
+        if p is None:
+            self.send_json(t='toast', ok=False, msg='请先设置回充点')
+            return
+        goal = NavigateToPose.Goal()
+        goal.pose = self.node.make_pose(p['x'], p['y'], p['yaw'])
+        self.send_json(t='toast', msg=f'回充：导航到回充点 ({p["x"]:.2f}, '
+                                      f'{p["y"]:.2f})，朝向 {math.degrees(p["yaw"]):.0f}°')
+        self._spawn_nav(self.node.ac_nav, goal, 'dock', 1)
 
     async def _call_cancel(self, quiet=False):
         if not self.node.cli_cancel.service_is_ready():
@@ -2221,6 +2687,12 @@ class WebConsole:
         self.loop = asyncio.get_event_loop()
         self.mgr = LaunchManager(self.loop, self.on_launch_line,
                                  self.on_launch_exit)
+        self.gps_mon = GpsMonitor()
+        # 让残留检测认得自家的 GPS 监控(它跑的也是 dual_rtk_driver),
+        # 否则户外模式下会把它误报成残留进程
+        self.mgr.own_pgid_hook = (
+            lambda: self.gps_mon.proc.pid if self.gps_mon.alive() else None)
+        self.gps_mon_want = False   # 前端是否处于户外模式(任务结束后据此决定要不要拉回来)
         # 启动时预览地图库里最近修改的一张(只是画布预览, 不代表导航会用它——
         # 导航实际用哪张现在由启动时选择的地图名决定, 见地图库UI)
         try:

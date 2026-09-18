@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# 棋盘格标定相机内参 — 封装 ROS 官方 camera_calibration 包。
+#
+# cameracalibrator 是 GUI 工具(用 cv2.imshow 显示画面), 本车是无头机器,
+# 必须用 ssh -X 转发 X11 才能看到画面和点击采集/标定/提交按钮。
+#
+# 标定流程:
+#   1. 相机已在跑(navigation 或单独起相机驱动)
+#   2. ssh -X 连车, 运行本脚本
+#   3. 弹出窗口显示相机画面, 举着棋盘格在相机前各角度移动
+#   4. 进度条(X/Y/size/skew)变绿后点 CALIBRATE 计算内参
+#   5. 计算完点 COMMIT 提交 → 终端打印 ost 格式 YAML
+#   6. 本脚本自动捕获 ost, 存到 config/calibration/ost.yaml
+#   7. 按提示让 navigation.launch.py 加载标定(color_info_url)
+#
+# 用法:
+#   ./scripts/calibrate_camera                              # 默认 9x6 内角点, 25mm 方格
+#   ./scripts/calibrate_camera --size 7x5 --square 0.02     # 自定义棋盘格
+#   ./scripts/calibrate_camera --camera-name rgb_camera     # 相机名(默认就是 rgb_camera, 改了驱动不认)
+#   注: 脚本内部已用下划线 --camera_name 传给 cameracalibrator (它只认这种形式)
+#   ./scripts/calibrate_camera --skip-topic-check           # 跳过话题检查(脚本内查不到但交互式能查到时用)
+#
+# 棋盘格 --size 是【内角点数】NxM, 不是方格数:
+#   标准 8x8 棋盘(64 格) = 7x7 内角点
+#   打印一张 10x7 方格的图 = 9x6 内角点
+# --square 是单个方格的边长(米), 用尺量打印出来的实际尺寸。
+
+set -euo pipefail
+
+# ── 定位包路径 ──────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CALIB_DIR="$PKG_DIR/config/calibration"
+OST_FILE="$CALIB_DIR/ost.yaml"
+LOG_FILE="/tmp/calibrate_camera_$$.log"
+
+# ── 默认参数 ────────────────────────────────────────────────────────
+# ⚠ camera-name 必须是 "rgb_camera": astra 驱动的 setupCameraInfoManager()
+# 硬编码 CameraInfoManager(node_, "rgb_camera", color_info_url_), oST 文件的
+# [name] 段必须与之匹配, 否则 isCalibrated() 返回 false, 驱动静默用默认内参。
+SIZE="9x6"
+SQUARE="0.025"
+CAMERA_NAME="rgb_camera"
+IMAGE_TOPIC="/camera/color/image_raw"
+INFO_TOPIC="/camera/color/camera_info"
+SKIP_TOPIC_CHECK=0
+
+# ── 解析命令行 ──────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --size)         SIZE="$2"; shift 2 ;;
+    --square)       SQUARE="$2"; shift 2 ;;
+    --camera-name)  CAMERA_NAME="$2"; shift 2 ;;
+    --image-topic)  IMAGE_TOPIC="$2"; shift 2 ;;
+    --info-topic)   INFO_TOPIC="$2"; shift 2 ;;
+    --skip-topic-check) SKIP_TOPIC_CHECK=1; shift ;;
+    -h|--help)
+      sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+      exit 0 ;;
+    *) echo "未知参数: $1 (用 --help 查看用法)"; exit 1 ;;
+  esac
+done
+
+# ── 前置检查 ────────────────────────────────────────────────────────
+
+# 1. DISPLAY (cameracalibrator 用 cv2.imshow, 无头机器必须 ssh -X)
+if [[ -z "${DISPLAY:-}" ]]; then
+  echo "✗ 错误: 没有 DISPLAY 环境变量 — cameracalibrator 需要 GUI 显示画面。" >&2
+  echo "  本车是无头机器(无桌面), 必须用 X11 转发连接:" >&2
+  echo "" >&2
+  echo "    # 从你的电脑重新 SSH 连车 (注意 -X):" >&2
+  echo "    ssh -X cat@<车IP>" >&2
+  echo "" >&2
+  echo "  连上后验证: echo \$DISPLAY  (应有值如 localhost:10.0)" >&2
+  echo "  Mac 需装 XQuartz, Windows 需装 VcXsrv/Xming 并 ssh -X" >&2
+  exit 1
+fi
+echo "✓ DISPLAY=$DISPLAY (X11 转发可用)"
+
+# 2. ROS 环境
+# ⚠ colcon/ros 的 setup.bash 会引用未定义变量(如 COLCON_TRACE), 与本脚本的
+# set -u 冲突会直接终止脚本 —— sourcing 期间临时关掉 -u。
+if [[ -z "${ROS_DISTRO:-}" ]] || ! command -v ros2 &>/dev/null; then
+  if [[ -f /opt/ros/humble/setup.bash ]]; then
+    set +u; source /opt/ros/humble/setup.bash; set -u
+  else
+    echo "✗ 错误: 找不到 ROS2 (ROS_DISTRO 未设, /opt/ros/humble 不存在)" >&2
+    exit 1
+  fi
+fi
+# 工作空间 overlay (让 ros2 run 能找到 camera_calibration)
+if [[ -f ~/wheeltec_ros2/install/setup.bash ]]; then
+  set +u; source ~/wheeltec_ros2/install/setup.bash; set -u
+fi
+
+# 3. camera_calibration 包
+if [[ ! -x /opt/ros/humble/lib/camera_calibration/cameracalibrator ]]; then
+  echo "✗ 错误: camera_calibration 包未安装。" >&2
+  echo "  安装方法(本机有 libopencv-dev 冲突, 需手工解包):" >&2
+  echo "    # 1. 换 USTC 源下载(aliyun 443 不通):" >&2
+  echo "    echo 'deb [arch=arm64 signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] https://mirrors.ustc.edu.cn/ros2/ubuntu jammy main' > /tmp/ustc_ros.list" >&2
+  echo "    sudo apt-get -o Dir::Etc::sourcelist=/tmp/ustc_ros.list -o Dir::Etc::sourceparts=/dev/null update" >&2
+  echo "    sudo apt-get -o Dir::Etc::sourcelist=/tmp/ustc_ros.list -o Dir::Etc::sourceparts=/dev/null download \\" >&2
+  echo "      ros-humble-camera-calibration ros-humble-cv-bridge ros-humble-image-geometry" >&2
+  echo "    # 2. 手工解包绕过 libopencv-dev 冲突:" >&2
+  echo "    sudo dpkg-deb -x ros-humble-camera-calibration_*.deb /" >&2
+  echo "    sudo dpkg-deb -x ros-humble-cv-bridge_*.deb /" >&2
+  echo "    sudo dpkg-deb -x ros-humble-image-geometry_*.deb /" >&2
+  echo "    # 3. semver shim (python3-semver 无候选):" >&2
+  echo "    #    见 ~/.local/lib/python3.10/site-packages/semver.py" >&2
+  exit 1
+fi
+echo "✓ camera_calibration 包可用"
+
+# 4. 相机话题在发布
+# 重试几次给 daemon 预热; 仍失败就打印诊断信息让用户判断(而非闷头退出)。
+# 这是非致命检查 —— 标定窗口本身收得到图像才是真正的判据, 所以查不到也不退出,
+# 用 --skip-topic-check 可彻底跳过。
+_wait_for_publisher() {
+  local topic="$1" tries=0
+  while [[ $tries -lt 5 ]]; do
+    if ros2 topic info "$topic" 2>/dev/null | grep -q "Publisher count: [1-9]"; then
+      return 0
+    fi
+    tries=$((tries + 1))
+    sleep 1
+  done
+  return 1
+}
+
+if [[ $SKIP_TOPIC_CHECK -eq 0 ]]; then
+  echo "→ 检查相机话题..."
+  TOPIC_OK=true
+  if ! _wait_for_publisher "$IMAGE_TOPIC"; then
+    echo "⚠ 脚本进程内查不到 $IMAGE_TOPIC 的发布者。诊断:" >&2
+    echo "  ── ros2 topic info 原始输出 ──" >&2
+    ros2 topic info "$IMAGE_TOPIC" 2>&1 | sed 's/^/    /' >&2
+    echo "  ── ros2 topic list (含 color 的行) ──" >&2
+    ros2 topic list 2>&1 | grep -i color | sed 's/^/    /' >&2 || echo "    (无 color 话题)" >&2
+    echo "  ── 本脚本 ROS_DOMAIN_ID / RMW ──" >&2
+    echo "    ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-<空>}" >&2
+    echo "    RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-<默认>}" >&2
+    echo "  若你交互式跑 'ros2 topic info $IMAGE_TOPIC' 能看到发布者," >&2
+    echo "  多半是本脚本与登录 shell 的 ROS 环境/域不一致(DOMAIN_ID、RMW、overlay)。" >&2
+    echo "  可用 --skip-topic-check 跳过此检查直接启动标定窗口(收得到图像与否一目了然)。" >&2
+    TOPIC_OK=false
+  fi
+  if $TOPIC_OK && ! _wait_for_publisher "$INFO_TOPIC"; then
+    echo "⚠ $INFO_TOPIC 没有发布者(可能相机驱动还没起 camera_info)。" >&2
+    TOPIC_OK=false
+  fi
+  $TOPIC_OK && echo "✓ 相机话题正常 ($IMAGE_TOPIC)"
+  if ! $TOPIC_OK; then
+    echo "  话题检查未通过但仍继续 —— 标定窗口若收不到图像请先解决环境问题。" >&2
+  fi
+else
+  echo "→ 跳过话题检查 (--skip-topic-check)"
+fi
+
+# 5. 标定输出目录
+mkdir -p "$CALIB_DIR"
+
+# ── 运行标定 ────────────────────────────────────────────────────────
+echo ""
+echo "════════════════════════════════════════════════════════════════"
+echo "  棋盘格相机标定"
+echo "  棋盘格:   ${SIZE} 内角点, 方格边长 ${SQUARE}m"
+echo "  相机名:   $CAMERA_NAME (写入 ost 文件)"
+echo "  图像:     $IMAGE_TOPIC"
+echo "  输出:     $OST_FILE"
+echo "════════════════════════════════════════════════════════════════"
+echo ""
+echo "  操作步骤:"
+echo "    1. 弹出窗口后, 举棋盘格在相机前移动"
+echo "       覆盖画面各区域 + 各角度(俯/仰/左/右倾斜)"
+echo "    2. 右侧进度条(X/Y/Size/Skew)全变绿 → 点 CALIBRATE"
+echo "    3. 计算完成(几秒) → 点 COMMIT 提交"
+echo "    4. 终端打印 ost YAML 后, 关窗口或 Ctrl+C 退出"
+echo ""
+echo "  ⚠ COMMIT 时会尝试调 set_camera_info 服务(astra 驱动没有, 会报失败)"
+echo "     但 ost YAML 仍会打印, 本脚本会自动捕获存盘。可忽略那个失败提示。"
+echo ""
+echo "  → 启动 cameracalibrator (日志存 $LOG_FILE) ..."
+echo ""
+
+# cameracalibrator 标定完点 COMMIT 后, do_upload() 会 print(self.c.ost())
+# 即 ost 格式 YAML 打到 stdout。用 tee 同时存日志和显示, 事后从日志提取。
+# --no-service-check: astra 没 set_camera_info 服务, 跳过启动检查避免退出。
+# --camera_name (下划线!): 这版 cameracalibrator 用 optparse, 只认下划线形式,
+#   写入 ost 的 [name] 段, 必须是 "rgb_camera"(匹配 astra 驱动硬编码名)。
+# 话题重映射: cameracalibrator 默认订阅 image/camera_info, remap 到实际话题。
+set +e
+/opt/ros/humble/lib/camera_calibration/cameracalibrator \
+  --size "$SIZE" \
+  --square "$SQUARE" \
+  --camera_name "$CAMERA_NAME" \
+  --no-service-check \
+  --ros-args \
+    -r "image:=$IMAGE_TOPIC" \
+    -r "camera_info:=$INFO_TOPIC" \
+  2>&1 | tee "$LOG_FILE"
+CALIB_RC=${PIPESTATUS[0]}
+set -e
+
+echo ""
+echo "→ cameracalibrator 已退出 (返回码 $CALIB_RC), 解析 ost 输出..."
+
+# ── 从日志提取 ost YAML ─────────────────────────────────────────────
+# ost 格式以 "# oST version" 开头, 到日志里找这段。
+# CameraInfoManager 认这个格式(file://ost.yaml)。
+# 提取范围: 从 "# oST version" 行到下一个空行后的 projection 段结束。
+python3 - "$LOG_FILE" "$OST_FILE" <<'PYEOF'
+import sys, re
+
+log_file, out_file = sys.argv[1], sys.argv[2]
+with open(log_file, 'r', errors='replace') as f:
+    text = f.read()
+
+# ost 输出形如 (lrost() 生成, 见 camera_calibration/calibrator.py:616):
+#   # oST version 5.0 parameters
+#   [image]  width  640  height  480  [camera]
+#   camera matrix   (3 行, 每行 3 个空格分隔的浮点数)
+#   distortion      (1 行)
+#   rectification   (3 行)
+#   projection      (3 行, 每行 4 个浮点数)  ← ost 块到这里结束
+# 完整块 = 从 header 到 projection 的 3 个值行。COMMIT 可能点多次, 取最后一个。
+pattern = re.compile(
+    r'# oST version 5\.0 parameters.*?projection\n(?:[^\n]*\n){3}',
+    re.DOTALL
+)
+matches = pattern.findall(text)
+
+if not matches:
+    print("✗ 未在日志中找到 ost 标定输出。", file=sys.stderr)
+    print("  可能原因: 没点 COMMIT 按钮, 或标定未完成。", file=sys.stderr)
+    print("  完整日志见: " + log_file, file=sys.stderr)
+    sys.exit(2)
+
+ost = matches[-1].strip() + "\n"
+with open(out_file, 'w') as f:
+    f.write(ost)
+print("✓ 标定结果已保存: " + out_file)
+
+# 解析 K 矩阵打印一下, 供确认(ost 的 camera matrix 段紧跟 3 行值)
+m = re.search(r'camera matrix\n([^\n]*\n[^\n]*\n[^\n]*)', ost)
+if m:
+    vals = m.group(1).split()
+    if len(vals) >= 6:
+        fx, fy, cx, cy = float(vals[0]), float(vals[4]), float(vals[2]), float(vals[5])
+        print(f"  fx={fx:.2f}  fy={fy:.2f}  cx={cx:.2f}  cy={cy:.2f}")
+        print(f"  (标定前默认值: fx=fy=570.34  cx=319.5  cy=239.5)")
+PYEOF
+PARSE_RC=$?
+
+echo ""
+if [[ $PARSE_RC -ne 0 ]]; then
+  echo "完整日志: $LOG_FILE"
+  exit $PARSE_RC
+fi
+
+# ── 接入指导 ────────────────────────────────────────────────────────
+echo ""
+echo "════════════════════════════════════════════════════════════════"
+echo "  标定完成! 下一步: 让相机驱动加载标定值"
+echo "════════════════════════════════════════════════════════════════"
+echo ""
+echo "  标定文件: $OST_FILE"
+echo ""
+echo "  让驱动加载 — 在 navigation.launch.py 的 astra 节点参数里加 color_info_url:"
+echo ""
+echo "    # wheeltec_fastlio/launch/navigation.launch.py, astra_camera 节点 parameters 块内加:"
+echo "    #   'color_info_url': 'file://$PKG_DIR/config/calibration/ost.yaml'"
+echo ""
+echo "  然后重编 + 重启导航:"
+echo "    cd ~/wheeltec_ros2 && colcon build --packages-select wheeltec_fastlio"
+echo "    ros2 launch wheeltec_fastlio navigation.launch.py"
+echo ""
+echo "  验证标定已生效:"
+echo "    ros2 topic echo /camera/color/camera_info --once | grep -A4 'k:'"
+echo "    # K 矩阵应显示标定值(不再是默认 570.34/319.5/239.5)"
+echo ""
+echo "  ⚠ 两个匹配条件(不满足会静默回退默认内参):"
+echo "    1. ost 文件的 [name] 段 = '$CAMERA_NAME' (脚本默认已是, 匹配驱动硬编码名)"
+echo "    2. 标定分辨率 = 运行时分辨率 (本脚本标 /camera/color/image_raw = 640x480, "
+echo "       与 navigation.launch.py 的 color_width/height 一致)"
+echo ""
+echo "  效果验证(用 test_apriltag 相机直测模式对比标定前后精度):"
+echo "    python3 scripts/test_apriltag --known-distance 1.0"
+echo ""

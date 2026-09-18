@@ -5,8 +5,10 @@
   <version>0.1.0</version>
   <description>
     Industrial-grade AprilTag auto-docking framework with multi-chassis
-    support (diff-drive, omni, quadruped), Nav2 pre-docking, visual
-    servoing, and full state machine.
+    support (diff-drive, omni, quadruped), visual servoing, and full
+    state machine. Docking is triggered directly (e.g. via the
+    /docking_node/start_docking service); pre-dock navigation is handled
+    externally.
   </description>
   <maintainer email="user@example.com">user</maintainer>
   <license>Apache-2.0</license>
@@ -23,13 +25,10 @@
   <depend>apriltag_msgs</depend>
   <depend>tf2_ros</depend>
   <depend>tf2_geometry_msgs</depend>
-  <depend>nav2_msgs</depend>
 
   <exec_depend>rosidl_default_runtime</exec_depend>
   <exec_depend>apriltag_ros</exec_depend>
-  <!-- camera_info_bridge node used by docking.launch.py to synchronize
-       image/camera_info timestamps for apriltag_ros -->
-  <exec_depend>autodock</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

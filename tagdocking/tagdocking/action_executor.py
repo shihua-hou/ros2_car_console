@@ -63,6 +63,14 @@ class ActionExecutor:
         # Turn tracking
         self._turn_start_yaw = 0.0
         self._turn_blind_cap = None
+        # Unwrapped accumulated rotation (rad) since the turn started. The raw
+        # odom yaw wraps at ±π, so "turned = abs(normalize_angle(delta))" caps
+        # at π and a 180° turn (target π) never completes cleanly: the robot
+        # overshoots, the capped measure drops back below π, and it spins a full
+        # extra revolution until delta lands on π again. Accumulate the wrapped
+        # per-tick increments instead so the true total keeps growing.
+        self._turn_accumulated = 0.0
+        self._turn_prev_yaw = 0.0
 
         # Visual settle after turn
         self._last_stop_ns: int | None = None
@@ -201,6 +209,8 @@ class ActionExecutor:
         elif self._action == 'turning':
             self._turn_start_yaw = yaw
             self._turn_blind_cap = blind_cap
+            self._turn_accumulated = 0.0
+            self._turn_prev_yaw = yaw
 
     # ── Update (call at control-loop rate) ──────────────────────────
 
@@ -296,7 +306,15 @@ class ActionExecutor:
 
     def _update_turn(self, odom_yaw, tag_visible, raw_dist,
                      bearing_fn, theta_bounds_fn) -> bool:
-        turned = abs(normalize_angle(odom_yaw - self._turn_start_yaw))
+        # Accumulate the unwrapped rotation. odom_yaw wraps at ±π, so a naive
+        # abs(normalize_angle(odom_yaw - start)) caps at π and breaks for any
+        # turn ≥ π (e.g. the 180° undock): the robot overshoots, the measure
+        # drops back below the target, and it spins a full extra revolution.
+        d = odom_yaw - self._turn_prev_yaw
+        d = math.atan2(math.sin(d), math.cos(d))   # wrap per-tick delta to [-π, π]
+        self._turn_accumulated += d
+        self._turn_prev_yaw = odom_yaw
+        turned = abs(self._turn_accumulated)
 
         # Determine completion target: use blind cap if tag not visible
         target_now = self._action_target

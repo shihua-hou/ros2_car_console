@@ -467,7 +467,7 @@ RViz 配置要点（RViz 只在远程 PC 上跑，**不要在鲁班猫上跑**�
 
 - pcd2pgm：RANSAC 地面校平（消除安装倾角，1° 倾角在 15m 外会把地面翘成障碍）、自动合并 scans*.pcd 分段、高度带以地面为 z=0（min_z=0.10 / max_z=0.45=车可通行高度；倾装时期曾改成 2.0/1.2，已回退，见 5.7.0）
 - auto_relocalize：启动自动重定位 + `/relocalize` 服务 + 绑架看门狗（**双 σ 似然场**：全局搜索 σ=0.25，健康检查 σ=0.08——宽 σ 下错误位姿也能蒙 0.7 分，必须用窄 σ 区分）
-- mapping/navigation launch：启动时防重复实例 + 自动清理 /dev/shm 残留 + 建图前清空旧 PCD 分段
+- mapping/navigation launch：启动时防重复实例 + 自动清理 /dev/shm 残留（2026-09-18 起只删没有任何进程映射/打开的文件组，不再按进程名猜）+ 建图前清空旧 PCD 分段
 - depth_obstacle_filter（2026-08-05 新增）：Astra 深度图 → 导航用稀疏障碍点云，见 5.5
 
 ### 5.5 Astra 深度相机避障（2026-08-05 新增，已实机验证）
@@ -1046,6 +1046,7 @@ x < 0 && x² > cos²(半角)·(x²+y²)
 | 编译中进程被杀/机器卡死 | **4GB 内存 OOM**（本机最常见问题） | 确认 swap 已启用；降 MAKEFLAGS 到 -j2、`--parallel-workers 1`；`dmesg \| grep -i killed` 确认 |
 | 编译到一半机器**莫名重启**（不是卡死、不是被 kill，是干净地重启了） | **硬件看门狗**（2026-07-23 为排查WiFi热点卡死而启用，`/etc/systemd/system.conf` 的 `RuntimeWatchdogSec=30`，RK 的 dw_wdt 实际取整到 **44s**）。本机 4GB 内存 + swap 在 eMMC 上，`colcon build` 重度换页时 PID 1 可能喂不上狗 → SoC 自动复位 | 跑大编译前先关掉：`sudo sed -i 's/^RuntimeWatchdogSec=30/#RuntimeWatchdogSec=0/' /etc/systemd/system.conf && sudo systemctl daemon-reexec`。查证当前值：`systemctl show -p RuntimeWatchdogUSec`（`0` 才是关闭） |
 | nav2 容器 100% CPU、零日志、生命周期节点全不创建 | 被 kill -9 的进程在 /dev/shm 残留**已锁定的 `sem.fastrtps_*` 信号量**，新进程加锁死锁 | 停全部 ROS 进程后 `rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_*`（两条都要，`fastrtps_*` 匹配不到 `sem.` 前缀）。launch 已内置自动清理 |
+| 导航跑着跑着进程间数据断了（发现正常但收不到数据、EKF 发散），导航进程 `/proc/<pid>/maps` 里全是 `/dev/shm/... (deleted)` | **systemd-logind `RemoveIPC=yes`（默认）**：webapp 和它拉起的导航都在 `wheeltec-webapp.service` 里，不算登录会话；cat 最后一个 SSH/终端会话关闭 10 秒后，logind 删掉 cat 名下全部 /dev/shm。FastDDS 见 `*_el` 锁文件没了，还会把活着的段当僵尸删掉（2026-09-18 查明） | 已加 `/etc/systemd/logind.conf.d/10-keep-ros-shm.conf`：`[Login]` `RemoveIPC=no`（不额外占内存；`loginctl enable-linger cat` 也行但常驻约 29MB）。重装系统后要重新加。查证：`busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager RemoveIPC` 应为 `b false` |
 | Ctrl+C 关不掉 launch | humble nav2 容器关闭时 bond 死锁（社区已知） | 等10秒不退就 `~/stop_nav.sh`；连按 Ctrl+C 没用 |
 | 启动报"检测到已有建图/导航实例" | 防重复启动保护（双实例互相打架：组件挤进同名容器、串口冲突、CPU爆） | 按提示先停旧实例 |
 | ros2 CLI 报 `Failed init_port ... open_and_lock_file failed` | 被强杀的 CLI 进程污染 SHM/daemon | 清 SHM + `ros2 daemon stop && ros2 daemon start` |

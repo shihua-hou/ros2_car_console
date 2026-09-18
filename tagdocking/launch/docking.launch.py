@@ -11,9 +11,6 @@ Usage:
   # With custom tag
   ros2 launch tagdocking docking.launch.py dock_tag_id:=5 tag_size:=0.21
 
-  # Skip Navigation (direct docking mode)
-  ros2 launch tagdocking docking.launch.py navigation_enable:=false
-
   # Omni wheel mode
   ros2 launch tagdocking docking.launch.py base_type:=omni
 """
@@ -49,7 +46,9 @@ def launch_setup(context):
     camera_frame = LaunchConfiguration('camera_frame').perform(context)
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic').perform(context)
     base_type = LaunchConfiguration('base_type').perform(context)
-    navigation_enable = LaunchConfiguration('navigation_enable').perform(context).lower() == 'true'
+    dock_distance = float(LaunchConfiguration('dock_distance').perform(context))
+    final_straight_distance = float(LaunchConfiguration('final_straight_distance').perform(context))
+    final_straight_yaw_deg = float(LaunchConfiguration('final_straight_yaw_deg').perform(context))
 
     pkg_share = get_package_share_directory('tagdocking')
     config_path = os.path.join(pkg_share, 'config', 'docking.yaml')
@@ -70,8 +69,11 @@ def launch_setup(context):
     # 时间同步会丢弃几乎所有帧 (Synchronized pairs: 0) → 检测频率极低 → 转向后
     # 来不及重新看到 tag 而丢失。桥每收到一帧 image 就用其时间戳重发 camera_info,
     # 保证每帧都能配对。
+    #
+    # camera_info_bridge 是 tagdocking 包内节点 (原依赖的独立 autodock 包已废弃,
+    # 实现见 tagdocking/camera_info_bridge.py)。
     nodes.append(Node(
-        package='autodock',
+        package='tagdocking',
         executable='camera_info_bridge',
         name='camera_info_bridge',
         parameters=[{
@@ -118,7 +120,10 @@ def launch_setup(context):
                 'camera_frame': camera_frame,
                 'base.cmd_vel_topic': cmd_vel_topic,
                 'base.type': base_type,
-                'navigation.enable': navigation_enable,
+                # 两阶段停泊参数 (覆盖 yaml)
+                'dock_target.distance': dock_distance,
+                'final_straight.start_distance': final_straight_distance,
+                'final_straight.yaw_threshold_deg': final_straight_yaw_deg,
             },
         ],
         output='screen',
@@ -146,7 +151,11 @@ def generate_launch_description():
                              description='Velocity command topic'),
         DeclareLaunchArgument('base_type', default_value='diff_drive',
                              description='Chassis type: diff_drive, omni, quadruped'),
-        DeclareLaunchArgument('navigation_enable', default_value='true',
-                             description='Enable Nav2 pre-docking'),
+        DeclareLaunchArgument('dock_distance', default_value='0.55',
+                             description='最终停泊距离 (m), 底盘距 tag'),
+        DeclareLaunchArgument('final_straight_distance', default_value='0.85',
+                             description='直行阶段起点距离 (m), 到此距离后纯直行不再调角 (须 > dock_distance)'),
+        DeclareLaunchArgument('final_straight_yaw_deg', default_value='5.0',
+                             description='进入直行阶段的航向门槛 (deg, 方阵误差)'),
         OpaqueFunction(function=launch_setup),
     ])

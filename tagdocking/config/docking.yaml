@@ -1,14 +1,5 @@
 docking_node:
   ros__parameters:
-    # ── Navigation (Nav2 pre-docking) ──
-    navigation.enable: true
-    navigation.pre_dock_distance: 1.0        # m — distance in front of tag
-    navigation.position_tolerance: 0.1        # m
-    navigation.yaw_tolerance_deg: 5.0         # degrees
-    navigation.nav2_action_name: "navigate_to_pose"
-    navigation.nav2_timeout_sec: 60.0
-    navigation.pre_dock_frame: "map"
-
     # ── Camera / Timing ──
     # 自适应位姿时效窗口: 实际取 max(max_latency_ms, 实测检测间隔 × latency_interval_margin)。
     # 程序自动适应相机真实帧率 (6Hz→窗口~500ms, 30Hz→窗口~100ms 但受下限保护),
@@ -68,6 +59,15 @@ docking_node:
     final_servo.max_yaw_speed: 0.2            # rad/s — (legacy)
     final_servo.distance: 0.20                # m — enter FINAL_SERVO within this distance
 
+    # ── Final Straight (两阶段停泊) ──
+    # 阶段1(APPROACH): 正常带角度修正的接近, 尽量对准。
+    # 阶段2(直行): 进入 start_distance 后无条件纯直行, 不再调角(像停车入库)。
+    #   进入时做一次性失败检查: 方位误差 > yaw_threshold_deg 则对准过差、
+    #   入库会撞偏 → 报 MOTION_FAILED 导航失败。容许 ±10° 内入库。
+    final_straight.enable: true                       # 两阶段停泊开关; false 恢复单阶段
+    final_straight.start_distance: 0.85               # m — 直行阶段起点 (须 > dock_target.distance)
+    final_straight.yaw_threshold_deg: 10.0            # deg — 直行失败门槛: 进入直行距离时方位误差超此值则报导航失败
+
     # ── Docking Tolerance ──
     tolerance.position_m: 0.05                # m — 前后 ±5cm 视为到位
     tolerance.yaw_deg: 10.0                   # degrees — ±10° 视为对准
@@ -77,13 +77,26 @@ docking_node:
     safety.minimum_distance_m: 0.15           # m — stop if closer than this
     timeout_sec: 120.0                        # overall docking timeout
 
+    # ── Undock (泊出) ──
+    # 泊出 = 盲退一段距离 → 原地转 180°, 纯里程计闭环不看 tag。
+    # 由 /docking_node/start_undock 触发, 典型场景: 停泊(DOCKED)后把车退出充电桩/工位。
+    # blind 与重试倒车同一路径(negative jog), 转向用 full 全量盲转(里程计校准)。
+    undock.backup_distance: 0.5                # m — 盲退距离(后退, 正值)
+    undock.linear_rate: 0.08                   # m/s — 后退速率
+    undock.turn_angle_deg: 180.0               # deg — 转向角度(正=CCW, 负=CW)
+    undock.angular_rate: 0.3                   # rad/s — 转向速率
+    undock.timeout_sec: 30.0                   # 泊出整体超时(里程计不走时兜底落 MOTION_FAILED)
+
     # ── Search Behavior ──
-    search.angular_speed: 0.3                 # rad/s — rotation speed
-    search.rotate_time_sec: 0.8               # s — rotate for this long
-    search.pause_time_sec: 1.5                # s — pause for detection
-    search.hold_time_sec: 0.5                 # s — tag must be visible this long to lock
-    search.search_direction: 1                # +1 = CCW, -1 = CW
-    search.timeout_sec: 60.0                  # overall search timeout
+    # 角度步进搜索: 转固定角度(里程计闭环) → 停稳 → 检测 → 再转, 转满 360°。
+    # 转动期冻结检测避免误锁; 单向旋转不交替, 12 步(30°)转满一圈在 60s 超时内。
+    search.angular_speed: 0.3                 # rad/s — 每步旋转速度
+    search.step_angle_deg: 30.0               # deg — 每步旋转角度, 建议≥10°(太小会半速拖慢)
+    search.rotate_time_sec: 0.8               # (已弃用) 角度步进化后不再读取, 保留兼容旧配置
+    search.pause_time_sec: 1.5                # s — 每步之间的检测停留时长
+    search.hold_time_sec: 0.5                 # s — 二维码持续可见此时长才锁定
+    search.search_direction: 1                # +1=CCW, -1=CW (从未见过二维码时的起始方向)
+    search.timeout_sec: 60.0                  # 整体搜索超时
 
     # ── Per-State Timeouts ──
     align_timeout_sec: 15.0
@@ -95,4 +108,4 @@ docking_node:
 
     # ── Topics ──
     detection_topic: "/detections"
-    odom_topic: "/odom"
+    odom_topic: "/odom_combined"

@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <title>WHEELTEC 控制台</title>
+<script src="https://webapi.amap.com/maps?v=2.0&key=c9515d8a263546e0a94f01137e8e44d1&plugin=AMap.Scale,AMap.ToolBar"></script>
+<script>
+  window._AMapSecurityConfig = { securityJsCode: '9e5bf6810330a0b354c2e7c9e002b5ce' };
+</script>
 <!--
   双模式控制台 (2026-08-06 起)。挂在 /v2, 与老版 index.html 并存, 说的是同一套 WS 协议。
 
@@ -228,6 +232,15 @@ button{font:inherit;color:inherit;border:none;background:none;cursor:pointer}
 
 /* ---- 状态胶囊 ---- */
 #hChips{display:flex;flex-wrap:wrap;gap:7px;padding-top:12px;flex:none}
+.chip.gps-status{background:var(--panel2);border:1px solid var(--line);padding:8px 12px}
+/* 经纬度+精度这条比普通 chip 长得多: .chip 在文件前半段定了
+   max-width:190px, 后面那条 .chip 规则没重置它, 不放开会把精度数值
+   用 ellipsis 截掉(2026-09-15 用户反馈)。tabular-nums 让数字等宽,
+   坐标跳动时宽度不抖。 */
+.chip.gps-coord{max-width:100%;font-variant-numeric:tabular-nums}
+.chip.gps-status.ok{background:var(--ok-soft);border-color:var(--ok);color:var(--ok)}
+.chip.gps-status.warn{background:#ffa50020;border-color:#ffa500;color:#d68000}
+.chip.gps-status.err{background:var(--err-soft);border-color:var(--err);color:var(--err)}
 .chip{display:flex;align-items:center;gap:6px;font-size:12.5px;padding:5px 11px;
   border-radius:var(--r-pill);background:var(--panel2);color:var(--dim);
   border:1px solid var(--line);white-space:nowrap}
@@ -322,7 +335,37 @@ button{font:inherit;color:inherit;border:none;background:none;cursor:pointer}
 .float{position:absolute;z-index:20;background:color-mix(in srgb,var(--panel) 80%,transparent);
   backdrop-filter:blur(14px) saturate(1.2);-webkit-backdrop-filter:blur(14px) saturate(1.2);
   border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow-lg)}
-/* 【浮层布局】左上相机 → 其下面板 → 左下日志; 右侧一列操作按钮; 右下摇杆;
+/* GPS 地图窗口 - 类似 pip 的样式，固定在左侧实时画面下方 */
+#gpsMap{position:absolute;left:14px;top:380px;width:320px;z-index:20;
+  background:color-mix(in srgb,var(--panel) 80%,transparent);
+  backdrop-filter:blur(14px) saturate(1.2);-webkit-backdrop-filter:blur(14px) saturate(1.2);
+  border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow-lg);
+  overflow:hidden;padding:0;display:none}
+#gpsMap.show{display:block}
+#gpsMap.fold{height:50px}
+#gpsMap.full{width:calc(100vw - 28px);height:calc(100vh - 28px);left:14px;top:14px;z-index:100}
+#gpsMapContainer{width:100%;height:210px;border-radius:0 0 16px 16px;margin-top:50px}
+#gpsMap.fold #gpsMapContainer{display:none}
+#gpsMap.full #gpsMapContainer{height:calc(100% - 50px);border-radius:0 0 16px 16px}
+#gpsBar{position:absolute;top:0;left:0;right:0;height:50px;
+  background:color-mix(in srgb,var(--panel) 95%,transparent);
+  backdrop-filter:blur(10px);display:flex;align-items:center;justify-content:space-between;
+  padding:0 12px;border-bottom:1px solid var(--line);z-index:102;border-radius:16px 16px 0 0}
+#gpsMap.fold #gpsBar{height:100%;border-bottom:none;border-radius:16px}
+#gpsLabel{font-size:13px;font-weight:600;color:var(--fg)}
+#gpsStatus{font-size:11px;padding:3px 8px;border-radius:6px;margin-left:8px}
+#gpsStatus.rtk-fix{background:var(--ok-soft);color:var(--ok)}
+#gpsStatus.dgps{background:#ffa50020;color:#d68000}
+#gpsStatus.gps{background:var(--accent-soft);color:var(--accent)}
+#gpsStatus.no-fix{background:var(--err-soft);color:var(--err)}
+#gpsCoords{font-size:10px;color:var(--dim);font-family:monospace;margin-top:2px}
+#gpsControls{display:flex;gap:4px;z-index:103;position:relative}
+#gpsControls button{width:32px;height:32px;border-radius:8px;border:none;
+  background:var(--panel2);cursor:pointer;display:flex;align-items:center;
+  justify-content:center;transition:background 0.2s;color:var(--fg);font-size:16px;font-weight:600}
+#gpsControls button:hover{background:var(--accent-soft)}
+#gpsMap.fold #gpsControls .hide-fold{display:none}
+/* 【浮层布局】左上相机 → 其下面板 → 其下GPS地图 → 左下日志; 右侧一列操作按钮; 右下摇杆;
    底部居中图例+比例尺。 */
 #pip{left:14px;top:14px;width:320px;overflow:hidden;padding:0}
 #pip .pip-body{position:relative;width:100%;aspect-ratio:4/3;background:#0007}
@@ -660,6 +703,8 @@ button{font:inherit;color:inherit;border:none;background:none;cursor:pointer}
 <symbol id="i-hand" viewBox="0 0 24 24"><path d="M12 3v9"/><path d="M5 12l7 8 7-8"/><path d="M8 9l4-4 4 4"/></symbol>
 <symbol id="i-orbit" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><ellipse cx="12" cy="12" rx="10" ry="4.4" transform="rotate(-25 12 12)"/></symbol>
 <symbol id="i-charge" viewBox="0 0 24 24"><path d="M13 2L4.5 13H11l-1 9 8.5-11H12z"/></symbol>
+<symbol id="i-dock" viewBox="0 0 24 24"><path d="M5 3h14v4H5z"/><path d="M12 7v12"/><path d="M8 15l4 4 4-4"/></symbol>
+<symbol id="i-undock" viewBox="0 0 24 24"><path d="M5 3h14v4H5z"/><path d="M12 19V7"/><path d="M8 11l4-4 4 4"/></symbol>
 <symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></symbol>
 <symbol id="i-chip" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M4 10h3M4 14h3M17 10h3M17 14h3M10 4v3M14 4v3M10 17v3M14 17v3"/></symbol>
 <symbol id="i-hdd" viewBox="0 0 24 24"><path d="M3 14h18M5.5 14L7 5h10l1.5 9v4a1 1 0 01-1 1h-11a1 1 0 01-1-1z"/><circle cx="16" cy="17" r=".8"/></symbol>
@@ -687,7 +732,7 @@ button{font:inherit;color:inherit;border:none;background:none;cursor:pointer}
   <div id="hLeft">
     <div id="hHead">
       <span class="logo"><svg class="ic"><use href="#i-robot"/></svg></span>
-      <div><h2>机器人控制台</h2>
+      <div><h2 style="font-size:24px;font-weight:700">机器人控制台</h2>
         <div class="sub"><span class="dot" id="hDot"></span><span id="hSub">正在连接…</span></div></div>
     </div>
     <div id="hClock">
@@ -696,6 +741,20 @@ button{font:inherit;color:inherit;border:none;background:none;cursor:pointer}
     </div>
     <div id="hTiles"></div>
     <div id="hChips"></div>
+    <!-- 室内/户外模式切换（左右切换样式） -->
+    <div style="margin-top:14px;display:flex;flex-direction:column;gap:6px">
+      <div style="font-size:12px;color:var(--dim);font-weight:600">运行模式</div>
+      <div id="outdoorToggle" style="display:flex;border-radius:10px;overflow:hidden;border:2px solid var(--line);background:var(--panel2);cursor:pointer;position:relative;height:44px">
+        <div id="outdoorSlider" style="position:absolute;width:50%;height:100%;background:linear-gradient(135deg,#2f7ef7,#5aa0ff);border-radius:8px;transition:transform 0.3s cubic-bezier(0.4,0,0.2,1);z-index:1"></div>
+        <button id="outdoorIndoor" style="flex:1;border:none;background:transparent;font-size:14px;font-weight:600;color:white;cursor:pointer;z-index:2;transition:color 0.3s;display:flex;align-items:center;justify-content:center;gap:6px">
+          <span>🏠</span><span>室内模式</span>
+        </button>
+        <button id="outdoorOutdoor" style="flex:1;border:none;background:transparent;font-size:14px;font-weight:600;color:var(--dim);cursor:pointer;z-index:2;transition:color 0.3s;display:flex;align-items:center;justify-content:center;gap:6px">
+          <span>🌍</span><span>户外模式</span>
+        </button>
+      </div>
+      <small style="color:var(--dim);font-size:11px">切换模式会自动停止运行中的任务</small>
+    </div>
   </div>
   <div id="hRight">
     <button class="hbtn" data-go="nav"><span class="glow"></span>
@@ -787,6 +846,28 @@ button{font:inherit;color:inherit;border:none;background:none;cursor:pointer}
   <div class="float" id="tools"></div>
   <div class="float" id="navPanel"></div>
 
+  <!-- GPS 地图窗口 -->
+  <div class="float" id="gpsMap">
+    <div id="gpsMapContainer"></div>
+    <div id="gpsBar">
+      <div style="flex:1;min-width:0">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span id="gpsLabel">GPS 定位</span>
+          <span id="gpsStatus">--</span>
+        </div>
+        <div id="gpsCoords">--</div>
+      </div>
+      <div id="gpsControls">
+        <button id="gpsFull" title="全屏/还原">
+          <svg class="ic" style="width:16px;height:16px"><use href="#i-fit"/></svg>
+        </button>
+        <button id="gpsFold" title="折叠/展开">
+          <span id="gpsFoldIcon">—</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
   <!-- 3D 手势速查: 进建图页时自动露一下, 之后点掉就不再弹(记在 localStorage)。
        点云视图没有任何可见的操作提示, 不说一声没人知道双指能平移。 -->
   <div id="gesHint">
@@ -830,7 +911,8 @@ const S={mode:'idle',sensor:'mid360',running:false,external:false,stopping:false
 const UI={route:'home',   // home | nav | map | maps | settings
           mode:'nav',     // 画布用: 'nav'(2D地图) | 'map'(3D点云), 由 route 派生
           pipMain:false,        // false=地图为主画面, true=相机为主画面
-          panel:'',             // '' | 'goal' | 'wps'
+          panel:'',             // '' | 'goal' | 'wps' | 'dock'
+          outdoor:localStorage.getItem('v2outdoor')==='1',  // 室内/户外模式切换
           layers:Object.assign({costmap:true,plan:true,local:true,scan:true},
                     JSON.parse(localStorage.getItem('v2layers')||'{}')),
           sound:localStorage.getItem('v2sound')!=='0',
@@ -841,6 +923,9 @@ let navT0=null;
 /* 导航的终态(含被拒绝)。后端发的是 nav2 原词, 在 onJson 里已翻译成这套。 */
 const NAV_END=['succeeded','failed','canceled','rejected','idle'];
 let maps=[], nav={state:'idle'}, robot={ok:false,x:0,y:0,yaw:0,frame:''};
+let gps={ok:false,lat:0,lon:0,alt:0,status:-1,heading:0};  // GPS 状态
+let gpsMap=null, gpsMarker=null;  // 高德地图实例和标记
+let dockState='idle', dockPoint=null;   // 停靠状态字符串 / 回充点 {x,y,yaw}
 let ws=null, connected=false;
 /* 刚连上的那一瞬间后端会补发: 当前 state、当前 nav_info、最近100条日志。
    那些是**历史**, 不是刚发生的事 —— 不设这个门, 每次刷新页面/掉线重连都会把
@@ -858,6 +943,17 @@ function connect(){
                  // 断线重连后后端的 scene_want 已经清了(没客户端就退回1Hz),
                  // 实景开着的话要重新告诉它, 否则点云会莫名其妙变回一秒一跳
                  if(C3.scene)send({t:'scene',on:true});
+                 // 户外模式只存在于前端(localStorage), 后端不记。小车/webapp 重启后
+                 // 后端是干净的, 不主动同步就会出现"界面显示户外、GPS 却未启动"。
+                 // 2026-09-16 实际踩到: 页面从小车重启前就开着, 只在 load 时同步过
+                 // 一次, 之后每次断线重连都没再同步, 两边就一直对不上。
+                 // 延迟 1.5s 是等第一条 state 把 caps 带回来, 否则 applyGpsMonitor
+                 // 会因为 caps 还是空的而提前 return 并误报"后端版本较旧"。
+                 // 只"恢复", 不"关闭": gps_monitor 是全局单例, 谁发谁算数。
+                 // 无条件发的话, 一个处于室内模式的客户端(另一台设备/调试浏览器)
+                 // 一连上来就会 on:false, 把正在户外作业那台的 RTK 驱动关掉。
+                 // 切回室内仍由 switchMode(false) 显式发送 —— 那是主动操作。
+                 setTimeout(()=>{ if(UI.outdoor) applyGpsMonitor(); }, 1500);
                  renderAll();};
   ws.onclose=()=>{connected=false;renderAll();setTimeout(connect,1500);};
   ws.onmessage=e=>{ if(typeof e.data==='string') onJson(JSON.parse(e.data)); else onBin(e.data); };
@@ -944,6 +1040,53 @@ function onJson(m){
     onNavUpdate(was,wasWp); draw(); renderPanel(); }
   else if(m.t==='scanpose'){ scanPose=m; }
   else if(m.t==='clear'){ clearLayers(m.what); }
+  else if(m.t==='dock_state'){
+    const prev=dockState; dockState=m.state;
+    // 终态只在"状态跳变"时提示一次(后端已去重只推跳变, 这里再加一道保险,
+    // 防止刷新后同一终态被反复弹 toast)
+    if(prev===dockState){renderPanel();return;}
+    if(dockState==='docked') toast('✅ 回充/停靠完成');
+    else if(dockState==='undocked') toast('✅ 泊出完成');
+    else if(['tag_lost','timeout','motion_failed'].includes(dockState))
+      toast('❌ 停靠失败: '+dockStateText(),true);
+    else toast(dockStateText());
+    renderPanel();
+  }
+  else if(m.t==='dock_point'){
+    // 后端回显这张图存过的回充点(可能为 null = 没设过)
+    if(m.point&&typeof m.point==='object'&&m.point.x!=null) dockPoint=m.point;
+    else dockPoint=null;
+    draw();renderPanel();
+  }
+  else if(m.t==='gps'){
+    // GPS 数据更新 - 使用坐标转换
+    gps.ok = (m.status >= 0);  // status >= 0 表示有定位
+    gps.lat = m.lat;
+    gps.lon = m.lon;
+    gps.alt = m.alt;
+    gps.status = m.status;
+    gps.quality = (m.quality===undefined||m.quality===null) ? -1 : m.quality;
+    gps.cov = m.cov || [0,0,0];
+
+    // WGS84 转 GCJ02（火星坐标系）
+    const [gcjLon, gcjLat] = wgs84ToGcj02(m.lon, m.lat);
+    gps.gcjLon = gcjLon;
+    gps.gcjLat = gcjLat;
+
+    updateGpsDisplay();
+
+    // 自动显示/隐藏 GPS 地图（仅在导航/建图页面且户外模式）
+    if(UI.route === 'nav' || UI.route === 'map') {
+      toggleGpsMap(gps.ok && UI.outdoor);
+    }
+
+    if(gpsMap && gps.ok) {
+      gpsMarker.setPosition([gcjLon, gcjLat]);  // 使用转换后的坐标
+      if(UI.route==='nav' || UI.route==='map') {
+        gpsMap.setCenter([gcjLon, gcjLat]);
+      }
+    }
+  }
 }
 /* 二进制帧: 首字节是类型, 见 app.py 顶部的 B_* 常量 */
 let mapImg=null,mapMeta=null,cmImg=null,cmMeta=null;
@@ -1045,6 +1188,13 @@ function go(r){
   // 回来时不自动恢复: 实景是要主动开的东西, 悄悄替用户开着才更让人意外。
   if(r!=='map'&&C3.scene){C3.scene=false;live.frames=[];live.n=0;send({t:'scene',on:false});}
   if(r==='map')showGesHint(); else $('gesHint').classList.remove('show');
+
+  // 设置 body 的 data-route 属性，用于 CSS 定位 GPS 地图
+  document.body.setAttribute('data-route', r);
+
+  // GPS 地图显示控制：在导航和建图页面显示（仅户外模式且有信号）
+  toggleGpsMap((r==='nav' || r==='map') && UI.outdoor && gps.ok);
+
   renderAll();
   if(r==='nav'||r==='map')resize();
   if(r==='edit')edResize();
@@ -1174,11 +1324,31 @@ function renderHome(){
 
   /* ---- 状态胶囊: 只放磁贴里没有的东西(底盘状态已经由电量磁贴表达) ---- */
   const lidar=!!(S.detected&&S.detected.mid360);
-  $('hChips').innerHTML=
-     `<span class="chip"><span class="dot ${lidar?'on':'off'}"></span>雷达 <b>MID360s</b>
+  let chips = `<span class="chip"><span class="dot ${lidar?'on':'off'}"></span>雷达 <b>MID360s</b>
         ${lidar?'在线':'离线'}</span>`
     +`<span class="chip">点云分段 <b>${S.pcd_count||0}</b> 段`
     +`${S.pcd_count?' · 存图后可清理':''}</span>`;
+
+  // GPS 状态胶囊
+  if(gps.ok) {
+    const g = gpsLabel();
+    let gpsStatus = g.text, gpsClass = 'chip gps-status' + (g.cls?' '+g.cls:'');
+    chips += `<span class="${gpsClass}"><span class="dot on"></span>GPS <b>${gpsStatus}</b></span>`;
+    // 户外模式再补一条经纬度+精度, 方便现场核对定位是否在动
+    if(UI.outdoor && gps.lat){
+      const acc = (gps.cov && gps.cov[0]>0) ? Math.sqrt(gps.cov[0]).toFixed(1)+'m' : '--';
+      chips += `<span class="chip gps-coord">${gps.lat.toFixed(6)}, ${gps.lon.toFixed(6)}`
+             + ` · 精度 <b>${acc}</b></span>`;
+    }
+  } else if((S.gps_pub||0) === 0) {
+    // 没有任何节点在发 /gps/fix = 驱动压根没启动, 跟"搜不到星"是两回事
+    chips += `<span class="chip gps-status"><span class="dot off"></span>GPS <b>未启动</b>`
+           + `${UI.outdoor?'':' · 切户外模式可启动'}</span>`;
+  } else {
+    chips += `<span class="chip gps-status err"><span class="dot off"></span>GPS <b>无信号</b> · 搜星中</span>`;
+  }
+
+  $('hChips').innerHTML = chips;
 
   /* ---- 右侧四个入口的副标题 ---- */
   /* 【"当前地图"到底该显示哪个】导航跑着的时候, 真正加载的是 active_map(启动那一刻
@@ -1251,6 +1421,15 @@ function renderStatus(){
       : '选中的地图, 启动导航时会加载它';
     add(robot.ok?`<svg class="ic"><use href="#i-pin"/></svg>${robot.x.toFixed(2)}, ${robot.y.toFixed(2)}`
                 :`<svg class="ic"><use href="#i-pin"/></svg>--`,'hide-s');
+    // GPS 状态显示
+    if(gps.ok) {
+      const g = gpsLabel();
+      add(`GPS <b>${g.text}</b>`, 'gps-status' + (g.cls?' '+g.cls:''));
+    } else if((S.gps_pub||0) === 0) {
+      add(`GPS <b>未启动</b>`, 'gps-status');
+    } else {
+      add(`GPS <b>无信号</b>`, 'gps-status err');
+    }
   }else{
     add(`<svg class="ic"><use href="#i-cube"/></svg>点云 <b>${(cloud.n/1000).toFixed(0)}k</b>`);
     add(`分段 <b>${S.pcd_count||0}</b>`,'hide-s');
@@ -1300,6 +1479,13 @@ const TOOLS_NAV=[
      if(!(S.running&&S.mode==='navigation')){toast('重新定位需要先启动导航',true);return;}
      send({t:'relocalize'});}],
   ['i-charge','回到起点(长按可重设起点)',()=>goHome()],
+  ['i-dock','回充/泊出',()=>{
+     if(!(S.running&&S.mode==='navigation')){toast('回充/泊出需要先启动导航',true);return;}
+     togglePanel('dock');
+     // 打开面板时拉一下这张图存过的回充点, 回显在地图上
+     const mn=mapNameNow();
+     if(mn&&mn!=='未选择')send({t:'get_dock_point',sensor:'mid360',name:mn});
+   }],
   ['i-stopnav','紧急停止',()=>{send({t:'estop'});speak('estop')}],
   ['i-swap','切换主画面',()=>{UI.pipMain=!UI.pipMain;layout();draw();}],
 ];
@@ -1521,6 +1707,8 @@ function _draw(){
       goal.done==='succeeded'?'#22c55e':
       (goal.done==='failed'||goal.done==='rejected')?'#ef4444':'#2f7ef7');
   wps.forEach((p,i)=>markDir(p.x,p.y,p.yaw||0,'#8b5cf6',i+1));
+  // 回充点: 青色, 带箭头表示车到点后应朝的方向(正对二维码)
+  if(dockPoint) markDir(dockPoint.x,dockPoint.y,dockPoint.yaw||0,'#22d3ee','充');
   if(pick)  markDir(pick.x,pick.y,pick.yaw,pick.drag?'#f59e0b':'#94a3b8');
   if(robot.ok)drawRobot();
 }
@@ -1990,14 +2178,15 @@ function goalClear(){goalHoldCancel();goal=null;}
 let pick=null;          // {x,y,yaw,drag} 正在拖朝向的临时目标
 /* armed: 只有点了"设目标"/"加航点"/"设初始位姿"之后的**下一次**按下才放点。
    之前是"面板开着就一直放点", 结果按下地图想平移也会变成放点, 根本挪不动图。 */
-let armed='';           // '' | 'goal' | 'wp' | 'init'
+let armed='';           // '' | 'goal' | 'wp' | 'init' | 'dock'
 function pickActive(){return armed!=='';}
 function setArmed(a){
   armed=a; clickMode=a==='init'?'init':'';
   cv.style.cursor=a?'crosshair':'';
   if(a)toast({goal:'在地图上按住拖出朝向 → 松手下发',
               wp:'在地图上按住拖出朝向 → 松手添加航点',
-              init:'在地图上按住拖出车头朝向 → 松手'}[a]);
+              init:'在地图上按住拖出车头朝向 → 松手',
+              dock:'在地图上按住拖出**车头朝向(正对二维码)** → 松手保存回充点'}[a]);
   renderPanel();
 }
 (function(){
@@ -2067,6 +2256,15 @@ function commitPick(){
   if(!p)return;
   if(a==='init'){send({t:'initialpose',x:p.x,y:p.y,yaw:p.yaw});draw();return;}
   if(a==='wp'){wps.push({x:p.x,y:p.y,yaw:p.yaw});renderPanel();draw();return;}
+  if(a==='dock'){
+    // 回充点: 坐标 + yaw(车头朝向, 应正对二维码)。yaw 是关键 —— 导航到点时按这个
+    // 朝向停, 到达后几乎不用旋转搜索就能看到二维码, 停泊时间最短。
+    const mn=mapNameNow();
+    if(!mn||mn==='未选择'){toast('请先在地图库选中一张地图',true);draw();return;}
+    dockPoint={x:p.x,y:p.y,yaw:p.yaw};
+    send({t:'save_dock_point',sensor:'mid360',name:mn,x:p.x,y:p.y,yaw:p.yaw});
+    renderPanel();draw();return;
+  }
   if(a==='goal'){
     // 先无条件把标记放上去 —— 导航没起时也让用户看见自己点在哪, 否则面板上
     // "目标点"永远显示"未设置", 看起来像点了没反应(2026-08-07 用户反馈)
@@ -2133,6 +2331,26 @@ function renderPanel(){
         <div class="row"><button onclick="goHome()">回到起点</button></div>
       </div>`;
     updatePanelLive();
+  }else if(UI.panel==='dock'){
+    const running=nav.state==='running';
+    np.innerHTML=`
+      <div class="ph"><svg class="ic"><use href="#i-dock"/></svg>回充 / 泊出
+        <span class="x" onclick="togglePanel('dock')"><svg class="ic"><use href="#i-x"/></svg></span></div>
+      <div class="pb">
+        <div class="nst ${cls}" id="pnState"><b>${esc(dockStateText())}</b>
+          <span class="pill">${dockPoint?dockPoint.x.toFixed(2)+', '+dockPoint.y.toFixed(2):'未设回充点'}</span></div>
+        <div class="mets">
+          <div class="met"><small>回充点</small><b class="sm">${dockPoint?dockPoint.x.toFixed(2)+', '+dockPoint.y.toFixed(2):'未设置'}</b></div>
+          <div class="met"><small>停靠朝向</small><b class="sm">${dockPoint?((dockPoint.yaw||0)*57.3).toFixed(0)+'°':'--'}</b></div>
+        </div>
+        <div class="row">
+          <button class="${armed==='dock'?'primary':''}" onclick="setArmed(armed==='dock'?'':'dock')">
+            ${armed==='dock'?'点地图放置(拖出朝向)…':'设置回充点'}</button>
+          <button onclick="doClearDock()" ${dockPoint?'':'disabled'}>清除</button></div>
+        <div class="row">
+          <button class="primary" onclick="doDock()" ${running||!dockPoint?'disabled':''}>回充</button>
+          <button onclick="doUndock()" ${running?'disabled':''}>泊出</button></div>
+      </div>`;
   }else{
     const running=nav.state==='running';
     np.innerHTML=`
@@ -2243,6 +2461,29 @@ function startCruise(loop){
 function saveRoute(){
   send({t:'save_route',map:UI.selMap||S.active_map||'WHEELTEC3D',points:wps});
   toast('巡航路线已保存');
+}
+/* ============ 回充 / 泊出 ============ */
+function doDock(){
+  const mn=mapNameNow();
+  if(!mn||mn==='未选择'){toast('请先在地图库选中一张地图',true);return;}
+  send({t:'dock',sensor:'mid360',name:mn});
+  renderPanel();
+}
+function doUndock(){ send({t:'undock'}); renderPanel(); }
+function doClearDock(){
+  const mn=mapNameNow();
+  if(!mn||mn==='未选择'){toast('请先在地图库选中一张地图',true);return;}
+  send({t:'clear_dock_point',sensor:'mid360',name:mn});
+  dockPoint=null;draw();renderPanel();
+}
+function dockStateText(){
+  return {'idle':'停靠空闲','navigating':'停靠: 导航中','search_tag':'停靠: 搜索二维码',
+          'align':'停靠: 对准','approach':'停靠: 接近','final_servo':'停靠: 精调',
+          'retrying':'停靠: 失败重试中(倒车)',
+          'docked':'✅ 停靠完成','undocking':'泊出中','undocked':'✅ 泊出完成',
+          'tag_lost':'❌ 二维码丢失','timeout':'❌ 停靠超时',
+          'motion_failed':'❌ 运动失败','cancelled':'停靠已取消'}[dockState]
+          || ('停靠状态: '+dockState);
 }
 
 /* ============ 弹窗 ============ */
@@ -2385,6 +2626,8 @@ function renderMapDlg(){
     }
     row.onclick=()=>{UI.selMap=m.name;localStorage.setItem('v2selMap',m.name);
       renderMapDlg();renderStatus();renderHome();
+      /* 回充点是按地图存的: 换图就要重新拉这张图有没有设过回充点 */
+      dockPoint=null; send({t:'get_dock_point',sensor:'mid360',name:m.name});
       /* 【导航跑着的时候要真的换图】以前这里无论如何都只发 preview_map, 而后端
          在导航运行中是拒绝预览的(画布上那张才是真正在用的), 于是选了半天画面
          纹丝不动 —— 用户的说法是"换地图完全没实现"。
@@ -2855,6 +3098,20 @@ function dlgSaveMap(){
       <p style="font-size:12px;color:var(--dim)">
         当前 PCD 分段 <b>${S.pcd_count||0}</b> 个。转换约需十几秒, 完成后自动加载预览。
         同名会覆盖 —— 想留旧图请换个名字。</p>
+      <p style="font-size:12px;color:var(--dim)">障碍物高度带:
+        <b>${UI.outdoor?'0.30 ~ 2.00 m (户外)':'0.10 ~ 0.45 m (室内)'}</b>
+        ${UI.outdoor?' —— 下限 0.30 是为了避开草(草会被误判成障碍); 上限 2.00 让楼房树木进入地图':''}</p>
+      ${UI.outdoor&&(S.caps||[]).includes('save_occ_pts')?`
+      <div class="fld"><label>散点过滤强度</label>
+        <select id="occPts" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--fg);font-size:13px">
+          <option value="2">2 —— 最敏感, 弱结构也保留</option>
+          <option value="5" selected>5 —— 默认</option>
+          <option value="10">10 —— 只在确实有散点红斑时用</option>
+        </select></div>
+      <p style="font-size:12px;color:var(--dim)">
+        一格里至少要有这么多点才算障碍。<b>调高会删掉真实结构</b> ——
+        实测同一份户外点云 2→障碍4.0%, 5→2.6%, 10→1.7%, 40→0.5%。
+        户外扫描本就稀疏, 除非地面上确实出现成片散点红斑, 否则别往上调。</p>`:''}
       ${blockReason()?`<p style="font-size:12px;color:var(--err)">${blockReason()}</p>`:''}
     </div>
     <div class="foot"><button class="x">取消</button>
@@ -2864,7 +3121,11 @@ function dlgSaveMap(){
       const b=blockReason(); if(b){toast(b,true);return;}
       const n=$('mapName').value.trim()||'WHEELTEC3D';
       freshMap=n;
-      send({t:'start',sensor:'mid360',mode:'save_map',map_name:n});
+      // 带上户外标志: 后端据此把障碍带上限提到 2m(和户外导航的 /scan 同带)
+      const m={t:'start',sensor:'mid360',mode:'save_map',map_name:n,outdoor:!!UI.outdoor};
+      // 选择器只在户外+后端支持时才渲染; 不在就别发, 让后端用它自己的默认值
+      const os_=$('occPts'); if(os_) m.occ_pts=parseInt(os_.value,10);
+      send(m);
       speak('save_map');closeDlg();
       // 存图结束后端会推 maps, 这里再补一次主动拉取(双保险: 不依赖单一路径)
       setTimeout(()=>send({t:'list_maps',sensor:'mid360'}),20000);
@@ -2897,6 +3158,18 @@ function renderSetPage(){
         <p style="font-size:11px;color:var(--dim);margin:0">
           只影响摇杆。自动导航的速度在「导航 → 导航参数」里, 两者互不相干。</p>
       </div></div>
+    <div class="card"><h4><svg class="ic"><use href="#i-pin"/></svg>GPS 坐标格式</h4>
+      <div class="in">
+        <div class="fld">
+          <label>坐标系统</label>
+          <select id="coordFormat" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--fg);font-size:13px">
+            <option value="gcj02">GCJ02 (火星坐标系 - 高德地图)</option>
+            <option value="wgs84">WGS84 (GPS原始坐标)</option>
+          </select>
+        </div>
+        <p style="font-size:11px;color:var(--dim);margin:6px 0 0">
+          RTK 输出的是 WGS84 坐标，高德地图使用 GCJ02。默认显示 GCJ02 与地图匹配。</p>
+      </div></div>
     <div class="card"><h4><svg class="ic"><use href="#i-lib"/></svg>关于</h4>
       <div class="in" style="font-size:12px;color:var(--dim)">
         MID360s + FAST-LIO2 建图导航 · 新版控制台 (/v2)<br>
@@ -2909,6 +3182,18 @@ function renderSetPage(){
   $('tAp').onclick=()=>{const on=!$('tAp').classList.contains('on');
     $('tAp').classList.toggle('on',on);send({t:'ap_power',on});
     toast(on?'正在开启热点(约需1~2分钟)':'正在关闭热点');};
+
+  // GPS 坐标格式选择
+  const coordFormat = $('coordFormat');
+  if(coordFormat) {
+    coordFormat.value = localStorage.getItem('v2coordFormat') || 'gcj02';
+    coordFormat.onchange = () => {
+      localStorage.setItem('v2coordFormat', coordFormat.value);
+      updateGpsDisplay();
+      toast(`已切换到 ${coordFormat.value === 'wgs84' ? 'WGS84 坐标' : 'GCJ02 坐标'}`);
+    };
+  }
+
   $('rsvx').value=UI.vx; $('rswz').value=UI.wz;
   const sy=()=>{$('lsvx').textContent=(+$('rsvx').value).toFixed(2)+' m/s';
                 $('lswz').textContent=(+$('rswz').value).toFixed(1)+' rad/s';};
@@ -2921,9 +3206,41 @@ function renderSetPage(){
 /* ============ 任务启停 ============ */
 function startTask(mode){
   if(busy()){toast('已有任务在运行, 先停止',true);return;}
+  // 上次建图的PCD分段还在 —— 先弹窗确认再清, 不静默删(删掉的可能是还没存过的图)
+  if(mode==='mapping' && (S.pcd_count||0)>0){
+    if(!(S.caps||[]).includes('pcd_confirm')){
+      toast('后端版本较旧, 请先重启 webapp 服务再建图',true);return;}
+    dlgStalePcd(); return;
+  }
+  sendStart(mode);
+}
+function sendStart(mode,extra){
   const args={t:'start',sensor:'mid360',mode};
+
+  // 户外模式：使用 outdoor 包
+  if(UI.outdoor && (mode==='mapping' || mode==='navigation')) {
+    args.outdoor = true;  // 通知后端使用户外功能包
+  }
+
   if(mode==='navigation'&&UI.selMap)args.map_name=UI.selMap;
+  if(extra)Object.assign(args,extra);
   send(args);
+}
+function dlgStalePcd(){
+  const n=S.pcd_count||0;
+  openDlg(`<h3><svg class="ic"><use href="#i-hdd"/></svg>上次建图的点云还在
+      <span class="x"><svg class="ic"><use href="#i-x"/></svg></span></h3>
+    <div class="body">
+      <p style="font-size:13px">检测到 <b>${n}</b> 个上次建图遗留的 PCD 分段。</p>
+      <p style="font-size:12px;color:var(--dim)">
+        直接开始新建图, 之后"保存地图"会把新旧两次的点云混在一起, 生成的是废图,
+        所以必须先清掉。<b style="color:var(--err)">这份点云如果还没存成地图, 清掉就找不回来了</b>
+        —— 需要的话先点取消, 去存完图再来。</p>
+    </div>
+    <div class="foot"><button class="x">取消</button>
+      <button class="primary" id="doClearPcd">清理并开始建图</button></div>`,()=>{
+    $('doClearPcd').onclick=()=>{ closeDlg(); sendStart('mapping',{clear_pcd:true}); };
+  });
 }
 function stopTask(){ send({t:'stop'}); }
 
@@ -3137,7 +3454,254 @@ document.addEventListener('dblclick',e=>{
   if(!e.target.closest('#camFull'))e.preventDefault();   // 相机主画面的双击复位要留
 });
 addEventListener('resize',resize);
+
+/* ============ WGS84 到 GCJ02 坐标转换（火星坐标系）============ */
+// RTK 输出的是 WGS84 坐标，高德地图使用 GCJ02 坐标，需要转换
+function wgs84ToGcj02(lng, lat) {
+  const a = 6378245.0;  // 长半轴
+  const ee = 0.00669342162296594323;  // 偏心率平方
+
+  function transformLat(lng, lat) {
+    let ret = -100.0 + 2.0 * lng + 3.0 * lat + 0.2 * lat * lat + 0.1 * lng * lat + 0.2 * Math.sqrt(Math.abs(lng));
+    ret += (20.0 * Math.sin(6.0 * lng * Math.PI) + 20.0 * Math.sin(2.0 * lng * Math.PI)) * 2.0 / 3.0;
+    ret += (20.0 * Math.sin(lat * Math.PI) + 40.0 * Math.sin(lat / 3.0 * Math.PI)) * 2.0 / 3.0;
+    ret += (160.0 * Math.sin(lat / 12.0 * Math.PI) + 320 * Math.sin(lat * Math.PI / 30.0)) * 2.0 / 3.0;
+    return ret;
+  }
+
+  function transformLng(lng, lat) {
+    let ret = 300.0 + lng + 2.0 * lat + 0.1 * lng * lng + 0.1 * lng * lat + 0.1 * Math.sqrt(Math.abs(lng));
+    ret += (20.0 * Math.sin(6.0 * lng * Math.PI) + 20.0 * Math.sin(2.0 * lng * Math.PI)) * 2.0 / 3.0;
+    ret += (20.0 * Math.sin(lng * Math.PI) + 40.0 * Math.sin(lng / 3.0 * Math.PI)) * 2.0 / 3.0;
+    ret += (150.0 * Math.sin(lng / 12.0 * Math.PI) + 300.0 * Math.sin(lng / 30.0 * Math.PI)) * 2.0 / 3.0;
+    return ret;
+  }
+
+  const dLat = transformLat(lng - 105.0, lat - 35.0);
+  const dLng = transformLng(lng - 105.0, lat - 35.0);
+  const radLat = lat / 180.0 * Math.PI;
+  let magic = Math.sin(radLat);
+  magic = 1 - ee * magic * magic;
+  const sqrtMagic = Math.sqrt(magic);
+  const mgLat = lat + (dLat * 180.0) / ((a / sqrtMagic) * Math.PI);
+  const mgLng = lng + (dLng * 180.0) / ((a / sqrtMagic) * Math.cos(radLat) * Math.PI);
+  return [mgLng, mgLat];
+}
+
+/* ============ GPS 地图功能 ============ */
+function initGpsMap() {
+  if (!window.AMap || gpsMap) return;
+  gpsMap = new AMap.Map('gpsMapContainer', {
+    zoom: 18,
+    center: [116.397428, 39.90923],
+    mapStyle: 'amap://styles/normal',
+    viewMode: '2D'
+  });
+  // 添加比例尺和工具条
+  gpsMap.addControl(new AMap.Scale());
+  gpsMap.addControl(new AMap.ToolBar({position:'RT'}));
+
+  // 创建机器人标记
+  gpsMarker = new AMap.Marker({
+    map: gpsMap,
+    position: [116.397428, 39.90923],
+    icon: new AMap.Icon({
+      size: new AMap.Size(40, 40),
+      image: 'data:image/svg+xml,' + encodeURIComponent(`
+        <svg width="40" height="40" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="20" cy="20" r="18" fill="#2f7ef7" opacity="0.3"/>
+          <circle cx="20" cy="20" r="10" fill="#2f7ef7"/>
+          <circle cx="20" cy="20" r="4" fill="white"/>
+        </svg>
+      `),
+      imageSize: new AMap.Size(40, 40)
+    }),
+    offset: new AMap.Pixel(-20, -20),
+    zIndex: 100
+  });
+}
+
+function updateGpsDisplay() {
+  const statusSpan = $('gpsStatus');
+  const coordsDiv = $('gpsCoords');
+  if (!statusSpan || !coordsDiv) return;
+
+  if (gps.ok) {
+    // 统一用 gpsLabel(), 别在这里另立一套判断。
+    // 这里原本按 gps.status(NavSatFix 三态)判断, 而首页芯片和导航顶栏用的是
+    // gps.quality(GGA 质量码六态)。RTK 浮点的质量码 5 映射到 NavSatFix 会并进
+    // status=1, 于是同一时刻首页显示"RTK 浮点解"、这个面板显示"DGPS"。
+    // 面板只负责把 gpsLabel 的类名映射到自己的样式。
+    const g = gpsLabel();
+    statusSpan.textContent = g.text;
+    statusSpan.className = {ok: 'rtk-fix', warn: 'dgps', err: 'no-fix'}[g.cls] || 'gps';
+
+    // 获取用户设置的坐标格式（默认 GCJ02）
+    const coordFormat = localStorage.getItem('v2coordFormat') || 'gcj02';
+
+    // 根据格式显示坐标
+    if (coordFormat === 'wgs84') {
+      coordsDiv.textContent = `${gps.lat.toFixed(6)}°, ${gps.lon.toFixed(6)}° | ${gps.alt.toFixed(1)}m`;
+    } else {
+      coordsDiv.textContent = `${(gps.gcjLat || gps.lat).toFixed(6)}°, ${(gps.gcjLon || gps.lon).toFixed(6)}° | ${gps.alt.toFixed(1)}m`;
+    }
+  } else {
+    statusSpan.textContent = '无信号';
+    statusSpan.className = 'no-fix';
+    coordsDiv.textContent = '等待 GPS 数据...';
+  }
+
+  renderStatus();  // 更新顶栏状态
+  renderHome();    // 更新首页状态芯片
+}
+
+function toggleGpsMap(show) {
+  const mapDiv = $('gpsMap');
+  if (!mapDiv) return;
+
+  // 显示 GPS 地图（当 show=true 且有信号且在户外模式）
+  if (show && gps.ok && UI.outdoor) {
+    mapDiv.classList.add('show');
+    if (!gpsMap) {
+      // 延迟初始化，确保容器已显示
+      setTimeout(() => {
+        initGpsMap();
+        if (gps.ok && gpsMarker && gps.gcjLon && gps.gcjLat) {
+          gpsMarker.setPosition([gps.gcjLon, gps.gcjLat]);
+          gpsMap.setCenter([gps.gcjLon, gps.gcjLat]);
+        }
+      }, 100);
+    } else {
+      gpsMap.resize();
+      if (gps.ok && gpsMarker && gps.gcjLon && gps.gcjLat) {
+        gpsMarker.setPosition([gps.gcjLon, gps.gcjLat]);
+        gpsMap.setCenter([gps.gcjLon, gps.gcjLat]);
+      }
+    }
+  } else {
+    // 隐藏 GPS 地图
+    mapDiv.classList.remove('show');
+  }
+}
+
+// 户外模式常驻 RTK 驱动: 告诉后端开/关。
+// 后端旧版本(只 colcon build 没重启服务)不认识这条消息, 用 caps 判断,
+// 免得界面承诺一个后端做不到的事(2026-09-14 PCD弹窗就栽在这上面)。
+// 定位类型文案。优先用原始 GGA 质量位(6种), 老后端没这个字段时退回
+// NavSatFix.status(只有4档, 区分不了浮点解和差分 —— 以前都显示成"DGPS")。
+function gpsLabel(){
+  const Q = {0:['无效',''], 1:['单点',''], 2:['DGPS 差分','warn'],
+             4:['RTK 固定解','ok'], 5:['RTK 浮点解','warn'], 6:['航位推算','']};
+  if(gps.quality!==undefined && gps.quality>=0 && Q[gps.quality])
+    return {text:Q[gps.quality][0], cls:Q[gps.quality][1]};
+  // 退回旧逻辑
+  if(gps.status===2) return {text:'RTK固定解', cls:'ok'};
+  if(gps.status===1) return {text:'差分/浮点', cls:'warn'};
+  return {text:'单点', cls:''};
+}
+
+function applyGpsMonitor(){
+  if(!(S.caps||[]).includes('gps_monitor')){
+    if(UI.outdoor) toast('后端版本较旧, 不支持自动启动RTK驱动(需重启webapp服务)',true);
+    return;
+  }
+  send({t:'gps_monitor', on: !!UI.outdoor});
+}
+
+// 室内/户外模式切换
+function updateOutdoorToggle() {
+  const slider = $('outdoorSlider');
+  const indoorBtn = $('outdoorIndoor');
+  const outdoorBtn = $('outdoorOutdoor');
+  if(!slider || !indoorBtn || !outdoorBtn) return;
+
+  if(UI.outdoor) {
+    slider.style.transform = 'translateX(100%)';
+    indoorBtn.style.color = 'var(--dim)';
+    outdoorBtn.style.color = 'white';
+    slider.style.background = 'linear-gradient(135deg, #17b978, #4ed9a4)';
+  } else {
+    slider.style.transform = 'translateX(0)';
+    indoorBtn.style.color = 'white';
+    outdoorBtn.style.color = 'var(--dim)';
+    slider.style.background = 'linear-gradient(135deg, #2f7ef7, #5aa0ff)';
+  }
+}
+
 go('home');resize();connect();renderAll();
+
+// 绑定室内/户外模式切换按钮
+setTimeout(() => {
+  const indoorBtn = $('outdoorIndoor');
+  const outdoorBtn = $('outdoorOutdoor');
+
+  if(indoorBtn && outdoorBtn) {
+    updateOutdoorToggle();
+
+    const switchMode = (toOutdoor) => {
+      if(UI.outdoor === toOutdoor) return;
+
+      // 如果有任务在运行，先停止
+      if(S.running || S.external) {
+        stopTask();
+        toast('已停止运行中的任务');
+        setTimeout(() => {
+          UI.outdoor = toOutdoor;
+          localStorage.setItem('v2outdoor', UI.outdoor ? '1' : '0');
+          updateOutdoorToggle();
+          applyGpsMonitor();
+          toggleGpsMap((UI.route==='nav' || UI.route==='map') && UI.outdoor && gps.ok);
+          toast(UI.outdoor ? '已切换到户外模式 🌍' : '已切换到室内模式 🏠');
+        }, 500);
+      } else {
+        UI.outdoor = toOutdoor;
+        localStorage.setItem('v2outdoor', UI.outdoor ? '1' : '0');
+        updateOutdoorToggle();
+        applyGpsMonitor();
+        toggleGpsMap((UI.route==='nav' || UI.route==='map') && UI.outdoor && gps.ok);
+        toast(UI.outdoor ? '已切换到户外模式 🌍' : '已切换到室内模式 🏠');
+      }
+    };
+
+    indoorBtn.onclick = () => switchMode(false);
+    outdoorBtn.onclick = () => switchMode(true);
+    // 刷新页面后也同步一次: 户外模式是存在 localStorage 里的, 但后端进程可能
+    // 已经重启过, 不主动告诉它就会出现界面是户外模式、驱动却没跑
+    setTimeout(applyGpsMonitor, 1500);
+  }
+
+  // 绑定 GPS 地图折叠/放大按钮
+  const gpsFold = $('gpsFold');
+  const gpsFull = $('gpsFull');
+  const gpsMapDiv = $('gpsMap');
+
+  if(gpsFold) {
+    gpsFold.onclick = () => {
+      gpsMapDiv.classList.toggle('fold');
+      $('gpsFoldIcon').textContent = gpsMapDiv.classList.contains('fold') ? '+' : '—';
+    };
+  }
+
+  if(gpsFull) {
+    gpsFull.onclick = () => {
+      if(gpsMapDiv.classList.contains('full')) {
+        // 恢复原始大小
+        gpsMapDiv.classList.remove('full');
+        gpsFull.title = '全屏';
+        if(gpsMap) {
+          setTimeout(() => gpsMap.resize(), 100);
+        }
+      } else {
+        // 放大到全屏
+        gpsMapDiv.classList.add('full');
+        gpsFull.title = '还原';
+        if(gpsMap) {
+          setTimeout(() => gpsMap.resize(), 100);
+        }
+      }
+    };
+  }
+}, 500);
 </script>
 </body>
 </html>
