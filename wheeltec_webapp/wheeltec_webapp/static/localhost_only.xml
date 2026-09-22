@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- webapp 专用 FastDDS 配置: 只走本机回环(127.0.0.1)的 UDP, 不建 /dev/shm 共享内存段。
+     webapp 拉起的建图/导航进程设 ROS_LOCALHOST_ONLY=1(共享内存 + 回环 UDP), 全车 ROS 通信只在本机。
+     为什么不用全网卡 UDP(2026-09-22 前的 udp_only.xml): 参与者启动时把当时各网卡的 IP 记成自己的
+     地址, 之后不会更新。那天开机时 Wi-Fi 先连上了别的网络, Wi-Fi 换网后, 所有发给 webapp 的点云都发往
+     一个已经不存在的地址: 从 Wi-Fi 发出去塞满上行(实测 6.4 Mbit/s), 还堵住了 FAST-LIO 的发送线程,
+     FAST-LIO 从 ROS 网络里"消失"、收不到雷达数据而发散。回环地址永远不变, 也不占 Wi-Fi。
+     代价: 其他电脑上的 ROS 工具(RViz 等)连不到车; 网页控制台不受影响。 -->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <transport_descriptors>
+        <transport_descriptor>
+            <transport_id>udp_localhost</transport_id>
+            <type>UDPv4</type>
+            <interfaceWhiteList><address>127.0.0.1</address></interfaceWhiteList>
+        </transport_descriptor>
+    </transport_descriptors>
+    <participant profile_name="webapp_localhost_only" is_default_profile="true">
+        <rtps>
+            <userTransports><transport_id>udp_localhost</transport_id></userTransports>
+            <useBuiltinTransports>false</useBuiltinTransports>
+        </rtps>
+    </participant>
+    <data_writer profile_name="dw_default" is_default_profile="true">
+        <qos><data_sharing><kind>OFF</kind></data_sharing></qos>
+    </data_writer>
+    <data_reader profile_name="dr_default" is_default_profile="true">
+        <qos><data_sharing><kind>OFF</kind></data_sharing></qos>
+    </data_reader>
+</profiles>

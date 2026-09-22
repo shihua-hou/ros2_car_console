@@ -335,7 +335,8 @@ button{font:inherit;color:inherit;border:none;background:none;cursor:pointer}
 .float{position:absolute;z-index:20;background:color-mix(in srgb,var(--panel) 80%,transparent);
   backdrop-filter:blur(14px) saturate(1.2);-webkit-backdrop-filter:blur(14px) saturate(1.2);
   border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow-lg)}
-/* GPS 地图窗口 - 类似 pip 的样式，固定在左侧实时画面下方 */
+/* GPS 地图窗口 - 类似 pip 的样式, 在左列实时画面下方; 实际 top 由 layout() 按
+   "实时画面 → GPS → 操作面板"紧贴着算, 这里的 380px 只是脚本接手前的占位 */
 #gpsMap{position:absolute;left:14px;top:380px;width:320px;z-index:20;
   background:color-mix(in srgb,var(--panel) 80%,transparent);
   backdrop-filter:blur(14px) saturate(1.2);-webkit-backdrop-filter:blur(14px) saturate(1.2);
@@ -911,6 +912,7 @@ const S={mode:'idle',sensor:'mid360',running:false,external:false,stopping:false
 const UI={route:'home',   // home | nav | map | maps | settings
           mode:'nav',     // 画布用: 'nav'(2D地图) | 'map'(3D点云), 由 route 派生
           pipMain:false,        // false=地图为主画面, true=相机为主画面
+          pipAutoFold:false,    // 实时画面是被"户外默认收起"收起的(用户手动开合后清掉)
           panel:'',             // '' | 'goal' | 'wps' | 'dock'
           outdoor:localStorage.getItem('v2outdoor')==='1',  // 室内/户外模式切换
           layers:Object.assign({costmap:true,plan:true,local:true,scan:true},
@@ -1194,6 +1196,7 @@ function go(r){
 
   // GPS 地图显示控制：在导航和建图页面显示（仅户外模式且有信号）
   toggleGpsMap((r==='nav' || r==='map') && UI.outdoor && gps.ok);
+  applyPipDefault();   // 户外默认收起实时画面
 
   renderAll();
   if(r==='nav'||r==='map')resize();
@@ -1571,9 +1574,16 @@ function bindTip(el,text){
 
 /* ============ 布局(浮层位置随模式/画中画变化) ============ */
 function layout(){
-  const pip=$('pip'),np=$('navPanel');
+  const pip=$('pip'),np=$('navPanel'),gm=$('gpsMap');
   const pipH=pip.offsetHeight||200;
-  np.style.top=(14+pipH+8)+'px';   // 面板紧跟画面下方, 画面收起后自动上移
+  // 左列自上而下紧贴着排: 实时画面(收起后只剩标题胶囊) → GPS 定位窗(户外) → 操作面板。
+  // 任何一个开合, 下面的自动跟着上移/下移。GPS 全屏时交给 CSS(.full 自带 top)。
+  let y=14+pipH+8;
+  if(gm.classList.contains('show')&&!gm.classList.contains('full')){
+    gm.style.top=y+'px';
+    y+=gm.offsetHeight+8;
+  }else gm.style.top='';
+  np.style.top=y+'px';
   np.style.display=UI.panel?'block':'none';
   $('joy').style.display=UI.mode==='nav'||UI.mode==='map'?'flex':'none';
   // 主画面切换: 画中画里放另一个
@@ -3413,14 +3423,27 @@ function fmtTime(ts){
 // 秒表要一直走(哪怕位姿断了), 所以留一个每秒的轻量刷新; 面板结构不重建
 setInterval(()=>{if(UI.panel)updatePanelLive();},1000);
 /* 收起画面时顺便告诉后端别推了 —— 640x480@30 的 JPEG 流白占带宽和 CPU */
-$('pipFold').onclick=()=>{
-  const p=$('pip'),fold=!p.classList.contains('fold');
-  p.classList.toggle('fold',fold);
+function setPipFold(fold){
+  $('pip').classList.toggle('fold',fold);
   $('pipFold').textContent=fold?'+':'—';
   send({t:'cam',on:!fold});
   if(fold&&UI.pipMain){UI.pipMain=false;}     // 收起时不该还占着主画面
   layout();
+}
+$('pipFold').onclick=()=>{
+  UI.pipAutoFold=false;                       // 用户自己动过, 之后不再替他展开
+  setPipFold(!$('pip').classList.contains('fold'));
 };
+/* 户外模式下, 建图/导航页默认收起实时画面, GPS 定位窗紧贴在收起后的胶囊下面
+   (2026-09-22 用户要求): 户外主要看点云/地图和 GPS, 相机推流还白占 Wi-Fi。
+   只管"默认": 进这两个页面或切换室内/户外时套用一次, 之后手动开合照旧。
+   自动收起的, 切回室内时再展开; 用户自己收起的不动。 */
+function applyPipDefault(){
+  if(UI.route!=='nav'&&UI.route!=='map')return;
+  const folded=$('pip').classList.contains('fold');
+  if(UI.outdoor&&!folded){setPipFold(true);UI.pipAutoFold=true;}
+  else if(!UI.outdoor&&folded&&UI.pipAutoFold){setPipFold(false);UI.pipAutoFold=false;}
+}
 $('logMin').onclick=()=>{const b=$('logBox');b.classList.toggle('min');
   b.classList.remove('big');$('logMin').textContent=b.classList.contains('min')?'+':'—';};
 $('logBig').onclick=()=>{const b=$('logBox');b.classList.remove('min');
@@ -3558,6 +3581,7 @@ function updateGpsDisplay() {
 function toggleGpsMap(show) {
   const mapDiv = $('gpsMap');
   if (!mapDiv) return;
+  const wasShown = mapDiv.classList.contains('show');
 
   // 显示 GPS 地图（当 show=true 且有信号且在户外模式）
   if (show && gps.ok && UI.outdoor) {
@@ -3582,6 +3606,8 @@ function toggleGpsMap(show) {
     // 隐藏 GPS 地图
     mapDiv.classList.remove('show');
   }
+  // 这里每收到一帧 GPS 都会被调一次, 只在显隐真的变了才重排左列
+  if (mapDiv.classList.contains('show') !== wasShown) layout();
 }
 
 // 户外模式常驻 RTK 驱动: 告诉后端开/关。
@@ -3651,6 +3677,7 @@ setTimeout(() => {
           updateOutdoorToggle();
           applyGpsMonitor();
           toggleGpsMap((UI.route==='nav' || UI.route==='map') && UI.outdoor && gps.ok);
+          applyPipDefault();
           toast(UI.outdoor ? '已切换到户外模式 🌍' : '已切换到室内模式 🏠');
         }, 500);
       } else {
@@ -3659,6 +3686,7 @@ setTimeout(() => {
         updateOutdoorToggle();
         applyGpsMonitor();
         toggleGpsMap((UI.route==='nav' || UI.route==='map') && UI.outdoor && gps.ok);
+        applyPipDefault();
         toast(UI.outdoor ? '已切换到户外模式 🌍' : '已切换到室内模式 🏠');
       }
     };
@@ -3679,6 +3707,7 @@ setTimeout(() => {
     gpsFold.onclick = () => {
       gpsMapDiv.classList.toggle('fold');
       $('gpsFoldIcon').textContent = gpsMapDiv.classList.contains('fold') ? '+' : '—';
+      layout();   // 下面的操作面板跟着上移/下移
     };
   }
 
@@ -3699,6 +3728,7 @@ setTimeout(() => {
           setTimeout(() => gpsMap.resize(), 100);
         }
       }
+      layout();   // 全屏时让出 top 给 CSS, 还原后重新贴回胶囊下面
     };
   }
 }, 500);

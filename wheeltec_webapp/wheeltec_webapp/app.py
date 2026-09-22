@@ -35,9 +35,10 @@ import time
 import numpy as np
 from PIL import Image
 
-# 必须在 rclpy.init 之前设置: webapp 自身走纯UDP传输(见 udp_only.xml 注释),
-# 免疫 launch/stop_nav.sh 的 /dev/shm 清理; 子 launch 会剔除此变量继续用SHM。
-_PROFILE_XML = os.path.join(os.path.dirname(__file__), 'static', 'udp_only.xml')
+# 必须在 rclpy.init 之前设置: webapp 自身只走本机回环 UDP(见 localhost_only.xml 注释);
+# 子 launch 剔除此变量、改设 ROS_LOCALHOST_ONLY=1(共享内存 + 回环 UDP), 全车 ROS 通信只在本机,
+# 不受 Wi-Fi 换网/改 IP 影响, 也不往 Wi-Fi 上发任何 ROS 数据(2026-09-22)。
+_PROFILE_XML = os.path.join(os.path.dirname(__file__), 'static', 'localhost_only.xml')
 if 'FASTRTPS_DEFAULT_PROFILES_FILE' not in os.environ:
     os.environ['FASTRTPS_DEFAULT_PROFILES_FILE'] = _PROFILE_XML
 
@@ -866,8 +867,15 @@ class GpsMonitor:
     LOG = os.path.join(HOME, '.ros', 'wheeltec_gps_monitor.log')
     LOG_MAX = 2 * 1024 * 1024        # 盘只剩 3G, 超过就截断重来
 
+    # 自动重试: 户外模式下驱动意外退出, 隔 RETRY_MIN 秒再拉, 连续失败每次翻倍到
+    # RETRY_MAX; 一次拉起后稳定跑满 60 秒就复位。
+    RETRY_MIN = 10.0
+    RETRY_MAX = 120.0
+
     def __init__(self):
         self.proc = None
+        self.last_start = 0.0
+        self.retry_s = self.RETRY_MIN
 
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
@@ -887,6 +895,7 @@ class GpsMonitor:
     def start(self):
         if self.alive():
             return
+        self.last_start = time.time()
         f = None
         try:
             f = self._open_log()
@@ -907,6 +916,20 @@ class GpsMonitor:
         finally:
             if f is not None:
                 f.close()    # 子进程已经继承了 fd, 父进程这份可以关
+
+    def supervise(self, allowed):
+        """周期调用: 该有驱动(allowed)却没在跑, 就按退避间隔再拉一次。
+
+        以前驱动一退出就没人管: 2026-09-22 车刚上电、接收机还没搜到星时切到户外,
+        驱动 15 秒拿不到定位退出了, 等搜到星也没人再拉, 界面一直"GPS未启动"。"""
+        if self.alive():
+            if time.time() - self.last_start > 60.0:
+                self.retry_s = self.RETRY_MIN
+            return
+        if not allowed or time.time() - self.last_start < self.retry_s:
+            return
+        self.start()
+        self.retry_s = min(self.retry_s * 2, self.RETRY_MAX)
 
     def stop(self):
         """先 SIGINT 让驱动自己收尾(它注册了 SIGINT handler), 收不掉再 SIGKILL。
@@ -980,6 +1003,8 @@ class LaunchManager:
         env = os.environ.copy()
         if env.get('FASTRTPS_DEFAULT_PROFILES_FILE') == _PROFILE_XML:
             env.pop('FASTRTPS_DEFAULT_PROFILES_FILE')   # 子进程用默认SHM传输
+        # 共享内存 + 回环 UDP, 与 webapp 的 localhost_only.xml 一致(只在本机通信)
+        env['ROS_LOCALHOST_ONLY'] = '1'
         extra = [f'{k}:={v}' for k, v in (launch_args or {}).items()]
         self.proc = subprocess.Popen(
             ['ros2', 'launch', profile['package'], profile['launches'][mode]] + extra,
@@ -1587,15 +1612,25 @@ class WebConsole:
             self.set_nav(state='idle', kind=None)
         self.push_state()
 
+    def _set_static_map(self, frame):
+        """把一张静态图(保存后/换图预览/编辑保存)设为当前底图并推给前端。
+
+        缓存序号记成"已收到的最后一帧 /map"的序号: 之后只有真来了新 /map(如启动导航后
+        map_server 发的)才会替换它。以前记成 -2, 推送循环见"序号不等"就把内存里残留的
+        上一次导航的 /map 重推一遍, 0.2 秒内盖掉刚推的图 —— 表现为保存完/换地图后地图
+        "加载不出来", 只在本次 webapp 跑过导航之后出现(2026-09-22)。"""
+        with self.node.lock:
+            seq = self.node.map_seq
+        self.map_cache, self.map_cache_seq = frame, seq
+        self._send_all(frame)
+
     def _push_saved_map(self, name='WHEELTEC3D'):
         pgm = os.path.join(MAP_DIR_INSTALL, name + '.pgm')
         yml = os.path.join(MAP_DIR_INSTALL, name + '.yaml')
         if os.path.exists(pgm) and os.path.exists(yml):
             try:
                 meta, png = pgm_to_png(pgm, yml)
-                frame = pack_map(meta, png)
-                self.map_cache, self.map_cache_seq = frame, -2
-                self._send_all(frame)
+                self._set_static_map(pack_map(meta, png))
                 msg = '2D地图已生成并加载预览'
                 if self.save_report:
                     msg += ' | ' + self.save_report.split('] ')[-1]
@@ -1699,6 +1734,9 @@ class WebConsole:
                     None, detect_sensors)
             except Exception:
                 pass
+            # 户外模式、没有任务(自己的或外部的, 它们自带驱动)时, 保证 RTK 驱动在跑
+            self.gps_mon.supervise(self.gps_mon_want and not self.mgr.alive()
+                                   and not self.ext_running)
             if self.clients:
                 self.push_state()
             await asyncio.sleep(2.0)
@@ -2205,11 +2243,7 @@ class WebConsole:
                 return
             try:
                 meta, png = pgm_to_png(pgm, yml)
-                frame = pack_map(meta, png)
-                # seq 用 -2: 和 _push_saved_map 一样, 表示"这是主动推的静态图",
-                # 不会被后面 /map 话题的 seq 比较逻辑当成旧帧丢掉
-                self.map_cache, self.map_cache_seq = frame, -2
-                self._send_all(frame)
+                self._set_static_map(pack_map(meta, png))
                 self.send_json(t='map_preview', name=name)
             except Exception as e:
                 self.send_json(t='toast', ok=False, msg=f'加载地图失败: {e}')
@@ -2322,8 +2356,7 @@ class WebConsole:
                 bak = backup_map(name)
                 edit_png_to_pgm(png_bytes, dest, yml)
                 meta, png = pgm_to_png(dest[0][0], dest[0][1])
-                self.map_cache, self.map_cache_seq = pack_map(meta, png), -2
-                self._send_all(self.map_cache)
+                self._set_static_map(pack_map(meta, png))
                 tip = f'"{name}" 已保存'
                 if bak:
                     tip += f' (旧图备份: _backup/{bak})'
