@@ -124,6 +124,7 @@ RViz Fixed Frame 用 `camera_init`，导航时用 `map`。户外导航在 AMCL �
 | `turn_on_wheeltec_robot` | 改动 | 底盘串口 + EKF（`odom_combined → base_footprint`） |
 | `FAST_LIO` | 第三方 + 补丁 | hku-mars 官方 ROS2 分支，加了 **PCD 分段保存**补丁与**正后方扇区屏蔽** |
 | `livox_ros_driver2` | 第三方 + 补丁 | MID360s 驱动，加了**点云 / IMU 时间戳同步**补丁 |
+| `wheeltec_gps` | 原厂 + 第三方 + 补丁 | UM982 双天线 RTK 驱动 `wheeltec_dual_rtk_driver`（原厂，打了补丁：读串口线程兜住异常不会悄悄停、刚上电没定位时不再退出而是边搜星边运行、停止时不报错）；另含原厂 `wheeltec_gps_driver`、第三方 `ublox-ros2` / `nmea_msgs` / `nmea_navsat_driver`，以及生成 `/dev/wheeltec_gnss` 的 udev 脚本 `wheeltec_gnss.sh` |
 | `wheeltec_lidar_ros2` | 第三方（已归档） | 镭神 lslidar 驱动（N10Plus 用） |
 
 > **归档**指代码保留但打了 `COLCON_IGNORE` 不参与编译（本项目已定型为 MID360s 方案）。
@@ -137,7 +138,6 @@ RViz Fixed Frame 用 `camera_init`，导航时用 `map`。户外导航在 AMCL �
 | Nav2 本体 | `apt install ros-humble-navigation2 ros-humble-nav2-bringup` |
 | Livox-SDK2 | [Livox-SDK/Livox-SDK2](https://github.com/Livox-SDK/Livox-SDK2)，需源码编译安装 |
 | Astra 相机驱动（可选） | Orbbec `ros2_astra_camera`，本项目对其打过一处 TF 去重补丁，见 `CLAUDE.md` 5.5 |
-| UM982 RTK 驱动 | `wheeltec_gps` 内的 `wheeltec_dual_rtk_driver`（随原厂 SDK 提供 / 自行编译），配合 `wheeltec_gnss.sh` udev 规则生成 `/dev/wheeltec_gnss` |
 | 户外 Python 依赖 | `pip3 install pyproj transforms3d`；`apt install ros-humble-tf-transformations` |
 | 底盘原厂包 | `wheeltec_robot_msg` / `wheeltec_robot_urdf` / `wheeltec_robot_keyboard` / `interfaces` / `depend` 等，随原厂 SDK 提供 |
 
@@ -325,4 +325,6 @@ ros2 run wheeltec_fastlio blackbox.py --report
   [livox_ros_driver2](https://github.com/Livox-SDK/livox_ros_driver2)、
   [Nav2](https://github.com/ros-navigation/navigation2)、
   [Orbbec Astra 驱动](https://github.com/orbbec/ros2_astra_camera)、
-  镭神 lslidar 驱动、WHEELTEC 原厂底盘包、和芯星通 UM982 RTK 模组。
+  [ublox](https://github.com/KumarRobotics/ublox)、
+  [nmea_navsat_driver](https://github.com/ros-drivers/nmea_navsat_driver) / [nmea_msgs](https://github.com/ros-drivers/nmea_msgs)、
+  镭神 lslidar 驱动、WHEELTEC 原厂底盘包与 GPS 驱动、和芯星通 UM982 RTK 模组。
