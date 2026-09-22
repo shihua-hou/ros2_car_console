@@ -56,7 +56,6 @@ tts_make_ros2/
 usb_cam-ros2/
 web_video_server-ros2/
 wheeltec_bodyreader/
-wheeltec_gps/
 wheeltec_imu/
 wheeltec_joy/
 wheeltec_mic/
